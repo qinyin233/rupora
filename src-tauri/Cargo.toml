@@ -2,10 +2,14 @@
 name = "rupora"
 version = "1.0.0"
 description = "RUPORA - A modern Markdown editor built with Tauri and Vue"
-authors = ["you"]
+authors = ["qinyin233"]
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+license = "MIT"
+repository = "https://github.com/qinyin233/RUPORA"
+homepage = "https://github.com/qinyin233/RUPORA"
+readme = "../README.md"
+keywords = ["markdown", "editor", "tauri", "vditor"]
+categories = ["text-editors"]
 
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
