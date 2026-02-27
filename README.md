@@ -6,7 +6,7 @@
 
 *Inspired by Typora · Powered by Rust*
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/qinyin233/RUPORA/releases)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/qinyin233/RUPORA/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-FFC131?logo=tauri&logoColor=white)](https://v2.tauri.app/)
 [![Vue](https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white)](https://vuejs.org/)
 [![Rust](https://img.shields.io/badge/Rust-2021-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
@@ -43,6 +43,13 @@
 - 使用系统原生文件对话框（Open / Save），体验与操作系统一致
 - **智能编码检测**：自动识别 UTF-8、UTF-8 BOM、UTF-16 LE/BE、GBK/GB18030 等编码
 - 基于 `chardetng` 引擎兜底检测，确保中文、日文等多语言文件无乱码
+
+### 🌓 主题与导出
+- 亮/暗色主题一键切换，记住用户偏好
+- 工具栏「更多」中支持导出 **HTML / PDF**
+
+### 🧲 拖拽打开
+- 支持从文件管理器拖拽 Markdown 文件到窗口直接打开
 
 ### ⌨️ 快捷键支持
 | 快捷键 | 功能 |
@@ -128,7 +135,7 @@ RUPORA/
 - **主编辑区**：中央为 Vditor 即时渲染编辑器，支持工具栏固定
 - **左侧边栏**：已打开文件列表，可折叠、可拖拽调整宽度
 - **右侧大纲**：文档标题大纲，支持点击跳转、拖拽调整宽度
-- **底部状态栏**：显示当前文件名与编辑状态，含侧边栏切换按钮
+- **底部状态栏**：显示当前文件路径，含侧边栏切换按钮
 
 ## 🗺️ 路线图
 
@@ -140,10 +147,10 @@ RUPORA/
 - [x] 原生文件对话框
 - [x] 键盘快捷键
 - [ ] 标签页（Tabs）支持
-- [ ] 文件拖拽打开
-- [ ] 主题切换（亮色 / 暗色）
+- [x] 文件拖拽打开
+- [x] 主题切换（亮色 / 暗色）
 - [ ] 最近文件列表
-- [ ] 导出为 PDF / HTML
+- [x] 导出为 PDF / HTML
 - [ ] macOS / Linux 构建支持
 - [ ] 自动保存
 - [ ] 文件搜索与替换
