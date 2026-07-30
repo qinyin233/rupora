@@ -114,6 +114,140 @@ pub fn char_index_for_line(text: &str, one_based_line: usize) -> usize {
         )
 }
 
+pub fn continue_markdown_line(text: &mut String, cursor: usize) -> Option<Range<usize>> {
+    let cursor = cursor.min(text.chars().count());
+    let cursor_byte = char_to_byte(text, cursor);
+    let previous_newline = cursor_byte.checked_sub(1)?;
+    if text.as_bytes().get(previous_newline) != Some(&b'\n') {
+        return None;
+    }
+
+    let line_start = text[..previous_newline]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let previous_line = &text[line_start..previous_newline];
+    let continuation = continuation_prefix(previous_line)?;
+    let content = &previous_line[continuation.content_start..];
+
+    if content.trim().is_empty() {
+        let removed_chars = previous_line[..continuation.source_prefix_len]
+            .chars()
+            .count();
+        text.replace_range(line_start..line_start + continuation.source_prefix_len, "");
+        let next = cursor.saturating_sub(removed_chars);
+        return Some(next..next);
+    }
+
+    text.insert_str(cursor_byte, &continuation.next_prefix);
+    let next = cursor + continuation.next_prefix.chars().count();
+    Some(next..next)
+}
+
+pub fn indent_selected_lines(
+    text: &mut String,
+    selection: Range<usize>,
+    outdent: bool,
+) -> Range<usize> {
+    let selection = clamp_char_range(text, selection);
+    let start_byte = char_to_byte(text, selection.start);
+    let end_byte = char_to_byte(text, selection.end);
+    let block_start = text[..start_byte].rfind('\n').map_or(0, |index| index + 1);
+    let block_end = text[end_byte..]
+        .find('\n')
+        .map_or(text.len(), |index| end_byte + index);
+    let transformed = text[block_start..block_end]
+        .split('\n')
+        .map(|line| {
+            if outdent {
+                line.strip_prefix('\t')
+                    .or_else(|| line.strip_prefix("    "))
+                    .or_else(|| line.strip_prefix("   "))
+                    .or_else(|| line.strip_prefix("  "))
+                    .or_else(|| line.strip_prefix(' '))
+                    .unwrap_or(line)
+                    .to_owned()
+            } else {
+                format!("    {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.replace_range(block_start..block_end, &transformed);
+    let start = text[..block_start].chars().count();
+    start..start + transformed.chars().count()
+}
+
+pub fn paste_url_as_markdown_link(
+    text: &mut String,
+    selection: Range<usize>,
+    url: &str,
+) -> Option<Range<usize>> {
+    if !is_probable_url(url) || selection.is_empty() {
+        return None;
+    }
+    let selection = clamp_char_range(text, selection);
+    let start = char_to_byte(text, selection.start);
+    let end = char_to_byte(text, selection.end);
+    let label = text[start..end].to_owned();
+    let replacement = format!("[{label}]({url})");
+    text.replace_range(start..end, &replacement);
+    let cursor = selection.start + replacement.chars().count();
+    Some(cursor..cursor)
+}
+
+pub fn insert_resource_link(
+    text: &mut String,
+    selection: Range<usize>,
+    label: &str,
+    destination: &str,
+    image: bool,
+) -> Range<usize> {
+    let selection = clamp_char_range(text, selection);
+    let replacement = if image {
+        format!("![{label}]({destination})")
+    } else {
+        format!("[{label}]({destination})")
+    };
+    replace_range(text, selection, &replacement)
+}
+
+pub fn apply_smart_pair(
+    text: &mut String,
+    selection: Range<usize>,
+    typed: &str,
+) -> Option<Range<usize>> {
+    let selection = clamp_char_range(text, selection);
+    if selection.is_empty() && matches!(typed, ")" | "]" | "}" | "\"" | "'" | "`") {
+        let start = char_to_byte(text, selection.start);
+        let end = start + typed.len();
+        if text.get(start..end) == Some(typed) {
+            let cursor = selection.start + 1;
+            return Some(cursor..cursor);
+        }
+    }
+    let (opening, closing) = match typed {
+        "(" => ("(", ")"),
+        "[" => ("[", "]"),
+        "{" => ("{", "}"),
+        "\"" => ("\"", "\""),
+        "'" => ("'", "'"),
+        "`" => ("`", "`"),
+        _ => return None,
+    };
+
+    let start = char_to_byte(text, selection.start);
+    let end = char_to_byte(text, selection.end);
+    let selected = text[start..end].to_owned();
+    let replacement = format!("{opening}{selected}{closing}");
+    text.replace_range(start..end, &replacement);
+    if selection.is_empty() {
+        let cursor = selection.start + opening.chars().count();
+        Some(cursor..cursor)
+    } else {
+        Some(selection.start + opening.chars().count()..selection.end + opening.chars().count())
+    }
+}
+
 fn find_from_byte(
     text: &str,
     query: &str,
@@ -316,6 +450,71 @@ fn strip_ordered_prefix(line: &str) -> Option<&str> {
         .then(|| &line[digit_count + 2..])
 }
 
+struct ContinuationPrefix {
+    source_prefix_len: usize,
+    content_start: usize,
+    next_prefix: String,
+}
+
+fn continuation_prefix(line: &str) -> Option<ContinuationPrefix> {
+    let indent_len = line
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let mut cursor = indent_len;
+    while line[cursor..].starts_with("> ") {
+        cursor += 2;
+    }
+    let structural_prefix = &line[..cursor];
+    let rest = &line[cursor..];
+
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(after_marker) = rest.strip_prefix(marker) {
+            let task_len = if after_marker.starts_with("[ ] ") || after_marker.starts_with("[x] ") {
+                4
+            } else {
+                0
+            };
+            let source_prefix_len = cursor + marker.len() + task_len;
+            let next_marker = if task_len > 0 {
+                format!("{marker}[ ] ")
+            } else {
+                marker.to_owned()
+            };
+            return Some(ContinuationPrefix {
+                source_prefix_len,
+                content_start: source_prefix_len,
+                next_prefix: format!("{structural_prefix}{next_marker}"),
+            });
+        }
+    }
+
+    let digit_count = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_count > 0 && rest.get(digit_count..digit_count + 2) == Some(". ") {
+        let ordinal = rest[..digit_count].parse::<u64>().unwrap_or(0);
+        let source_prefix_len = cursor + digit_count + 2;
+        return Some(ContinuationPrefix {
+            source_prefix_len,
+            content_start: source_prefix_len,
+            next_prefix: format!("{structural_prefix}{}. ", ordinal.saturating_add(1)),
+        });
+    }
+
+    (cursor > indent_len).then(|| ContinuationPrefix {
+        source_prefix_len: cursor,
+        content_start: cursor,
+        next_prefix: structural_prefix.to_owned(),
+    })
+}
+
+fn is_probable_url(text: &str) -> bool {
+    let text = text.trim();
+    !text.contains(char::is_whitespace)
+        && ["https://", "http://", "mailto:", "file://"]
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+}
+
 fn clamp_char_range(text: &str, range: Range<usize>) -> Range<usize> {
     let length = text.chars().count();
     range.start.min(length).min(range.end)..range.start.max(range.end).min(length)
@@ -388,5 +587,60 @@ mod tests {
         assert_eq!(char_index_for_line(text, 2), 3);
         assert_eq!(char_index_for_line(text, 3), 10);
         assert_eq!(char_index_for_line(text, 99), text.chars().count());
+    }
+
+    #[test]
+    fn continues_lists_quotes_ordering_and_tasks() {
+        for (before, cursor, expected, next) in [
+            ("- item\n", 7, "- item\n- ", 9),
+            ("3. item\n", 8, "3. item\n4. ", 11),
+            ("> quote\n", 8, "> quote\n> ", 10),
+            ("- [x] done\n", 11, "- [x] done\n- [ ] ", 17),
+            ("  - 中文\n", 7, "  - 中文\n  - ", 11),
+        ] {
+            let mut text = before.to_owned();
+            assert_eq!(continue_markdown_line(&mut text, cursor), Some(next..next));
+            assert_eq!(text, expected);
+        }
+    }
+
+    #[test]
+    fn exits_an_empty_list_item() {
+        let mut text = "- item\n- \n".to_owned();
+        assert_eq!(continue_markdown_line(&mut text, 10), Some(8..8));
+        assert_eq!(text, "- item\n\n");
+    }
+
+    #[test]
+    fn indents_and_outdents_selected_unicode_lines() {
+        let mut text = "一\n二".to_owned();
+        let selected = indent_selected_lines(&mut text, 0..3, false);
+        assert_eq!(text, "    一\n    二");
+        indent_selected_lines(&mut text, selected, true);
+        assert_eq!(text, "一\n二");
+    }
+
+    #[test]
+    fn smart_paste_wraps_selected_text_as_a_link() {
+        let mut text = "Open documentation now".to_owned();
+        let cursor = paste_url_as_markdown_link(&mut text, 5..18, "https://example.com").unwrap();
+        assert_eq!(text, "Open [documentation](https://example.com) now");
+        assert_eq!(cursor, 41..41);
+        assert!(paste_url_as_markdown_link(&mut text, 0..0, "not a url").is_none());
+    }
+
+    #[test]
+    fn smart_pairs_wrap_selections_and_skip_existing_closers() {
+        let mut text = "中文".to_owned();
+        assert_eq!(apply_smart_pair(&mut text, 0..2, "("), Some(1..3));
+        assert_eq!(text, "(中文)");
+
+        let mut text = "call()".to_owned();
+        assert_eq!(apply_smart_pair(&mut text, 5..5, ")"), Some(6..6));
+        assert_eq!(text, "call()");
+
+        let mut text = String::new();
+        assert_eq!(apply_smart_pair(&mut text, 0..0, "`"), Some(1..1));
+        assert_eq!(text, "``");
     }
 }

@@ -1,9 +1,9 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use eframe::{
@@ -37,6 +37,20 @@ enum ViewMode {
     Preview,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SplitScrollDriver {
+    #[default]
+    Editor,
+    Preview,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PaneScroll {
+    offset: f32,
+    maximum: f32,
+    hovered: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct PersistedState {
@@ -48,6 +62,9 @@ struct PersistedState {
     session_files: Vec<PathBuf>,
     active_session_file: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
+    cursor_positions: HashMap<PathBuf, usize>,
+    scroll_positions: HashMap<PathBuf, f32>,
+    key_bindings: KeyBindings,
 }
 
 impl Default for PersistedState {
@@ -61,20 +78,72 @@ impl Default for PersistedState {
             session_files: Vec::new(),
             active_session_file: None,
             workspace_root: None,
+            cursor_positions: HashMap::new(),
+            scroll_positions: HashMap::new(),
+            key_bindings: KeyBindings::default(),
         }
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct KeyBindings {
+    new_document: String,
+    open_file: String,
+    open_folder: String,
+    save: String,
+    save_as: String,
+    undo: String,
+    redo: String,
+    find: String,
+    replace: String,
+    command_palette: String,
+    bold: String,
+    italic: String,
+    link: String,
+}
+
+impl Default for KeyBindings {
+    fn default() -> Self {
+        Self {
+            new_document: "Ctrl+N".to_owned(),
+            open_file: "Ctrl+O".to_owned(),
+            open_folder: "Ctrl+Shift+O".to_owned(),
+            save: "Ctrl+S".to_owned(),
+            save_as: "Ctrl+Shift+S".to_owned(),
+            undo: "Ctrl+Z".to_owned(),
+            redo: "Ctrl+Shift+Z".to_owned(),
+            find: "Ctrl+F".to_owned(),
+            replace: "Ctrl+H".to_owned(),
+            command_palette: "Ctrl+Shift+P".to_owned(),
+            bold: "Ctrl+B".to_owned(),
+            italic: "Ctrl+I".to_owned(),
+            link: "Ctrl+K".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum AppCommand {
     New,
     Open,
     OpenFolder,
+    ShortcutSettings,
     Save,
     SaveAs,
     Undo,
     Redo,
     ExportHtml,
+    PasteImage,
     Format(MarkdownCommand),
+    SetView(ViewMode),
+}
+
+enum ShortcutAction {
+    Command(AppCommand),
+    Find,
+    Replace,
+    Palette,
 }
 
 pub struct RuporaApp {
@@ -100,6 +169,16 @@ pub struct RuporaApp {
     external_conflicts: HashSet<PathBuf>,
     last_external_check: Instant,
     external_scan_error_reported: bool,
+    command_palette_open: bool,
+    command_query: String,
+    command_focus_requested: bool,
+    split_scroll_ratio: f32,
+    split_scroll_driver: SplitScrollDriver,
+    split_editor_maximum: f32,
+    split_preview_maximum: f32,
+    split_scroll_document: Option<usize>,
+    collapsed_blocks: HashSet<(usize, BlockId)>,
+    shortcut_settings_open: bool,
 }
 
 impl RuporaApp {
@@ -140,6 +219,16 @@ impl RuporaApp {
             external_conflicts: HashSet::new(),
             last_external_check: Instant::now(),
             external_scan_error_reported: false,
+            command_palette_open: false,
+            command_query: String::new(),
+            command_focus_requested: false,
+            split_scroll_ratio: 0.0,
+            split_scroll_driver: SplitScrollDriver::Editor,
+            split_editor_maximum: 0.0,
+            split_preview_maximum: 0.0,
+            split_scroll_document: None,
+            collapsed_blocks: HashSet::new(),
+            shortcut_settings_open: false,
         };
 
         match recovered_entries {
@@ -192,10 +281,59 @@ impl RuporaApp {
         if app.documents.is_empty() {
             app.new_document();
         }
+        app.restore_active_view_state();
         app
     }
 
+    fn store_active_view_state(&mut self) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let Some(path) = self.documents[index].path.clone() else {
+            return;
+        };
+        if let Some(cursor) = self.editor_cursor {
+            self.state
+                .cursor_positions
+                .insert(path.clone(), cursor.primary.index.0);
+        }
+        self.state
+            .scroll_positions
+            .insert(path, self.split_scroll_ratio);
+    }
+
+    fn restore_active_view_state(&mut self) {
+        self.editor_cursor = None;
+        self.pending_editor_cursor = None;
+        self.split_scroll_ratio = 0.0;
+        let Some(index) = self.active else {
+            return;
+        };
+        let Some(path) = self.documents[index].path.clone() else {
+            return;
+        };
+        let saved_cursor = self.state.cursor_positions.get(&path).copied();
+        let saved_scroll = self.state.scroll_positions.get(&path).copied();
+        if let Some(cursor) = saved_cursor {
+            let cursor = cursor.min(self.documents[index].content.chars().count());
+            self.queue_editor_selection(cursor..cursor);
+        }
+        self.split_scroll_ratio = saved_scroll.unwrap_or(0.0).clamp(0.0, 1.0);
+    }
+
+    fn activate_document(&mut self, index: usize) {
+        if index >= self.documents.len() || self.active == Some(index) {
+            return;
+        }
+        self.store_active_view_state();
+        self.active = Some(index);
+        self.hybrid_active = None;
+        self.split_scroll_document = Some(index);
+        self.restore_active_view_state();
+    }
+
     fn new_document(&mut self) {
+        self.store_active_view_state();
         let document = Document::untitled(self.next_untitled_id);
         self.next_untitled_id += 1;
         self.documents.push(document);
@@ -259,9 +397,7 @@ impl RuporaApp {
                     })
                     .unwrap_or(false)
             }) {
-                self.active = Some(index);
-                self.editor_cursor = None;
-                self.pending_editor_cursor = None;
+                self.activate_document(index);
                 continue;
             }
 
@@ -271,9 +407,7 @@ impl RuporaApp {
                         format!("已打开：{} · {}", path.display(), document.encoding.label());
                     self.remove_initial_placeholder();
                     self.documents.push(document);
-                    self.active = Some(self.documents.len() - 1);
-                    self.editor_cursor = None;
-                    self.pending_editor_cursor = None;
+                    self.activate_document(self.documents.len() - 1);
                     self.remember_recent(path);
                 }
                 Err(error) => self.show_error("打开失败", &error),
@@ -424,7 +558,7 @@ impl RuporaApp {
         if self.documents[index].dirty {
             match prompt_to_save(&self.documents[index].title()) {
                 MessageDialogResult::Yes => {
-                    self.active = Some(index);
+                    self.activate_document(index);
                     self.save_active(false);
                     if self.documents[index].dirty {
                         return;
@@ -439,6 +573,7 @@ impl RuporaApp {
             self.external_conflicts.remove(path);
         }
         self.documents.remove(index);
+        self.collapsed_blocks.clear();
         self.active = match (self.active, self.documents.is_empty()) {
             (_, true) => None,
             (Some(active), false) if active > index => Some(active - 1),
@@ -447,6 +582,7 @@ impl RuporaApp {
         };
         self.editor_cursor = None;
         self.pending_editor_cursor = None;
+        self.restore_active_view_state();
         if self.documents.is_empty() {
             self.new_document();
         }
@@ -463,60 +599,63 @@ impl RuporaApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &Context) {
-        let history_command = ctx.input_mut(|input| {
-            let command_shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
-            if input.consume_key(command_shift, Key::Z)
-                || input.consume_key(egui::Modifiers::COMMAND, Key::Y)
-            {
-                Some(AppCommand::Redo)
-            } else if input.consume_key(egui::Modifiers::COMMAND, Key::Z) {
-                Some(AppCommand::Undo)
+        let bindings = self.state.key_bindings.clone();
+        let action = ctx.input_mut(|input| {
+            if consume_shortcut(input, &bindings.redo) || consume_shortcut(input, "Ctrl+Y") {
+                Some(ShortcutAction::Command(AppCommand::Redo))
+            } else if consume_shortcut(input, &bindings.undo) {
+                Some(ShortcutAction::Command(AppCommand::Undo))
+            } else if consume_shortcut(input, &bindings.save_as) {
+                Some(ShortcutAction::Command(AppCommand::SaveAs))
+            } else if consume_shortcut(input, &bindings.save) {
+                Some(ShortcutAction::Command(AppCommand::Save))
+            } else if consume_shortcut(input, &bindings.open_folder) {
+                Some(ShortcutAction::Command(AppCommand::OpenFolder))
+            } else if consume_shortcut(input, &bindings.open_file) {
+                Some(ShortcutAction::Command(AppCommand::Open))
+            } else if consume_shortcut(input, &bindings.new_document) {
+                Some(ShortcutAction::Command(AppCommand::New))
+            } else if consume_shortcut(input, &bindings.command_palette) {
+                Some(ShortcutAction::Palette)
+            } else if consume_shortcut(input, &bindings.bold) {
+                Some(ShortcutAction::Command(AppCommand::Format(
+                    MarkdownCommand::Bold,
+                )))
+            } else if consume_shortcut(input, &bindings.italic) {
+                Some(ShortcutAction::Command(AppCommand::Format(
+                    MarkdownCommand::Italic,
+                )))
+            } else if consume_shortcut(input, &bindings.link) {
+                Some(ShortcutAction::Command(AppCommand::Format(
+                    MarkdownCommand::Link,
+                )))
+            } else if consume_shortcut(input, &bindings.replace) {
+                Some(ShortcutAction::Replace)
+            } else if consume_shortcut(input, &bindings.find) {
+                Some(ShortcutAction::Find)
             } else {
                 None
             }
         });
-        if let Some(command) = history_command {
-            self.execute(command);
-        }
 
-        let command = ctx.input(|input| {
-            if input.modifiers.command && input.key_pressed(Key::S) {
-                Some(if input.modifiers.shift {
-                    AppCommand::SaveAs
-                } else {
-                    AppCommand::Save
-                })
-            } else if input.modifiers.command && input.key_pressed(Key::O) {
-                Some(if input.modifiers.shift {
-                    AppCommand::OpenFolder
-                } else {
-                    AppCommand::Open
-                })
-            } else if input.modifiers.command && input.key_pressed(Key::N) {
-                Some(AppCommand::New)
-            } else if input.modifiers.command && input.key_pressed(Key::B) {
-                Some(AppCommand::Format(MarkdownCommand::Bold))
-            } else if input.modifiers.command && input.key_pressed(Key::I) {
-                Some(AppCommand::Format(MarkdownCommand::Italic))
-            } else if input.modifiers.command && input.key_pressed(Key::K) {
-                Some(AppCommand::Format(MarkdownCommand::Link))
-            } else {
-                None
+        match action {
+            Some(ShortcutAction::Command(command)) => self.execute(command),
+            Some(ShortcutAction::Find | ShortcutAction::Replace) => {
+                self.find_open = true;
+                self.find_focus_requested = true;
             }
-        });
-
-        if let Some(command) = command {
-            self.execute(command);
+            Some(ShortcutAction::Palette) => {
+                self.command_palette_open = true;
+                self.command_focus_requested = true;
+            }
+            None => {}
         }
-
-        if ctx.input(|input| input.modifiers.command && input.key_pressed(Key::F))
-            || ctx.input(|input| input.modifiers.command && input.key_pressed(Key::H))
-        {
-            self.find_open = true;
-            self.find_focus_requested = true;
-        }
-        if ctx.input(|input| input.key_pressed(Key::Escape)) && self.find_open {
-            self.find_open = false;
+        if ctx.input(|input| input.key_pressed(Key::Escape)) {
+            if self.command_palette_open {
+                self.command_palette_open = false;
+            } else if self.find_open {
+                self.find_open = false;
+            }
         }
         if ctx.input(|input| input.key_pressed(Key::F3)) {
             self.find_match(!ctx.input(|input| input.modifiers.shift));
@@ -528,12 +667,15 @@ impl RuporaApp {
             AppCommand::New => self.new_document(),
             AppCommand::Open => self.open_dialog(),
             AppCommand::OpenFolder => self.open_folder_dialog(),
+            AppCommand::ShortcutSettings => self.shortcut_settings_open = true,
             AppCommand::Save => self.save_active(false),
             AppCommand::SaveAs => self.save_active(true),
             AppCommand::Undo => self.undo_active(),
             AppCommand::Redo => self.redo_active(),
             AppCommand::ExportHtml => self.export_html(),
+            AppCommand::PasteImage => self.paste_clipboard_image(),
             AppCommand::Format(command) => self.apply_format(command),
+            AppCommand::SetView(mode) => self.state.view_mode = mode,
         }
     }
 
@@ -721,15 +863,133 @@ impl RuporaApp {
                 .collect::<Vec<_>>()
         });
         if !paths.is_empty() {
-            let mut files = Vec::new();
+            let mut documents = Vec::new();
+            let mut resources = Vec::new();
             for path in paths {
                 if path.is_dir() {
                     self.open_workspace(path);
+                } else if is_markdown_path(&path) {
+                    documents.push(path);
                 } else {
-                    files.push(path);
+                    resources.push(path);
                 }
             }
-            self.open_paths(files);
+            self.open_paths(documents);
+            for path in resources {
+                self.insert_resource(path);
+            }
+        }
+    }
+
+    fn insert_resource(&mut self, path: PathBuf) {
+        let Some(index) = self.active else {
+            return;
+        };
+        if !path.is_file() {
+            self.status = format!("资源不存在：{}", path.display());
+            return;
+        }
+
+        let base = self.documents[index]
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .or_else(|| {
+                self.workspace
+                    .as_ref()
+                    .map(|workspace| workspace.root.as_path())
+            })
+            .unwrap_or_else(|| Path::new("."));
+        let destination = markdown_resource_destination(&path, base);
+        let label = path
+            .file_stem()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "resource".to_owned());
+        let image = is_image_path(&path);
+        let selection = self.active_selection(index);
+        let before = self.documents[index].content.clone();
+        let next = editing::insert_resource_link(
+            &mut self.documents[index].content,
+            selection.clone(),
+            &label,
+            &destination,
+            image,
+        );
+        self.documents[index].record_edit(
+            before,
+            Some(selection),
+            Some(next.clone()),
+            EditKind::Other,
+        );
+        self.queue_editor_selection(next);
+        self.status = if image {
+            format!("已插入图片：{}", path.display())
+        } else {
+            format!("已插入附件链接：{}", path.display())
+        };
+    }
+
+    fn paste_clipboard_image(&mut self) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let image = match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image())
+        {
+            Ok(image) => image,
+            Err(error) => {
+                self.status = format!("剪贴板中没有可用图片：{error}");
+                return;
+            }
+        };
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let file_name = format!("image-{timestamp}.png");
+        let path = if let Some(base) = self.documents[index]
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .or_else(|| {
+                self.workspace
+                    .as_ref()
+                    .map(|workspace| workspace.root.as_path())
+            }) {
+            let assets = base.join("assets");
+            if let Err(error) = fs::create_dir_all(&assets) {
+                self.show_error(
+                    "创建资源目录失败",
+                    &format!("无法创建 {}：{error}", assets.display()),
+                );
+                return;
+            }
+            assets.join(file_name)
+        } else {
+            let Some(path) = FileDialog::new()
+                .add_filter("PNG", &["png"])
+                .set_file_name(file_name)
+                .save_file()
+            else {
+                return;
+            };
+            path
+        };
+
+        let result = image::save_buffer_with_format(
+            &path,
+            image.bytes.as_ref(),
+            image.width as u32,
+            image.height as u32,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        );
+        match result {
+            Ok(()) => self.insert_resource(path),
+            Err(error) => self.show_error(
+                "粘贴图片失败",
+                &format!("无法写入 {}：{error}", path.display()),
+            ),
         }
     }
 
@@ -956,6 +1216,10 @@ impl RuporaApp {
                     self.find_open = true;
                     self.find_focus_requested = true;
                 }
+                if ui.button("命令").on_hover_text("Ctrl+Shift+P").clicked() {
+                    self.command_palette_open = true;
+                    self.command_focus_requested = true;
+                }
                 ui.separator();
                 ui.selectable_value(&mut self.state.view_mode, ViewMode::Edit, "编辑");
                 ui.selectable_value(&mut self.state.view_mode, ViewMode::Split, "分屏");
@@ -1021,6 +1285,128 @@ impl RuporaApp {
                     }
                 });
             });
+    }
+
+    fn command_palette(&mut self, root: &mut Ui) {
+        if !self.command_palette_open {
+            return;
+        }
+
+        let commands = [
+            ("新建文档", AppCommand::New),
+            ("打开文件", AppCommand::Open),
+            ("打开工作区", AppCommand::OpenFolder),
+            ("保存", AppCommand::Save),
+            ("另存为", AppCommand::SaveAs),
+            ("撤销", AppCommand::Undo),
+            ("重做", AppCommand::Redo),
+            ("导出 HTML", AppCommand::ExportHtml),
+            ("粘贴剪贴板图片", AppCommand::PasteImage),
+            ("快捷键设置", AppCommand::ShortcutSettings),
+            ("切换到编辑模式", AppCommand::SetView(ViewMode::Edit)),
+            ("切换到分屏模式", AppCommand::SetView(ViewMode::Split)),
+            ("切换到混合模式", AppCommand::SetView(ViewMode::Hybrid)),
+            ("切换到预览模式", AppCommand::SetView(ViewMode::Preview)),
+            ("格式：粗体", AppCommand::Format(MarkdownCommand::Bold)),
+            ("格式：斜体", AppCommand::Format(MarkdownCommand::Italic)),
+            ("格式：链接", AppCommand::Format(MarkdownCommand::Link)),
+            (
+                "格式：代码块",
+                AppCommand::Format(MarkdownCommand::CodeBlock),
+            ),
+        ];
+
+        let mut open = self.command_palette_open;
+        let mut selected = None;
+        egui::Window::new("命令面板")
+            .id(egui::Id::new("command-palette"))
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0])
+            .default_width(460.0)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(root.ctx(), |ui| {
+                let response = ui.add_sized(
+                    [ui.available_width(), 28.0],
+                    TextEdit::singleline(&mut self.command_query)
+                        .hint_text("输入命令，例如：保存、混合、粗体"),
+                );
+                if self.command_focus_requested {
+                    response.request_focus();
+                    self.command_focus_requested = false;
+                }
+                ui.separator();
+
+                let query = self.command_query.trim().to_lowercase();
+                let filtered = commands
+                    .iter()
+                    .filter(|(label, _)| query.is_empty() || label.to_lowercase().contains(&query))
+                    .collect::<Vec<_>>();
+                if filtered.is_empty() {
+                    ui.label(RichText::new("没有匹配命令").weak());
+                    return;
+                }
+                if response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                    selected = Some(filtered[0].1);
+                }
+                for (label, command) in filtered.into_iter().take(12) {
+                    if ui.selectable_label(false, *label).clicked() {
+                        selected = Some(*command);
+                    }
+                }
+            });
+        self.command_palette_open = open;
+
+        if let Some(command) = selected {
+            self.command_palette_open = false;
+            self.command_query.clear();
+            self.execute(command);
+        }
+    }
+
+    fn shortcut_settings(&mut self, root: &mut Ui) {
+        if !self.shortcut_settings_open {
+            return;
+        }
+        let mut open = self.shortcut_settings_open;
+        egui::Window::new("快捷键设置")
+            .id(egui::Id::new("shortcut-settings"))
+            .default_width(420.0)
+            .collapsible(false)
+            .open(&mut open)
+            .show(root.ctx(), |ui| {
+                ui.label("使用 Ctrl、Shift、Alt 与字母组合；Ctrl 在 macOS 上对应 Command。");
+                ui.add_space(6.0);
+                egui::Grid::new("shortcut-grid")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .show(ui, |ui| {
+                        shortcut_row(ui, "新建", &mut self.state.key_bindings.new_document);
+                        shortcut_row(ui, "打开", &mut self.state.key_bindings.open_file);
+                        shortcut_row(ui, "打开工作区", &mut self.state.key_bindings.open_folder);
+                        shortcut_row(ui, "保存", &mut self.state.key_bindings.save);
+                        shortcut_row(ui, "另存为", &mut self.state.key_bindings.save_as);
+                        shortcut_row(ui, "撤销", &mut self.state.key_bindings.undo);
+                        shortcut_row(ui, "重做", &mut self.state.key_bindings.redo);
+                        shortcut_row(ui, "查找", &mut self.state.key_bindings.find);
+                        shortcut_row(ui, "替换", &mut self.state.key_bindings.replace);
+                        shortcut_row(ui, "命令面板", &mut self.state.key_bindings.command_palette);
+                        shortcut_row(ui, "粗体", &mut self.state.key_bindings.bold);
+                        shortcut_row(ui, "斜体", &mut self.state.key_bindings.italic);
+                        shortcut_row(ui, "链接", &mut self.state.key_bindings.link);
+                    });
+                ui.separator();
+                if duplicate_shortcuts(&self.state.key_bindings) {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "存在重复快捷键，前面的命令会优先。",
+                    );
+                }
+                if ui.button("恢复默认").clicked() {
+                    self.state.key_bindings = KeyBindings::default();
+                }
+            });
+        self.shortcut_settings_open = open;
     }
 
     fn sidebar(&mut self, root: &mut Ui) {
@@ -1126,9 +1512,7 @@ impl RuporaApp {
                 });
 
                 if let Some(index) = activate {
-                    self.active = Some(index);
-                    self.editor_cursor = None;
-                    self.pending_editor_cursor = None;
+                    self.activate_document(index);
                 }
                 if let Some(index) = close {
                     self.close_document(index);
@@ -1205,64 +1589,172 @@ impl RuporaApp {
 
             let mode = self.state.view_mode;
             match mode {
-                ViewMode::Edit => self.edit_pane(ui, index),
-                ViewMode::Preview => self.preview_pane(ui, index),
+                ViewMode::Edit => {
+                    self.edit_pane(ui, index, None);
+                }
+                ViewMode::Preview => {
+                    self.preview_pane(ui, index, None);
+                }
                 ViewMode::Hybrid => self.hybrid_pane(ui, index),
                 ViewMode::Split => {
+                    if self.split_scroll_document != Some(index) {
+                        self.split_scroll_document = Some(index);
+                        self.split_scroll_ratio = 0.0;
+                        self.split_editor_maximum = 0.0;
+                        self.split_preview_maximum = 0.0;
+                    }
+                    let editor_target = (self.split_scroll_driver == SplitScrollDriver::Preview)
+                        .then_some(self.split_scroll_ratio * self.split_editor_maximum);
+                    let preview_target = (self.split_scroll_driver == SplitScrollDriver::Editor)
+                        .then_some(self.split_scroll_ratio * self.split_preview_maximum);
+                    let mut editor_scroll = PaneScroll::default();
+                    let mut preview_scroll = PaneScroll::default();
                     ui.columns(2, |columns| {
-                        columns[0].push_id("source-pane", |ui| self.edit_pane(ui, index));
+                        columns[0].push_id("source-pane", |ui| {
+                            editor_scroll = self.edit_pane(ui, index, editor_target);
+                        });
                         columns[1].separator();
-                        columns[1].push_id("preview-pane", |ui| self.preview_pane(ui, index));
+                        columns[1].push_id("preview-pane", |ui| {
+                            preview_scroll = self.preview_pane(ui, index, preview_target);
+                        });
                     });
+                    self.split_editor_maximum = editor_scroll.maximum;
+                    self.split_preview_maximum = preview_scroll.maximum;
+                    if editor_scroll.hovered {
+                        self.split_scroll_driver = SplitScrollDriver::Editor;
+                        self.split_scroll_ratio = scroll_ratio(editor_scroll);
+                    } else if preview_scroll.hovered {
+                        self.split_scroll_driver = SplitScrollDriver::Preview;
+                        self.split_scroll_ratio = scroll_ratio(preview_scroll);
+                    }
                 }
             }
         });
     }
 
-    fn edit_pane(&mut self, ui: &mut Ui, index: usize) {
+    fn edit_pane(&mut self, ui: &mut Ui, index: usize, scroll_offset: Option<f32>) -> PaneScroll {
         let before_content = self.documents[index].content.clone();
         let selection_before = self.editor_cursor.map(cursor_range_to_char_range);
-        ScrollArea::vertical()
-            .id_salt(("editor-scroll", index))
-            .show(ui, |ui| {
-                let available = ui.available_size();
-                ui.set_min_size(Vec2::new(available.x, available.y.max(420.0)));
-                let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
-                let desired_rows = (available.y / row_height).max(20.0) as usize;
-                let editor_id = ui.make_persistent_id(("editor", index));
-                if let Some(cursor_range) = self.pending_editor_cursor.take() {
-                    let mut state = TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
-                    state.cursor.set_char_range(Some(cursor_range));
-                    state.store(ui.ctx(), editor_id);
-                    ui.memory_mut(|memory| memory.request_focus(editor_id));
-                    self.editor_cursor = Some(cursor_range);
+        let mut scroll_area = ScrollArea::vertical().id_salt(("editor-scroll", index));
+        if let Some(offset) = scroll_offset {
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
+        }
+        let output = scroll_area.show(ui, |ui| {
+            let available = ui.available_size();
+            ui.set_min_size(Vec2::new(available.x, available.y.max(420.0)));
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
+            let desired_rows = (available.y / row_height).max(20.0) as usize;
+            let editor_id = ui.make_persistent_id(("editor", index));
+            if let Some(cursor_range) = self.pending_editor_cursor.take() {
+                let mut state = TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+                state.cursor.set_char_range(Some(cursor_range));
+                state.store(ui.ctx(), editor_id);
+                ui.memory_mut(|memory| memory.request_focus(editor_id));
+                self.editor_cursor = Some(cursor_range);
+            }
+            let input_action = editor_input_action(ui);
+            let output = TextEdit::multiline(&mut self.documents[index].content)
+                .id(editor_id)
+                .font(egui::TextStyle::Monospace)
+                .code_editor()
+                .desired_width(f32::INFINITY)
+                .desired_rows(desired_rows)
+                .lock_focus(true)
+                .show(ui);
+            let mut selection_after = output.cursor_range.map(cursor_range_to_char_range);
+            if let Some(cursor_range) = output.cursor_range {
+                self.editor_cursor = Some(cursor_range);
+            }
+            let focused = output.response.has_focus();
+            let mut changed = output.response.changed();
+            let mut kind = EditKind::Typing;
+            let mut cursor_adjusted = false;
+
+            if focused
+                && let (Some(url), Some(selection)) =
+                    (input_action.pasted_url.as_deref(), selection_before.clone())
+                && !selection.is_empty()
+            {
+                self.documents[index].content.clone_from(&before_content);
+                if let Some(next) = editing::paste_url_as_markdown_link(
+                    &mut self.documents[index].content,
+                    selection,
+                    url,
+                ) {
+                    selection_after = Some(next);
+                    kind = EditKind::Other;
+                    changed = true;
+                    cursor_adjusted = true;
                 }
-                let output = TextEdit::multiline(&mut self.documents[index].content)
-                    .id(editor_id)
-                    .font(egui::TextStyle::Monospace)
-                    .code_editor()
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(desired_rows)
-                    .lock_focus(true)
-                    .show(ui);
-                let selection_after = output.cursor_range.map(cursor_range_to_char_range);
-                if let Some(cursor_range) = output.cursor_range {
-                    self.editor_cursor = Some(cursor_range);
+            } else if focused && input_action.tab {
+                self.documents[index].content.clone_from(&before_content);
+                let selection = selection_before.clone().unwrap_or_else(|| {
+                    let end = before_content.chars().count();
+                    end..end
+                });
+                selection_after = Some(editing::indent_selected_lines(
+                    &mut self.documents[index].content,
+                    selection,
+                    input_action.shift,
+                ));
+                kind = EditKind::Other;
+                changed = true;
+                cursor_adjusted = true;
+            } else if focused
+                && let (Some(typed), Some(selection)) =
+                    (input_action.typed_text.as_deref(), selection_before.clone())
+            {
+                let mut paired = before_content.clone();
+                if let Some(next) = editing::apply_smart_pair(&mut paired, selection, typed) {
+                    changed = paired != before_content;
+                    self.documents[index].content = paired;
+                    selection_after = Some(next);
+                    kind = EditKind::Other;
+                    cursor_adjusted = true;
                 }
-                if output.response.changed()
-                    && self.documents[index].record_edit(
-                        before_content,
-                        selection_before,
-                        selection_after,
-                        EditKind::Typing,
-                    )
-                {
-                    self.status = "已修改".to_owned();
+            } else if focused
+                && changed
+                && input_action.enter
+                && let Some(cursor) = selection_after.as_ref().map(|range| range.end)
+                && let Some(next) =
+                    editing::continue_markdown_line(&mut self.documents[index].content, cursor)
+            {
+                selection_after = Some(next);
+                cursor_adjusted = true;
+            }
+
+            if changed
+                && self.documents[index].record_edit(
+                    before_content,
+                    selection_before,
+                    selection_after.clone(),
+                    kind,
+                )
+            {
+                if cursor_adjusted && let Some(selection) = selection_after {
+                    self.queue_editor_selection(selection);
                 }
-            });
+                self.status = "已修改".to_owned();
+            } else if cursor_adjusted && let Some(selection) = selection_after {
+                self.queue_editor_selection(selection);
+            }
+        });
+        PaneScroll {
+            offset: output.state.offset.y,
+            maximum: (output.content_size.y - output.inner_rect.height()).max(0.0),
+            hovered: ui
+                .ctx()
+                .pointer_hover_pos()
+                .is_some_and(|position| output.inner_rect.contains(position)),
+        }
     }
 
-    fn preview_pane(&mut self, ui: &mut Ui, index: usize) {
+    fn preview_pane(
+        &mut self,
+        ui: &mut Ui,
+        index: usize,
+        scroll_offset: Option<f32>,
+    ) -> PaneScroll {
         let before_content = self.documents[index].content.clone();
         let base_uri = self.preview_base_uri(index);
         let local_links = markdown::local_link_destinations(&self.documents[index].content);
@@ -1274,32 +1766,33 @@ impl RuporaApp {
         let changed = {
             let content = &mut self.documents[index].content;
             let cache = &mut self.preview_cache;
-            ScrollArea::vertical()
-                .id_salt(("preview-scroll", index))
-                .show(ui, |ui| {
-                    ui.add_space(12.0);
-                    let changed = ui
-                        .horizontal(|ui| {
-                            ui.add_space(14.0);
-                            ui.vertical(|ui| {
-                                ui.set_max_width((ui.available_width() - 24.0).max(200.0));
-                                CommonMarkViewer::new()
-                                    .default_implicit_uri_scheme(base_uri)
-                                    .enable_scroll_to_heading(true)
-                                    .show_mut(ui, cache, content)
-                                    .response
-                                    .changed()
-                            })
-                            .inner
+            let mut scroll_area = ScrollArea::vertical().id_salt(("preview-scroll", index));
+            if let Some(offset) = scroll_offset {
+                scroll_area = scroll_area.vertical_scroll_offset(offset);
+            }
+            scroll_area.show(ui, |ui| {
+                ui.add_space(12.0);
+                let changed = ui
+                    .horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.vertical(|ui| {
+                            ui.set_max_width((ui.available_width() - 24.0).max(200.0));
+                            CommonMarkViewer::new()
+                                .default_implicit_uri_scheme(base_uri)
+                                .enable_scroll_to_heading(true)
+                                .show_mut(ui, cache, content)
+                                .response
+                                .changed()
                         })
-                        .inner;
-                    ui.add_space(40.0);
-                    changed
-                })
-                .inner
+                        .inner
+                    })
+                    .inner;
+                ui.add_space(40.0);
+                changed
+            })
         };
 
-        if changed {
+        if changed.inner {
             self.documents[index].record_edit(before_content, None, None, EditKind::TaskList);
             self.status = "已更新任务列表".to_owned();
         }
@@ -1308,6 +1801,14 @@ impl RuporaApp {
             .find(|destination| self.preview_cache.get_link_hook(destination) == Some(true));
         if let Some(destination) = clicked_link {
             self.open_local_preview_link(index, &destination);
+        }
+        PaneScroll {
+            offset: changed.state.offset.y,
+            maximum: (changed.content_size.y - changed.inner_rect.height()).max(0.0),
+            hovered: ui
+                .ctx()
+                .pointer_hover_pos()
+                .is_some_and(|position| changed.inner_rect.contains(position)),
         }
     }
 
@@ -1347,6 +1848,7 @@ impl RuporaApp {
         let mut pending_edit = None;
         let mut activate = None;
         let mut next_global_cursor = None;
+        let mut cursor_adjusted = false;
 
         ScrollArea::vertical()
             .id_salt(("hybrid-scroll", index))
@@ -1357,6 +1859,13 @@ impl RuporaApp {
                     ui.push_id(("hybrid-block", block.id), |ui| {
                         if block.id == active_id {
                             let mut block_content = source[block.range.clone()].to_owned();
+                            let original_block = block_content.clone();
+                            let block_char_start = source[..block.range.start].chars().count();
+                            let local_selection_before =
+                                selection_before.as_ref().map(|selection| {
+                                    selection.start.saturating_sub(block_char_start)
+                                        ..selection.end.saturating_sub(block_char_start)
+                                });
                             let editor_id =
                                 ui.make_persistent_id(("hybrid-editor", index, block.id));
                             if let Some(cursor_range) = pending_local.take() {
@@ -1372,6 +1881,7 @@ impl RuporaApp {
                                 .stroke(ui.visuals().selection.stroke);
                             frame.show(ui, |ui| {
                                 let desired_rows = block_content.lines().count().max(1);
+                                let input_action = editor_input_action(ui);
                                 let output = TextEdit::multiline(&mut block_content)
                                     .id(editor_id)
                                     .font(egui::TextStyle::Monospace)
@@ -1380,30 +1890,122 @@ impl RuporaApp {
                                     .desired_rows(desired_rows)
                                     .lock_focus(true)
                                     .show(ui);
-                                if let Some(cursor_range) = output.cursor_range {
-                                    let [local_start, local_end] = cursor_range.sorted_cursors();
-                                    let block_char_start =
-                                        source[..block.range.start].chars().count();
+                                let mut local_selection_after =
+                                    output.cursor_range.map(cursor_range_to_char_range);
+                                let focused = output.response.has_focus();
+                                let mut changed = output.response.changed();
+                                let mut kind = EditKind::Typing;
+
+                                if focused
+                                    && let (Some(url), Some(selection)) = (
+                                        input_action.pasted_url.as_deref(),
+                                        local_selection_before.clone(),
+                                    )
+                                    && !selection.is_empty()
+                                {
+                                    block_content.clone_from(&original_block);
+                                    if let Some(next) = editing::paste_url_as_markdown_link(
+                                        &mut block_content,
+                                        selection,
+                                        url,
+                                    ) {
+                                        local_selection_after = Some(next);
+                                        kind = EditKind::Other;
+                                        changed = true;
+                                        cursor_adjusted = true;
+                                    }
+                                } else if focused && input_action.tab {
+                                    block_content.clone_from(&original_block);
+                                    let selection =
+                                        local_selection_before.clone().unwrap_or_else(|| {
+                                            let end = original_block.chars().count();
+                                            end..end
+                                        });
+                                    local_selection_after = Some(editing::indent_selected_lines(
+                                        &mut block_content,
+                                        selection,
+                                        input_action.shift,
+                                    ));
+                                    kind = EditKind::Other;
+                                    changed = true;
+                                    cursor_adjusted = true;
+                                } else if focused
+                                    && let (Some(typed), Some(selection)) = (
+                                        input_action.typed_text.as_deref(),
+                                        local_selection_before.clone(),
+                                    )
+                                {
+                                    let mut paired = original_block.clone();
+                                    if let Some(next) =
+                                        editing::apply_smart_pair(&mut paired, selection, typed)
+                                    {
+                                        changed = paired != original_block;
+                                        block_content = paired;
+                                        local_selection_after = Some(next);
+                                        kind = EditKind::Other;
+                                        cursor_adjusted = true;
+                                    }
+                                } else if focused
+                                    && changed
+                                    && input_action.enter
+                                    && let Some(cursor) =
+                                        local_selection_after.as_ref().map(|range| range.end)
+                                    && let Some(next) =
+                                        editing::continue_markdown_line(&mut block_content, cursor)
+                                {
+                                    local_selection_after = Some(next);
+                                    cursor_adjusted = true;
+                                }
+
+                                if let Some(selection) = local_selection_after {
                                     next_global_cursor = Some(CCursorRange::two(
-                                        CCursor::new(block_char_start + local_start.index.0),
-                                        CCursor::new(block_char_start + local_end.index.0),
+                                        CCursor::new(block_char_start + selection.start),
+                                        CCursor::new(block_char_start + selection.end),
                                     ));
                                 }
-                                if output.response.changed() {
+                                if changed {
                                     pending_edit =
-                                        Some((block.range.clone(), block_content.clone()));
+                                        Some((block.range.clone(), block_content.clone(), kind));
                                 }
                             });
                         } else {
+                            let block_text = &source[block.range.clone()];
+                            let foldable = is_foldable_block(block_text);
+                            let collapse_key = (index, block.id);
+                            let collapsed = self.collapsed_blocks.contains(&collapse_key);
+                            if foldable {
+                                ui.horizontal(|ui| {
+                                    let icon = if collapsed { "▸" } else { "▾" };
+                                    if ui
+                                        .small_button(icon)
+                                        .on_hover_text(if collapsed {
+                                            "展开 Markdown 块"
+                                        } else {
+                                            "折叠 Markdown 块"
+                                        })
+                                        .clicked()
+                                    {
+                                        if collapsed {
+                                            self.collapsed_blocks.remove(&collapse_key);
+                                        } else {
+                                            self.collapsed_blocks.insert(collapse_key);
+                                        }
+                                    }
+                                    ui.label(
+                                        RichText::new(format!("第 {} 行", block.line))
+                                            .small()
+                                            .weak(),
+                                    );
+                                });
+                            }
+                            if collapsed {
+                                return;
+                            }
                             let shown = ui.scope(|ui| {
                                 ui.add_space(8.0);
                                 CommonMarkViewer::new()
                                     .default_implicit_uri_scheme(base_uri.clone())
-                                    .show(
-                                        ui,
-                                        &mut self.preview_cache,
-                                        &source[block.range.clone()],
-                                    );
+                                    .show(ui, &mut self.preview_cache, block_text);
                                 ui.add_space(8.0);
                             });
                             let response = ui
@@ -1437,7 +2039,7 @@ impl RuporaApp {
         if let Some(cursor_range) = next_global_cursor {
             self.editor_cursor = Some(cursor_range);
         }
-        if let Some((range, replacement)) = pending_edit {
+        if let Some((range, replacement, kind)) = pending_edit {
             self.documents[index]
                 .content
                 .replace_range(range.clone(), &replacement);
@@ -1446,10 +2048,13 @@ impl RuporaApp {
                 source.clone(),
                 selection_before,
                 selection_after,
-                EditKind::Typing,
+                kind,
             );
             self.hybrid_active = Some((index, active_id));
             self.status = "已更新当前 Markdown 块".to_owned();
+        }
+        if cursor_adjusted {
+            self.pending_editor_cursor = next_global_cursor;
         }
         if let Some((id, start)) = activate {
             let char_start = source[..start].chars().count();
@@ -1573,6 +2178,8 @@ impl eframe::App for RuporaApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
         self.top_bar(ui);
         self.find_bar(ui);
+        self.command_palette(ui);
+        self.shortcut_settings(ui);
         self.external_change_bar(ui);
         self.status_bar(ui);
         self.sidebar(ui);
@@ -1581,6 +2188,7 @@ impl eframe::App for RuporaApp {
     }
 
     fn save(&mut self, storage: &mut dyn Storage) {
+        self.store_active_view_state();
         self.state.session_files = self
             .documents
             .iter()
@@ -1632,6 +2240,147 @@ fn block_for_char_index<'a>(
 fn cursor_range_to_char_range(range: CCursorRange) -> std::ops::Range<usize> {
     let [start, end] = range.sorted_cursors();
     start.index.0..end.index.0
+}
+
+fn scroll_ratio(scroll: PaneScroll) -> f32 {
+    if scroll.maximum <= f32::EPSILON {
+        0.0
+    } else {
+        (scroll.offset / scroll.maximum).clamp(0.0, 1.0)
+    }
+}
+
+fn is_foldable_block(source: &str) -> bool {
+    source.contains('\n')
+        || source.starts_with('#')
+        || source.starts_with("```")
+        || source.starts_with("~~~")
+        || source.starts_with("> ")
+}
+
+fn parse_shortcut(specification: &str) -> Option<egui::KeyboardShortcut> {
+    let mut modifiers = egui::Modifiers::default();
+    let mut key = None;
+    for part in specification
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        match part.to_ascii_uppercase().as_str() {
+            "CTRL" | "CMD" | "COMMAND" => modifiers.command = true,
+            "SHIFT" => modifiers.shift = true,
+            "ALT" | "OPTION" => modifiers.alt = true,
+            token => {
+                key = Some(match token {
+                    "A" => Key::A,
+                    "B" => Key::B,
+                    "C" => Key::C,
+                    "D" => Key::D,
+                    "E" => Key::E,
+                    "F" => Key::F,
+                    "G" => Key::G,
+                    "H" => Key::H,
+                    "I" => Key::I,
+                    "J" => Key::J,
+                    "K" => Key::K,
+                    "L" => Key::L,
+                    "M" => Key::M,
+                    "N" => Key::N,
+                    "O" => Key::O,
+                    "P" => Key::P,
+                    "Q" => Key::Q,
+                    "R" => Key::R,
+                    "S" => Key::S,
+                    "T" => Key::T,
+                    "U" => Key::U,
+                    "V" => Key::V,
+                    "W" => Key::W,
+                    "X" => Key::X,
+                    "Y" => Key::Y,
+                    "Z" => Key::Z,
+                    "F1" => Key::F1,
+                    "F2" => Key::F2,
+                    "F3" => Key::F3,
+                    "F4" => Key::F4,
+                    "F5" => Key::F5,
+                    "F6" => Key::F6,
+                    "F7" => Key::F7,
+                    "F8" => Key::F8,
+                    "F9" => Key::F9,
+                    "F10" => Key::F10,
+                    "F11" => Key::F11,
+                    "F12" => Key::F12,
+                    _ => return None,
+                });
+            }
+        }
+    }
+    Some(egui::KeyboardShortcut {
+        modifiers,
+        logical_key: key?,
+    })
+}
+
+fn consume_shortcut(input: &mut egui::InputState, specification: &str) -> bool {
+    parse_shortcut(specification).is_some_and(|shortcut| input.consume_shortcut(&shortcut))
+}
+
+fn shortcut_row(ui: &mut Ui, label: &str, shortcut: &mut String) {
+    ui.label(label);
+    let response = ui.add_sized([170.0, 22.0], TextEdit::singleline(shortcut));
+    if parse_shortcut(shortcut).is_none() {
+        response.on_hover_text("快捷键格式无效，例如 Ctrl+Shift+P");
+        ui.colored_label(ui.visuals().error_fg_color, "格式无效");
+    }
+    ui.end_row();
+}
+
+fn duplicate_shortcuts(bindings: &KeyBindings) -> bool {
+    let shortcuts = [
+        &bindings.new_document,
+        &bindings.open_file,
+        &bindings.open_folder,
+        &bindings.save,
+        &bindings.save_as,
+        &bindings.undo,
+        &bindings.redo,
+        &bindings.find,
+        &bindings.replace,
+        &bindings.command_palette,
+        &bindings.bold,
+        &bindings.italic,
+        &bindings.link,
+    ];
+    let mut unique = HashSet::new();
+    shortcuts
+        .into_iter()
+        .map(|shortcut| shortcut.trim().to_ascii_uppercase())
+        .any(|shortcut| !shortcut.is_empty() && !unique.insert(shortcut))
+}
+
+#[derive(Default)]
+struct EditorInputAction {
+    enter: bool,
+    tab: bool,
+    shift: bool,
+    pasted_url: Option<String>,
+    typed_text: Option<String>,
+}
+
+fn editor_input_action(ui: &Ui) -> EditorInputAction {
+    ui.input(|input| EditorInputAction {
+        enter: input.key_pressed(Key::Enter),
+        tab: input.key_pressed(Key::Tab),
+        shift: input.modifiers.shift,
+        pasted_url: input.events.iter().rev().find_map(|event| match event {
+            egui::Event::Paste(text) => Some(text.trim().to_owned()),
+            _ => None,
+        }),
+        typed_text: input.events.iter().rev().find_map(|event| match event {
+            egui::Event::Text(text) => Some(text.clone()),
+            _ => None,
+        }),
+    })
 }
 
 fn workspace_entries_ui(
@@ -1686,6 +2435,34 @@ fn is_markdown_path(path: &Path) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico"
+            )
+        })
+}
+
+fn markdown_resource_destination(path: &Path, base: &Path) -> String {
+    let absolute_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let absolute_base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    let destination = pathdiff::diff_paths(&absolute_path, &absolute_base)
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .unwrap_or(absolute_path);
+    destination
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('#', "%23")
+        .replace('?', "%3F")
+        .replace('(', "%28")
+        .replace(')', "%29")
 }
 
 fn prompt_to_save(title: &str) -> MessageDialogResult {
@@ -1769,5 +2546,53 @@ mod tests {
         }));
         assert!(uri.starts_with("file:///"));
         assert!(uri.ends_with("notes and docs/"));
+    }
+
+    #[test]
+    fn creates_relative_encoded_resource_destinations() {
+        let directory = tempfile::tempdir().unwrap();
+        let notes = directory.path().join("notes");
+        let assets = directory.path().join("assets");
+        fs::create_dir_all(&notes).unwrap();
+        fs::create_dir_all(&assets).unwrap();
+        let image = assets.join("diagram one.png");
+        fs::write(&image, b"image").unwrap();
+
+        assert_eq!(
+            markdown_resource_destination(&image, &notes),
+            "../assets/diagram%20one.png"
+        );
+        assert!(is_image_path(&image));
+        assert!(!is_image_path(Path::new("attachment.pdf")));
+    }
+
+    #[test]
+    fn parses_configurable_cross_platform_shortcuts() {
+        let shortcut = parse_shortcut("Ctrl+Shift+P").unwrap();
+        assert!(shortcut.modifiers.command);
+        assert!(shortcut.modifiers.shift);
+        assert_eq!(shortcut.logical_key, Key::P);
+        assert!(parse_shortcut("Ctrl+NoSuchKey").is_none());
+    }
+
+    #[test]
+    fn detects_duplicate_shortcuts() {
+        let mut bindings = KeyBindings::default();
+        assert!(!duplicate_shortcuts(&bindings));
+        bindings.link.clone_from(&bindings.bold);
+        assert!(duplicate_shortcuts(&bindings));
+    }
+
+    #[test]
+    fn calculates_safe_split_scroll_ratios() {
+        assert_eq!(
+            scroll_ratio(PaneScroll {
+                offset: 50.0,
+                maximum: 100.0,
+                hovered: true,
+            }),
+            0.5
+        );
+        assert_eq!(scroll_ratio(PaneScroll::default()), 0.0);
     }
 }
