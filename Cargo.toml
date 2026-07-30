@@ -1,0 +1,61 @@
+[package]
+name = "rupora"
+version = "2.0.0-alpha.1"
+edition = "2024"
+rust-version = "1.92"
+description = "A native Rust Markdown editor"
+authors = ["qinyin233", "RUPORA contributors"]
+license = "MIT"
+repository = "https://github.com/qinyin233/rupora"
+keywords = ["markdown", "editor", "egui", "rust"]
+categories = ["text-editors"]
+
+[package.metadata.packager]
+before-packaging-command = "cargo build --release --locked"
+product-name = "RUPORA"
+identifier = "com.rupora.app"
+icons = [
+    "src-tauri/icons/32x32.png",
+    "src-tauri/icons/128x128.png",
+    "src-tauri/icons/128x128@2x.png",
+    "src-tauri/icons/icon.icns",
+    "src-tauri/icons/icon.ico",
+]
+license-file = "LICENSE"
+category = "Productivity"
+
+[lib]
+path = "native/src/lib.rs"
+
+[[bin]]
+name = "rupora"
+path = "native/src/main.rs"
+
+[dependencies]
+chardetng = "0.1.17"
+eframe = { version = "0.35.0", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "persistence",
+    "wayland",
+    "x11",
+] }
+egui_commonmark = { version = "0.24.0", features = [
+    "better_syntax_highlighting",
+    "svg",
+] }
+encoding_rs = "0.8.35"
+open = "5.4.0"
+pulldown-cmark = "0.13.4"
+rfd = "0.17.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.27.0"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.31"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

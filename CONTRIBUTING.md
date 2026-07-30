@@ -1,114 +1,56 @@
 # 贡献指南
 
-感谢你对 RUPORA 的关注！我们欢迎任何形式的贡献。
+感谢关注 RUPORA。
 
-## 🐛 报告 Bug
+## 开发环境
 
-如果你发现了 Bug，请在 [Issues](https://github.com/qinyin233/RUPORA/issues) 页面提交，并包含以下信息：
+- Rust 1.92 或更高版本
+- Windows、macOS，或带 Wayland/X11 的 Linux
 
-- **操作系统**：Windows / macOS / Linux 及其版本
-- **RUPORA 版本**：v1.0.0 等
-- **复现步骤**：描述如何重现该问题
-- **期望行为**：你期望看到的结果
-- **实际行为**：实际发生了什么
-- **截图**（如果有的话）
+默认 2.x 原生应用不需要 Node.js、Tauri CLI 或 WebView 开发环境。
 
-## 💡 功能建议
+## 本地开发
 
-欢迎在 Issues 中提出新功能建议。请描述：
-
-- 你想要什么功能
-- 为什么需要这个功能
-- 你期望的交互方式
-
-## 🔧 提交代码
-
-### 前置条件
-
-- [Node.js](https://nodejs.org/) ≥ 18
-- [Rust](https://rustup.rs/) ≥ 1.70
-- [Tauri CLI](https://v2.tauri.app/start/prerequisites/)
-
-### 开发流程
-
-1. **Fork** 本仓库
-2. **克隆**你的 Fork：
-   ```bash
-   git clone https://github.com/your-username/RUPORA.git
-   cd RUPORA
-   ```
-3. **安装依赖**：
-   ```bash
-   npm install
-   ```
-4. **创建特性分支**：
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
-5. **启动开发环境**：
-   ```bash
-   npm run tauri dev
-   ```
-6. **进行修改**，确保代码正常运行
-7. **提交更改**：
-   ```bash
-   git add .
-   git commit -m "feat: your feature description"
-   ```
-8. **推送分支**：
-   ```bash
-   git push origin feature/your-feature-name
-   ```
-9. **发起 Pull Request**
-
-### 提交规范
-
-本项目遵循 [Conventional Commits](https://www.conventionalcommits.org/) 提交规范：
-
-| 类型 | 说明 |
-|------|------|
-| `feat` | 新功能 |
-| `fix` | Bug 修复 |
-| `docs` | 文档更新 |
-| `style` | 代码格式调整（不影响逻辑） |
-| `refactor` | 重构（非新功能、非 Bug 修复） |
-| `perf` | 性能优化 |
-| `test` | 添加或修改测试 |
-| `chore` | 构建过程或辅助工具的变动 |
-
-示例：
-```
-feat: add dark theme support
-fix: resolve encoding issue with GBK files
-docs: update README with new screenshots
+```bash
+git clone https://github.com/qinyin233/rupora.git
+cd rupora
+cargo run
 ```
 
-### 项目结构
+提交前请运行：
 
-```
-RUPORA/
-├── src/                    # 前端 (Vue 3 + TypeScript)
-│   ├── App.vue             # 主应用组件
-│   ├── main.ts             # Vue 入口
-│   └── assets/             # 静态资源
-├── src-tauri/              # 后端 (Rust + Tauri 2)
-│   ├── src/lib.rs          # 核心命令
-│   ├── src/main.rs         # 入口
-│   └── Cargo.toml          # Rust 依赖
-├── package.json            # 前端依赖
-└── vite.config.ts          # Vite 配置
+```bash
+cargo fmt --all -- --check
+cargo test --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --release --locked
 ```
 
-### 代码风格
+## 代码结构
 
-- **Rust**：遵循标准 Rust 格式（`cargo fmt`）
-- **TypeScript/Vue**：使用项目的 EditorConfig 配置
-- **提交信息**：使用 Conventional Commits 格式
+- `native/src/app.rs`：窗口、UI、命令、多文档和混合编辑交互
+- `native/src/document.rs`：文档状态、编码、换行、冲突检测和原子读写
+- `native/src/editing.rs`：查找替换、格式命令和字符位置映射
+- `native/src/markdown.rs`：Markdown 解析、块范围、大纲、统计和 HTML
+- `native/src/recovery.rs`：崩溃恢复快照
+- `native/src/workspace.rs`：工作区目录树
+- `src/`、`src-tauri/`：1.x WebView 旧实现，仅用于迁移对照
 
-## 📜 许可证
+## 提交要求
 
-提交贡献即表示你同意将代码以 [MIT License](LICENSE) 进行开源。
+使用 Conventional Commits：
 
-## 💬 联系
+- `feat:` 新功能
+- `fix:` 缺陷修复
+- `refactor:` 不改变行为的重构
+- `test:` 测试
+- `docs:` 文档
+- `chore:` 构建与维护
 
-如有问题，请在 [Issues](https://github.com/qinyin233/RUPORA/issues) 中讨论。
+涉及文档保存的修改必须补充编码、换行、冲突或失败路径测试。涉及编辑器位置的修改必须覆盖
+中文或 emoji，不能把 UTF-8 字节位置当成字符位置。
+
+不要把分屏预览描述成完整所见即所得。当前实现边界见
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 和 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
+
+贡献内容以项目的 MIT 许可证发布。
