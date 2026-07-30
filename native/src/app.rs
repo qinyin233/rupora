@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -96,6 +97,9 @@ pub struct RuporaApp {
     find_focus_requested: bool,
     workspace: Option<Workspace>,
     hybrid_active: Option<(usize, BlockId)>,
+    external_conflicts: HashSet<PathBuf>,
+    last_external_check: Instant,
+    external_scan_error_reported: bool,
 }
 
 impl RuporaApp {
@@ -133,6 +137,9 @@ impl RuporaApp {
             find_focus_requested: false,
             workspace,
             hybrid_active: None,
+            external_conflicts: HashSet::new(),
+            last_external_check: Instant::now(),
+            external_scan_error_reported: false,
         };
 
         match recovered_entries {
@@ -294,6 +301,7 @@ impl RuporaApp {
         let Some(index) = self.active else {
             return;
         };
+        let previous_path = self.documents[index].path.clone();
 
         let needs_path = self.documents[index].path.is_none() || force_dialog;
         let selected_path = needs_path
@@ -369,7 +377,11 @@ impl RuporaApp {
                     document.line_ending.label()
                 );
                 if let Some(path) = document.path.clone() {
+                    self.external_conflicts.remove(&path);
                     self.remember_recent(path);
+                }
+                if let Some(path) = previous_path {
+                    self.external_conflicts.remove(&path);
                 }
             }
             Err(error) => self.show_error("保存失败", &error),
@@ -423,6 +435,9 @@ impl RuporaApp {
             }
         }
 
+        if let Some(path) = self.documents[index].path.as_ref() {
+            self.external_conflicts.remove(path);
+        }
         self.documents.remove(index);
         self.active = match (self.active, self.documents.is_empty()) {
             (_, true) => None,
@@ -730,6 +745,118 @@ impl RuporaApp {
                 self.recovery_error_reported = true;
             }
             Err(_) => {}
+        }
+    }
+
+    fn check_external_changes_if_due(&mut self) {
+        if self.last_external_check.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.last_external_check = Instant::now();
+
+        let open_paths = self
+            .documents
+            .iter()
+            .filter_map(|document| document.path.clone())
+            .collect::<HashSet<_>>();
+        self.external_conflicts
+            .retain(|path| open_paths.contains(path));
+
+        let mut reloaded = Vec::new();
+        for (index, document) in self.documents.iter_mut().enumerate() {
+            let Some(path) = document.path.clone() else {
+                continue;
+            };
+            match document.external_change_hint() {
+                Ok(false) => {
+                    self.external_conflicts.remove(&path);
+                    self.external_scan_error_reported = false;
+                }
+                Ok(true) if document.dirty => {
+                    self.external_conflicts.insert(path);
+                }
+                Ok(true) => match document.reload() {
+                    Ok(()) => {
+                        self.external_conflicts.remove(&path);
+                        reloaded.push((index, path));
+                        self.external_scan_error_reported = false;
+                    }
+                    Err(_) => {
+                        self.external_conflicts.insert(path);
+                    }
+                },
+                Err(error) if !self.external_scan_error_reported => {
+                    self.status = error;
+                    self.external_scan_error_reported = true;
+                }
+                Err(_) => {}
+            }
+        }
+
+        if let Some((index, path)) = reloaded.last() {
+            if self.active == Some(*index) {
+                self.editor_cursor = None;
+                self.pending_editor_cursor = None;
+                self.hybrid_active = None;
+            }
+            self.status = format!("已自动重新加载外部修改：{}", path.display());
+        }
+    }
+
+    fn external_change_bar(&mut self, root: &mut Ui) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let Some(path) = self.documents[index].path.clone() else {
+            return;
+        };
+        if !self.external_conflicts.contains(&path) {
+            return;
+        }
+
+        let mut reload = false;
+        let mut save_as = false;
+        Panel::top("external-change")
+            .exact_size(40.0)
+            .show(root, |ui| {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "磁盘文件已发生变化，当前编辑内容尚未覆盖。",
+                    );
+                    if ui.button("从磁盘重新加载").clicked() {
+                        reload = true;
+                    }
+                    if ui.button("另存为…").clicked() {
+                        save_as = true;
+                    }
+                });
+            });
+
+        if reload {
+            let confirmed = !self.documents[index].dirty
+                || MessageDialog::new()
+                    .set_level(MessageLevel::Warning)
+                    .set_title("重新加载外部版本")
+                    .set_description("这会丢弃 RUPORA 中尚未保存的修改。确定继续吗？")
+                    .set_buttons(MessageButtons::YesNo)
+                    .show()
+                    == MessageDialogResult::Yes;
+            if confirmed {
+                match self.documents[index].reload() {
+                    Ok(()) => {
+                        self.external_conflicts.remove(&path);
+                        self.editor_cursor = None;
+                        self.pending_editor_cursor = None;
+                        self.hybrid_active = None;
+                        self.status = format!("已从磁盘重新加载：{}", path.display());
+                    }
+                    Err(error) => self.show_error("重新加载失败", &error),
+                }
+            }
+        } else if save_as {
+            self.save_active(true);
         }
     }
 
@@ -1435,15 +1562,18 @@ impl RuporaApp {
 
 impl eframe::App for RuporaApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut Frame) {
+        ctx.request_repaint_after(Duration::from_millis(500));
         self.handle_shortcuts(ctx);
         self.handle_dropped_files(ctx);
         self.save_recovery_snapshot_if_due();
+        self.check_external_changes_if_due();
         self.confirm_application_close(ctx);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
         self.top_bar(ui);
         self.find_bar(ui);
+        self.external_change_bar(ui);
         self.status_bar(ui);
         self.sidebar(ui);
         self.outline(ui);

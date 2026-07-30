@@ -272,6 +272,23 @@ impl Document {
         Ok(current.as_ref() != Some(expected))
     }
 
+    pub fn external_change_hint(&self) -> Result<bool, String> {
+        let Some(path) = self.path.as_deref() else {
+            return Ok(false);
+        };
+        let Some(expected) = self.file_fingerprint.as_ref() else {
+            return Ok(path.exists());
+        };
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => {
+                return Err(format!("无法检查 {}：{error}", path.display()));
+            }
+        };
+        Ok(metadata.len() != expected.length || metadata.modified().ok() != expected.modified)
+    }
+
     pub fn save(&mut self, overwrite_external: bool) -> Result<(), String> {
         let path = self
             .path
@@ -746,6 +763,21 @@ mod tests {
         fs::create_dir(&invalid_target).unwrap();
         assert!(document.save_as(invalid_target, true).is_err());
         assert_eq!(document.path.as_deref(), Some(original_path.as_path()));
+    }
+
+    #[test]
+    fn external_change_hint_detects_modified_and_deleted_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("watched.md");
+        fs::write(&path, "original").unwrap();
+        let document = Document::open(&path).unwrap();
+        assert!(!document.external_change_hint().unwrap());
+
+        fs::write(&path, "changed with another length").unwrap();
+        assert!(document.external_change_hint().unwrap());
+
+        fs::remove_file(&path).unwrap();
+        assert!(document.external_change_hint().unwrap());
     }
 
     #[test]
