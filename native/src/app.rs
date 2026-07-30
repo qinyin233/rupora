@@ -17,6 +17,7 @@ use crate::{
     diagnostics,
     document::{Document, EditKind},
     editing::{self, MarkdownCommand},
+    editor_buffer::{TrackingTextBuffer, set_accessible_label},
     export,
     instance::InstanceCoordinator,
     markdown::{self, BlockId, Heading},
@@ -32,7 +33,7 @@ use eframe::{
     egui::{
         self, Align, Button, CentralPanel, Color32, Context, FontData, FontDefinitions, FontFamily,
         Key, Layout, Panel, RichText, ScrollArea, TextEdit, Ui, Vec2, ViewportCommand,
-        text::{CCursor, CCursorRange, CharIndex},
+        text::{CCursor, CCursorRange},
     },
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -2144,6 +2145,7 @@ impl RuporaApp {
                 .desired_rows(desired_rows)
                 .lock_focus(true)
                 .show(ui);
+            set_accessible_label(ui.ctx(), editor_id, "Markdown 源码编辑区");
             let mut before_content = editor_buffer.take_before();
             drop(editor_buffer);
             output.response.context_menu(|ui| {
@@ -2454,6 +2456,11 @@ impl RuporaApp {
                                     .desired_rows(desired_rows)
                                     .lock_focus(true)
                                     .show(ui);
+                                set_accessible_label(
+                                    ui.ctx(),
+                                    editor_id,
+                                    format!("从第 {} 行开始的 Markdown 块", block.line),
+                                );
                                 let mut local_selection_after =
                                     output.cursor_range.map(cursor_range_to_char_range);
                                 let focused = output.response.has_focus();
@@ -2966,53 +2973,6 @@ struct EditorInputAction {
     typed_text: Option<String>,
 }
 
-struct TrackingTextBuffer<'a> {
-    text: &'a mut String,
-    before: Option<String>,
-}
-
-impl<'a> TrackingTextBuffer<'a> {
-    fn new(text: &'a mut String) -> Self {
-        Self { text, before: None }
-    }
-
-    fn remember_before(&mut self) {
-        if self.before.is_none() {
-            self.before = Some(self.text.clone());
-        }
-    }
-
-    fn take_before(&mut self) -> Option<String> {
-        self.before.take()
-    }
-}
-
-struct TrackingTextBufferType;
-
-impl egui::TextBuffer for TrackingTextBuffer<'_> {
-    fn is_mutable(&self) -> bool {
-        true
-    }
-
-    fn as_str(&self) -> &str {
-        self.text
-    }
-
-    fn insert_text(&mut self, text: &str, char_index: CharIndex) -> usize {
-        self.remember_before();
-        egui::TextBuffer::insert_text(self.text, text, char_index)
-    }
-
-    fn delete_char_range(&mut self, char_range: std::ops::Range<CharIndex>) {
-        self.remember_before();
-        egui::TextBuffer::delete_char_range(self.text, char_range);
-    }
-
-    fn type_id(&self) -> std::any::TypeId {
-        std::any::TypeId::of::<TrackingTextBufferType>()
-    }
-}
-
 fn editor_input_action(ui: &Ui) -> EditorInputAction {
     ui.input(|input| EditorInputAction {
         enter: input.key_pressed(Key::Enter),
@@ -3208,19 +3168,6 @@ mod tests {
         assert_eq!(next_footnote_number("plain"), 1);
         assert_eq!(next_footnote_number("[^1] and [^3]"), 2);
         assert_eq!(next_footnote_number("[^2]: definition"), 1);
-    }
-
-    #[test]
-    fn text_buffer_captures_one_lazy_unicode_snapshot_per_edit() {
-        let mut text = "你🙂好".to_owned();
-        let mut buffer = TrackingTextBuffer::new(&mut text);
-        assert!(buffer.take_before().is_none());
-
-        egui::TextBuffer::insert_text(&mut buffer, "!", CharIndex(2));
-        egui::TextBuffer::delete_char_range(&mut buffer, CharIndex(0)..CharIndex(1));
-
-        assert_eq!(buffer.take_before().as_deref(), Some("你🙂好"));
-        assert_eq!(egui::TextBuffer::as_str(&buffer), "🙂!好");
     }
 
     #[test]
