@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     collections::hash_map::DefaultHasher,
-    fs,
+    fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
     io::Write,
     ops::Range,
@@ -12,11 +12,15 @@ use std::{
 use encoding_rs::{Encoding, GB18030, GBK};
 use tempfile::NamedTempFile;
 
-use crate::markdown::{BlockIndex, MarkdownAnalysis, MarkdownBlock, analyze};
+use crate::{
+    markdown::{BlockIndex, MarkdownAnalysis, MarkdownBlock, analyze},
+    merge,
+};
 
 const MAX_HISTORY_ENTRIES: usize = 256;
 const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 const TYPING_COALESCE_WINDOW: Duration = Duration::from_millis(900);
+const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditKind {
@@ -79,7 +83,7 @@ impl LineEnding {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Document {
     pub path: Option<PathBuf>,
     pub content: String,
@@ -93,6 +97,7 @@ pub struct Document {
     undo_history: Vec<EditTransaction>,
     redo_history: Vec<EditTransaction>,
     block_index: BlockIndex,
+    lock: Option<DocumentLock>,
 }
 
 impl Document {
@@ -112,11 +117,30 @@ impl Document {
             undo_history: Vec::new(),
             redo_history: Vec::new(),
             block_index,
+            lock: None,
         }
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
+        let lock = DocumentLock::acquire(path)?;
+        Self::open_with_lock(path, Some(lock))
+    }
+
+    fn open_unlocked(path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::open_with_lock(path.as_ref(), None)
+    }
+
+    fn open_with_lock(path: &Path, lock: Option<DocumentLock>) -> Result<Self, String> {
+        let metadata =
+            fs::metadata(path).map_err(|error| format!("无法检查 {}：{error}", path.display()))?;
+        if metadata.len() > MAX_DOCUMENT_BYTES {
+            return Err(format!(
+                "文档超过 {} MiB 安全上限：{}",
+                MAX_DOCUMENT_BYTES / 1024 / 1024,
+                path.display()
+            ));
+        }
         let bytes =
             fs::read(path).map_err(|error| format!("无法读取 {}：{error}", path.display()))?;
         let decoded = decode_bytes(&bytes);
@@ -137,6 +161,7 @@ impl Document {
             undo_history: Vec::new(),
             redo_history: Vec::new(),
             block_index,
+            lock,
         })
     }
 
@@ -289,6 +314,54 @@ impl Document {
         Ok(metadata.len() != expected.length || metadata.modified().ok() != expected.modified)
     }
 
+    pub fn external_diff(&self) -> Result<String, String> {
+        let path = self
+            .path
+            .as_ref()
+            .ok_or_else(|| "未命名文档没有外部版本".to_owned())?;
+        let external = Self::open_unlocked(path)?;
+        Ok(diffy::create_patch(&self.content, &external.content).to_string())
+    }
+
+    pub fn merge_external(&mut self) -> Result<usize, String> {
+        let path = self
+            .path
+            .clone()
+            .ok_or_else(|| "未命名文档没有外部版本".to_owned())?;
+        let external = Self::open_unlocked(path)?;
+        let before = self.content.clone();
+        let merged = merge::three_way_merge(&self.saved_content, &self.content, &external.content);
+
+        self.content = merged.content;
+        self.saved_content = external.content;
+        self.file_fingerprint = external.file_fingerprint;
+        self.encoding = external.encoding;
+        self.line_ending = external.line_ending;
+        if !self.record_edit(before, None, None, EditKind::Other) {
+            self.update_after_edit();
+        }
+        Ok(merged.conflicts)
+    }
+
+    pub fn relink_external(&mut self, path: PathBuf) -> Result<usize, String> {
+        let new_lock = DocumentLock::acquire(&path)?;
+        let external = Self::open_unlocked(&path)?;
+        let before = self.content.clone();
+        let merged = merge::three_way_merge(&self.saved_content, &self.content, &external.content);
+
+        self.path = Some(path);
+        self.lock = Some(new_lock);
+        self.content = merged.content;
+        self.saved_content = external.content;
+        self.file_fingerprint = external.file_fingerprint;
+        self.encoding = external.encoding;
+        self.line_ending = external.line_ending;
+        if !self.record_edit(before, None, None, EditKind::Other) {
+            self.update_after_edit();
+        }
+        Ok(merged.conflicts)
+    }
+
     pub fn save(&mut self, overwrite_external: bool) -> Result<(), String> {
         let path = self
             .path
@@ -313,14 +386,24 @@ impl Document {
         if path.exists() && !overwrite_existing {
             return Err(format!("目标文件已存在：{}", path.display()));
         }
+        if self
+            .path
+            .as_deref()
+            .is_some_and(|current| absolute_path_identity(current) == absolute_path_identity(&path))
+        {
+            return self.save(true);
+        }
 
+        let new_lock = DocumentLock::acquire(&path)?;
         let previous_path = self.path.replace(path);
         let previous_fingerprint = self.file_fingerprint.take();
+        let previous_lock = self.lock.replace(new_lock);
         match self.save(true) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.path = previous_path;
                 self.file_fingerprint = previous_fingerprint;
+                self.lock = previous_lock;
                 Err(error)
             }
         }
@@ -331,7 +414,8 @@ impl Document {
             .path
             .clone()
             .ok_or_else(|| "未命名文档无法从磁盘重新加载".to_owned())?;
-        let reloaded = Self::open(path)?;
+        let mut reloaded = Self::open_unlocked(path)?;
+        reloaded.lock = self.lock.take();
         *self = reloaded;
         Ok(())
     }
@@ -349,6 +433,50 @@ impl Document {
         document.content = content;
         document.update_after_edit();
         document
+    }
+}
+
+#[derive(Debug)]
+struct DocumentLock {
+    _file: File,
+}
+
+impl DocumentLock {
+    fn acquire(path: &Path) -> Result<Self, String> {
+        let identity = absolute_path_identity(path);
+        let mut hasher = DefaultHasher::new();
+        identity.hash(&mut hasher);
+        let lock_directory = std::env::temp_dir().join("rupora-document-locks");
+        fs::create_dir_all(&lock_directory)
+            .map_err(|error| format!("无法创建文档锁目录 {}：{error}", lock_directory.display()))?;
+        let lock_path = lock_directory.join(format!("{:016x}.lock", hasher.finish()));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| format!("无法创建文档锁 {}：{error}", lock_path.display()))?;
+        fs2::FileExt::try_lock_exclusive(&file)
+            .map_err(|_| format!("文档已由另一个 RUPORA 实例编辑：{}", path.display()))?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn absolute_path_identity(path: &Path) -> PathBuf {
+    let absolute = path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        }
+    });
+    if cfg!(windows) {
+        PathBuf::from(absolute.to_string_lossy().to_lowercase())
+    } else {
+        absolute
     }
 }
 
@@ -883,5 +1011,80 @@ mod tests {
         assert_eq!(patch.removed, "old");
         assert_eq!(patch.inserted, "new");
         assert_eq!(patch.removed.len() + patch.inserted.len(), 6);
+    }
+
+    #[test]
+    fn merges_independent_external_edits_and_refreshes_fingerprint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("merge.md");
+        fs::write(&path, "one\nmiddle\ntwo\n").unwrap();
+        let mut document = Document::open(&path).unwrap();
+        let before = document.content.clone();
+        document.content = "ONE\nmiddle\ntwo\n".to_owned();
+        document.record_edit(before, None, None, EditKind::Other);
+        fs::write(&path, "one\nmiddle\nTWO\n").unwrap();
+
+        assert_eq!(document.merge_external().unwrap(), 0);
+        assert_eq!(document.content, "ONE\nmiddle\nTWO\n");
+        assert!(!document.has_external_changes().unwrap());
+        assert!(document.dirty);
+    }
+
+    #[test]
+    fn keeps_both_sides_when_external_merge_conflicts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("conflict-merge.md");
+        fs::write(&path, "base\n").unwrap();
+        let mut document = Document::open(&path).unwrap();
+        let before = document.content.clone();
+        document.content = "local\n".to_owned();
+        document.record_edit(before, None, None, EditKind::Other);
+        fs::write(&path, "external\n").unwrap();
+
+        assert_eq!(document.merge_external().unwrap(), 1);
+        assert!(document.content.contains("<<<<<<<"));
+        assert!(document.content.contains("local"));
+        assert!(document.content.contains("external"));
+    }
+
+    #[test]
+    fn relinks_a_moved_document_without_losing_local_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.md");
+        let moved = directory.path().join("moved.md");
+        fs::write(&original, "local target\nmiddle\nexternal target\n").unwrap();
+        let mut document = Document::open(&original).unwrap();
+        document.content = "local edit\nmiddle\nexternal target\n".to_owned();
+        document.update_after_edit();
+
+        fs::rename(&original, &moved).unwrap();
+        fs::write(&moved, "local target\nmiddle\nexternal edit\n").unwrap();
+        let conflicts = document.relink_external(moved.clone()).unwrap();
+
+        assert_eq!(conflicts, 0);
+        assert_eq!(document.path.as_deref(), Some(moved.as_path()));
+        assert_eq!(document.content, "local edit\nmiddle\nexternal edit\n");
+        assert!(document.dirty);
+        assert!(!document.has_external_changes().unwrap());
+    }
+
+    #[test]
+    fn rejects_documents_above_the_resource_limit_before_reading() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("too-large.md");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_DOCUMENT_BYTES + 1).unwrap();
+        assert!(Document::open(path).unwrap_err().contains("安全上限"));
+    }
+
+    #[test]
+    fn prevents_two_editor_instances_from_locking_the_same_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("locked.md");
+        fs::write(&path, "content").unwrap();
+        let first = Document::open(&path).unwrap();
+        assert!(Document::open(&path).unwrap_err().contains("另一个 RUPORA"));
+        drop(first);
+        assert!(Document::open(path).is_ok());
     }
 }

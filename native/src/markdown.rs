@@ -395,7 +395,7 @@ fn similarity_score(left: &str, right: &str) -> usize {
 }
 
 pub fn render_html_document(source: &str, title: &str, dark: bool) -> String {
-    let body = render_html_fragment(source);
+    let body = ammonia::clean(&render_html_fragment(source));
     let (background, foreground, muted, code_background) = if dark {
         ("#111318", "#e8eaf0", "#a8adba", "#20242c")
     } else {
@@ -505,6 +505,18 @@ mod tests {
         let html = render_html_fragment("| a | b |\n|---|---|\n| 1 | 2 |\n\n- [x] done");
         assert!(html.contains("<table>"));
         assert!(html.contains("type=\"checkbox\""));
+    }
+
+    #[test]
+    fn exported_html_removes_scripts_and_event_handlers() {
+        let html = render_html_document(
+            "<script>alert(1)</script><img src=\"safe.png\" onerror=\"alert(2)\">",
+            "safe",
+            false,
+        );
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("onerror"));
+        assert!(html.contains("safe.png"));
     }
 
     #[test]

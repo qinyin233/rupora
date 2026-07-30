@@ -179,6 +179,7 @@ pub struct RuporaApp {
     split_scroll_document: Option<usize>,
     collapsed_blocks: HashSet<(usize, BlockId)>,
     shortcut_settings_open: bool,
+    external_diff_view: Option<String>,
 }
 
 impl RuporaApp {
@@ -229,6 +230,7 @@ impl RuporaApp {
             split_scroll_document: None,
             collapsed_blocks: HashSet::new(),
             shortcut_settings_open: false,
+            external_diff_view: None,
         };
 
         match recovered_entries {
@@ -1076,6 +1078,10 @@ impl RuporaApp {
 
         let mut reload = false;
         let mut save_as = false;
+        let mut compare = false;
+        let mut merge = false;
+        let mut relink = false;
+        let missing = !path.exists();
         Panel::top("external-change")
             .exact_size(40.0)
             .show(root, |ui| {
@@ -1083,10 +1089,23 @@ impl RuporaApp {
                 ui.horizontal(|ui| {
                     ui.colored_label(
                         ui.visuals().warn_fg_color,
-                        "磁盘文件已发生变化，当前编辑内容尚未覆盖。",
+                        if missing {
+                            "磁盘文件已被移动或删除。"
+                        } else {
+                            "磁盘文件已发生变化，当前编辑内容尚未覆盖。"
+                        },
                     );
+                    if missing && ui.button("重新定位…").clicked() {
+                        relink = true;
+                    }
                     if ui.button("从磁盘重新加载").clicked() {
                         reload = true;
+                    }
+                    if ui.button("比较").clicked() {
+                        compare = true;
+                    }
+                    if ui.button("三方合并").clicked() {
+                        merge = true;
                     }
                     if ui.button("另存为…").clicked() {
                         save_as = true;
@@ -1094,7 +1113,48 @@ impl RuporaApp {
                 });
             });
 
-        if reload {
+        if relink {
+            if let Some(new_path) = FileDialog::new()
+                .add_filter("Markdown", &["md", "markdown", "mdown", "mkd", "txt"])
+                .pick_file()
+            {
+                match self.documents[index].relink_external(new_path.clone()) {
+                    Ok(conflicts) => {
+                        self.external_conflicts.remove(&path);
+                        self.remember_recent(new_path);
+                        self.editor_cursor = None;
+                        self.pending_editor_cursor = None;
+                        self.hybrid_active = None;
+                        self.status = if conflicts == 0 {
+                            "已重新关联移动后的文件".to_owned()
+                        } else {
+                            format!("已重新关联，但存在 {conflicts} 处合并冲突")
+                        };
+                    }
+                    Err(error) => self.show_error("重新关联失败", &error),
+                }
+            }
+        } else if compare {
+            match self.documents[index].external_diff() {
+                Ok(diff) => self.external_diff_view = Some(diff),
+                Err(error) => self.show_error("比较失败", &error),
+            }
+        } else if merge {
+            match self.documents[index].merge_external() {
+                Ok(conflicts) => {
+                    self.external_conflicts.remove(&path);
+                    self.editor_cursor = None;
+                    self.pending_editor_cursor = None;
+                    self.hybrid_active = None;
+                    self.status = if conflicts == 0 {
+                        "已自动合并外部修改".to_owned()
+                    } else {
+                        format!("合并完成，存在 {conflicts} 处冲突；请搜索 <<<<<<< 并人工处理")
+                    };
+                }
+                Err(error) => self.show_error("合并失败", &error),
+            }
+        } else if reload {
             let confirmed = !self.documents[index].dirty
                 || MessageDialog::new()
                     .set_level(MessageLevel::Warning)
@@ -1117,6 +1177,30 @@ impl RuporaApp {
             }
         } else if save_as {
             self.save_active(true);
+        }
+    }
+
+    fn external_diff_window(&mut self, root: &mut Ui) {
+        let Some(diff) = self.external_diff_view.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("当前编辑版本 ↔ 磁盘版本")
+            .id(egui::Id::new("external-diff"))
+            .default_size([760.0, 560.0])
+            .open(&mut open)
+            .show(root.ctx(), |ui| {
+                ui.label("“-”表示当前编辑器内容，“+”表示磁盘内容。");
+                ui.add(
+                    TextEdit::multiline(diff)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(28)
+                        .interactive(false),
+                );
+            });
+        if !open {
+            self.external_diff_view = None;
         }
     }
 
@@ -2104,9 +2188,16 @@ impl RuporaApp {
         } else {
             base.join(link_path)
         };
+        let allowed_root = self
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.root.as_path())
+            .unwrap_or(base);
 
         if !resolved.exists() {
             self.status = format!("链接目标不存在：{}", resolved.display());
+        } else if !path_is_within(&resolved, allowed_root) {
+            self.status = format!("已阻止打开工作区之外的本地路径：{}", resolved.display());
         } else if is_markdown_path(&resolved) {
             self.open_paths([resolved]);
         } else if let Err(error) = open::that(&resolved) {
@@ -2180,6 +2271,7 @@ impl eframe::App for RuporaApp {
         self.find_bar(ui);
         self.command_palette(ui);
         self.shortcut_settings(ui);
+        self.external_diff_window(ui);
         self.external_change_bar(ui);
         self.status_bar(ui);
         self.sidebar(ui);
@@ -2465,6 +2557,14 @@ fn markdown_resource_destination(path: &Path, base: &Path) -> String {
         .replace(')', "%29")
 }
 
+fn path_is_within(path: &Path, allowed_root: &Path) -> bool {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let allowed_root = allowed_root
+        .canonicalize()
+        .unwrap_or_else(|_| allowed_root.to_path_buf());
+    path.starts_with(allowed_root)
+}
+
 fn prompt_to_save(title: &str) -> MessageDialogResult {
     MessageDialog::new()
         .set_level(MessageLevel::Warning)
@@ -2594,5 +2694,19 @@ mod tests {
             0.5
         );
         assert_eq!(scroll_ratio(PaneScroll::default()), 0.0);
+    }
+
+    #[test]
+    fn local_path_policy_blocks_workspace_escape() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let outside = directory.path().join("outside.txt");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(&outside, "secret").unwrap();
+        let inside = workspace.join("note.md");
+        fs::write(&inside, "safe").unwrap();
+
+        assert!(path_is_within(&inside, &workspace));
+        assert!(!path_is_within(&outside, &workspace));
     }
 }
