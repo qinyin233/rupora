@@ -8,7 +8,8 @@
 
 - 将默认应用从 Tauri + Vue + Vditor 重写为 `eframe` / `egui` 原生 Rust 程序。
 - Markdown 解析、大纲、统计、预览、块范围和 HTML 导出改由 Rust 实现。
-- 根目录现在使用 Cargo 构建；1.x Web 实现只作为迁移对照保留。
+- 根目录现在使用 Cargo 构建；1.x Web 实现与 Node/Tauri 构建链已移出 2.x 源码树。
+- 编辑热路径按需保存旧文本，并在输入空闲窗口批量刷新 Markdown 派生状态。
 
 ### Added
 
@@ -28,6 +29,7 @@
 - 单实例文件转交、桌面文件关联、后台更新检查与轮转诊断日志。
 - Criterion 性能预算、Proptest、fuzz、故障注入、cargo-deny 与 RustSec 门禁。
 - 发布产物的 SHA-256、CycloneDX SBOM、GitHub 来源证明及平台签名密钥入口。
+- 排版文本到 Markdown UTF-8 源码边界的映射，以及混合模式块内点击定位。
 
 ### Known limitations
 

@@ -22,6 +22,7 @@ use crate::{
     markdown::{self, BlockId, Heading},
     native_preview::{prepare_native_preview, render_math_widget},
     recovery::RecoveryStore,
+    source_map::SourceMap,
     table::{self, MarkdownTable},
     updater::{self, UpdateInfo, UpdateStatus},
     workspace::{Workspace, WorkspaceEntry},
@@ -31,7 +32,7 @@ use eframe::{
     egui::{
         self, Align, Button, CentralPanel, Color32, Context, FontData, FontDefinitions, FontFamily,
         Key, Layout, Panel, RichText, ScrollArea, TextEdit, Ui, Vec2, ViewportCommand,
-        text::{CCursor, CCursorRange},
+        text::{CCursor, CCursorRange, CharIndex},
     },
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -2113,7 +2114,6 @@ impl RuporaApp {
     }
 
     fn edit_pane(&mut self, ui: &mut Ui, index: usize, scroll_offset: Option<f32>) -> PaneScroll {
-        let before_content = self.documents[index].content.clone();
         let selection_before = self.editor_cursor.map(cursor_range_to_char_range);
         let mut scroll_area = ScrollArea::vertical().id_salt(("editor-scroll", index));
         if let Some(offset) = scroll_offset {
@@ -2134,7 +2134,8 @@ impl RuporaApp {
                 self.editor_cursor = Some(cursor_range);
             }
             let input_action = editor_input_action(ui);
-            let output = TextEdit::multiline(&mut self.documents[index].content)
+            let mut editor_buffer = TrackingTextBuffer::new(&mut self.documents[index].content);
+            let output = TextEdit::multiline(&mut editor_buffer)
                 .id(editor_id)
                 .font(egui::TextStyle::Monospace)
                 .code_editor()
@@ -2143,6 +2144,8 @@ impl RuporaApp {
                 .desired_rows(desired_rows)
                 .lock_focus(true)
                 .show(ui);
+            let mut before_content = editor_buffer.take_before();
+            drop(editor_buffer);
             output.response.context_menu(|ui| {
                 if ui.button("撤销").clicked() {
                     context_command = Some(AppCommand::Undo);
@@ -2192,8 +2195,9 @@ impl RuporaApp {
                 && let (Some(url), Some(selection)) =
                     (input_action.pasted_url.as_deref(), selection_before.clone())
                 && !selection.is_empty()
+                && let Some(before_content) = before_content.as_ref()
             {
-                self.documents[index].content.clone_from(&before_content);
+                self.documents[index].content.clone_from(before_content);
                 if let Some(next) = editing::paste_url_as_markdown_link(
                     &mut self.documents[index].content,
                     selection,
@@ -2204,8 +2208,11 @@ impl RuporaApp {
                     changed = true;
                     cursor_adjusted = true;
                 }
-            } else if focused && input_action.tab {
-                self.documents[index].content.clone_from(&before_content);
+            } else if focused
+                && input_action.tab
+                && let Some(before_content) = before_content.as_ref()
+            {
+                self.documents[index].content.clone_from(before_content);
                 let selection = selection_before.clone().unwrap_or_else(|| {
                     let end = before_content.chars().count();
                     end..end
@@ -2221,10 +2228,11 @@ impl RuporaApp {
             } else if focused
                 && let (Some(typed), Some(selection)) =
                     (input_action.typed_text.as_deref(), selection_before.clone())
+                && let Some(before_content) = before_content.as_ref()
             {
                 let mut paired = before_content.clone();
                 if let Some(next) = editing::apply_smart_pair(&mut paired, selection, typed) {
-                    changed = paired != before_content;
+                    changed = paired != *before_content;
                     self.documents[index].content = paired;
                     selection_after = Some(next);
                     kind = EditKind::Other;
@@ -2242,6 +2250,7 @@ impl RuporaApp {
             }
 
             if changed
+                && let Some(before_content) = before_content.take()
                 && self.documents[index].record_edit(
                     before_content,
                     selection_before,
@@ -2586,7 +2595,19 @@ impl RuporaApp {
                                 );
                             }
                             if response.clicked() {
-                                activate = Some((block.id, block.range.start));
+                                let local_source_byte = response
+                                    .interact_pointer_pos()
+                                    .map(|position| {
+                                        let width = response.rect.width().max(1.0);
+                                        let height = response.rect.height().max(1.0);
+                                        SourceMap::from_markdown(&source[block.range.clone()])
+                                            .source_byte_at_normalized_point(
+                                                (position.x - response.rect.left()) / width,
+                                                (position.y - response.rect.top()) / height,
+                                            )
+                                    })
+                                    .unwrap_or_default();
+                                activate = Some((block.id, block.range.start + local_source_byte));
                             }
                         }
                     });
@@ -2734,6 +2755,12 @@ impl RuporaApp {
 impl eframe::App for RuporaApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut Frame) {
         ctx.request_repaint_after(Duration::from_millis(500));
+        for document in &mut self.documents {
+            document.refresh_derived_state_if_idle(Duration::from_millis(120));
+            if document.derived_state_is_stale() {
+                ctx.request_repaint_after(Duration::from_millis(40));
+            }
+        }
         self.poll_instance_requests(ctx);
         self.poll_update_check();
         self.handle_shortcuts(ctx);
@@ -2939,6 +2966,53 @@ struct EditorInputAction {
     typed_text: Option<String>,
 }
 
+struct TrackingTextBuffer<'a> {
+    text: &'a mut String,
+    before: Option<String>,
+}
+
+impl<'a> TrackingTextBuffer<'a> {
+    fn new(text: &'a mut String) -> Self {
+        Self { text, before: None }
+    }
+
+    fn remember_before(&mut self) {
+        if self.before.is_none() {
+            self.before = Some(self.text.clone());
+        }
+    }
+
+    fn take_before(&mut self) -> Option<String> {
+        self.before.take()
+    }
+}
+
+struct TrackingTextBufferType;
+
+impl egui::TextBuffer for TrackingTextBuffer<'_> {
+    fn is_mutable(&self) -> bool {
+        true
+    }
+
+    fn as_str(&self) -> &str {
+        self.text
+    }
+
+    fn insert_text(&mut self, text: &str, char_index: CharIndex) -> usize {
+        self.remember_before();
+        egui::TextBuffer::insert_text(self.text, text, char_index)
+    }
+
+    fn delete_char_range(&mut self, char_range: std::ops::Range<CharIndex>) {
+        self.remember_before();
+        egui::TextBuffer::delete_char_range(self.text, char_range);
+    }
+
+    fn type_id(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<TrackingTextBufferType>()
+    }
+}
+
 fn editor_input_action(ui: &Ui) -> EditorInputAction {
     ui.input(|input| EditorInputAction {
         enter: input.key_pressed(Key::Enter),
@@ -3134,6 +3208,19 @@ mod tests {
         assert_eq!(next_footnote_number("plain"), 1);
         assert_eq!(next_footnote_number("[^1] and [^3]"), 2);
         assert_eq!(next_footnote_number("[^2]: definition"), 1);
+    }
+
+    #[test]
+    fn text_buffer_captures_one_lazy_unicode_snapshot_per_edit() {
+        let mut text = "你🙂好".to_owned();
+        let mut buffer = TrackingTextBuffer::new(&mut text);
+        assert!(buffer.take_before().is_none());
+
+        egui::TextBuffer::insert_text(&mut buffer, "!", CharIndex(2));
+        egui::TextBuffer::delete_char_range(&mut buffer, CharIndex(0)..CharIndex(1));
+
+        assert_eq!(buffer.take_before().as_deref(), Some("你🙂好"));
+        assert_eq!(egui::TextBuffer::as_str(&buffer), "🙂!好");
     }
 
     #[test]

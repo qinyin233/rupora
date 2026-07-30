@@ -32,6 +32,9 @@ cargo build --release --locked
 - `native/src/document.rs`：文档状态、编码、换行、冲突检测和原子读写
 - `native/src/editing.rs`：查找替换、格式命令和字符位置映射
 - `native/src/markdown.rs`：Markdown 解析、块范围、大纲、统计和 HTML
+- `native/src/source_map.rs`：排版文本到 UTF-8 Markdown 源码边界的映射
+- `native/src/app_state.rs`：持久状态、快捷键和应用命令
+- `native/src/native_preview.rs`：数学公式、Mermaid 与生成 SVG 缓存
 - `native/src/recovery.rs`：崩溃恢复快照
 - `native/src/workspace.rs`：工作区目录树
 - `assets/icons/`：桌面窗口和安装包使用的跨平台图标

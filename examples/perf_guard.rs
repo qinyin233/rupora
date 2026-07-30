@@ -1,4 +1,7 @@
-use rupora::markdown::{BlockIndex, analyze, render_html_fragment};
+use rupora::{
+    document::{Document, EditKind},
+    markdown::{BlockIndex, analyze, render_html_fragment},
+};
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -13,6 +16,20 @@ fn main() {
     measure("reconcile 20k blocks", Duration::from_secs(1), || {
         index.update(&edited);
     });
+
+    let mut document = Document::untitled(1);
+    document.content = source.clone();
+    document.update_after_edit();
+    let before = document.content.clone();
+    document.content.push('!');
+    measure(
+        "record edit without synchronous analysis",
+        Duration::from_millis(250),
+        || {
+            assert!(document.record_edit(before, None, None, EditKind::Typing));
+            assert!(document.derived_state_is_stale());
+        },
+    );
 
     let export_source = representative_document(2_000);
     measure("render 2k sections to HTML", Duration::from_secs(2), || {

@@ -110,6 +110,7 @@ macOS 分别构建安装包，并附加 SHA-256 校验、CycloneDX SBOM 与构�
 ```text
 native/src/
 ├── app.rs         # 原生 UI、窗口、命令、多文档与混合编辑交互
+├── app_state.rs   # 持久状态、快捷键与应用命令
 ├── diagnostics.rs # 轮转运行日志与 panic 回溯
 ├── document.rs    # 文档模型、编码、换行、冲突检测与原子写入
 ├── editing.rs     # 查找替换、格式命令和字符位置映射
@@ -118,6 +119,7 @@ native/src/
 ├── markdown.rs    # GFM、公式、图表、块范围、大纲、统计和 HTML
 ├── merge.rs       # 外部修改三方合并
 ├── recovery.rs    # 崩溃恢复快照
+├── source_map.rs  # 排版文本到 Markdown 源码的 Unicode 安全映射
 ├── table.rs       # 表格解析与可视化编辑模型
 ├── updater.rs     # 后台 Release 更新检查
 ├── workspace.rs   # 工作区目录树
@@ -129,10 +131,10 @@ assets/icons/      # 桌面窗口与安装包使用的跨平台图标
 
 ## 仍需诚实说明的限制
 
-P1–P5 已逐项完成，但混合模式仍不是 Typora 的像素级复制：点击排版块目前定位到块首，
-尚未把排版字形坐标精确映射回 Markdown 标记字符；跨块富文本选择、多光标、语言服务和插件
-API 仍属于后续编辑器研究。平台代码签名还必须由维护者提供外部证书，源码不能生成可信身份。
-完整状态见 [P1–P5 路线图](docs/ROADMAP.md)，质量门禁见 [质量说明](docs/QUALITY.md)。
+P1–P6 已逐项完成，但混合模式仍不是 Typora 的像素级复制：块内点击已映射到对应源码附近，
+尚未共享 CommonMark 渲染器的逐字形排版坐标；跨块富文本选择和多光标仍属于后续编辑器研究。
+平台代码签名还必须由维护者提供外部证书，源码不能生成可信身份。
+完整状态见 [P1–P6 路线图](docs/ROADMAP.md)，质量门禁见 [质量说明](docs/QUALITY.md)。
 
 ## License
 

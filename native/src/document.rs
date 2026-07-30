@@ -97,6 +97,8 @@ pub struct Document {
     undo_history: Vec<EditTransaction>,
     redo_history: Vec<EditTransaction>,
     block_index: BlockIndex,
+    derived_state_stale: bool,
+    last_content_edit: Option<Instant>,
     lock: Option<DocumentLock>,
 }
 
@@ -117,6 +119,8 @@ impl Document {
             undo_history: Vec::new(),
             redo_history: Vec::new(),
             block_index,
+            derived_state_stale: false,
+            last_content_edit: None,
             lock: None,
         }
     }
@@ -161,6 +165,8 @@ impl Document {
             undo_history: Vec::new(),
             redo_history: Vec::new(),
             block_index,
+            derived_state_stale: false,
+            last_content_edit: None,
             lock,
         })
     }
@@ -183,9 +189,44 @@ impl Document {
         self.dirty = self.content != self.saved_content;
         self.analysis = analyze(&self.content);
         self.block_index.update(&self.content);
+        self.derived_state_stale = false;
+        self.last_content_edit = None;
     }
 
-    pub fn blocks(&self) -> &[MarkdownBlock] {
+    fn mark_after_edit(&mut self, edited_at: Instant) {
+        self.dirty = self.content != self.saved_content;
+        self.derived_state_stale = true;
+        self.last_content_edit = Some(edited_at);
+    }
+
+    pub fn derived_state_is_stale(&self) -> bool {
+        self.derived_state_stale
+    }
+
+    pub fn refresh_derived_state(&mut self) -> bool {
+        if !self.derived_state_stale {
+            return false;
+        }
+        self.analysis = analyze(&self.content);
+        self.block_index.update(&self.content);
+        self.derived_state_stale = false;
+        self.last_content_edit = None;
+        true
+    }
+
+    pub fn refresh_derived_state_if_idle(&mut self, delay: Duration) -> bool {
+        if !self.derived_state_stale
+            || self
+                .last_content_edit
+                .is_some_and(|edited_at| edited_at.elapsed() < delay)
+        {
+            return false;
+        }
+        self.refresh_derived_state()
+    }
+
+    pub fn blocks(&mut self) -> &[MarkdownBlock] {
+        self.refresh_derived_state();
         self.block_index.blocks()
     }
 
@@ -201,9 +242,8 @@ impl Document {
         }
 
         let now = Instant::now();
-        let after = self.content.clone();
         let before_hash = text_hash(&before);
-        let after_hash = text_hash(&after);
+        let after_hash = text_hash(&self.content);
         let can_coalesce = kind == EditKind::Typing
             && self.undo_history.last().is_some_and(|previous| {
                 previous.kind == EditKind::Typing
@@ -213,23 +253,30 @@ impl Document {
             });
 
         if can_coalesce {
-            let previous = self
-                .undo_history
-                .last_mut()
-                .expect("coalescing requires an existing transaction");
             let mut original_before = before;
-            let reversed = previous.patch.apply_reverse(&mut original_before);
+            let reversed = self
+                .undo_history
+                .last()
+                .expect("coalescing requires an existing transaction")
+                .patch
+                .apply_reverse(&mut original_before);
             debug_assert!(
                 reversed,
                 "coalesced transaction must match its prior result"
             );
-            previous.patch = TextPatch::between(&original_before, &after);
+            let patch = TextPatch::between(&original_before, &self.content);
+            let previous = self
+                .undo_history
+                .last_mut()
+                .expect("coalescing requires an existing transaction");
+            previous.patch = patch;
             previous.selection_after = selection_after;
             previous.created_at = now;
             previous.after_hash = after_hash;
         } else {
+            let patch = TextPatch::between(&before, &self.content);
             self.undo_history.push(EditTransaction {
-                patch: TextPatch::between(&before, &after),
+                patch,
                 before_hash,
                 after_hash,
                 selection_before,
@@ -240,7 +287,7 @@ impl Document {
         }
         self.redo_history.clear();
         trim_history(&mut self.undo_history);
-        self.update_after_edit();
+        self.mark_after_edit(now);
         true
     }
 
@@ -265,7 +312,7 @@ impl Document {
         };
         self.redo_history.push(transaction);
         trim_history(&mut self.redo_history);
-        self.update_after_edit();
+        self.mark_after_edit(Instant::now());
         Some(outcome)
     }
 
@@ -282,7 +329,7 @@ impl Document {
         };
         self.undo_history.push(transaction);
         trim_history(&mut self.undo_history);
-        self.update_after_edit();
+        self.mark_after_edit(Instant::now());
         Some(outcome)
     }
 
@@ -951,6 +998,34 @@ mod tests {
 
         assert_eq!(document.redo().unwrap().selection, Some(2..2));
         assert_eq!(document.content, "你好");
+    }
+
+    #[test]
+    fn defers_full_markdown_analysis_during_a_typing_burst() {
+        let mut document = Document::untitled(1);
+        let before = document.content.clone();
+        document.content = "# 标题\n\n正文".to_owned();
+        document.record_edit(before, None, None, EditKind::Typing);
+
+        assert!(document.derived_state_is_stale());
+        assert!(document.analysis.headings.is_empty());
+        assert!(!document.refresh_derived_state_if_idle(Duration::from_secs(60)));
+
+        assert!(document.refresh_derived_state_if_idle(Duration::ZERO));
+        assert!(!document.derived_state_is_stale());
+        assert_eq!(document.analysis.headings[0].text, "标题");
+    }
+
+    #[test]
+    fn requesting_blocks_refreshes_deferred_derived_state() {
+        let mut document = Document::untitled(1);
+        let before = document.content.clone();
+        document.content = "alpha\n\nbeta".to_owned();
+        document.record_edit(before, None, None, EditKind::Typing);
+
+        assert!(document.derived_state_is_stale());
+        assert_eq!(document.blocks().len(), 2);
+        assert!(!document.derived_state_is_stale());
     }
 
     #[test]
