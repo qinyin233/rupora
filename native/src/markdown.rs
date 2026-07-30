@@ -4,7 +4,9 @@ use std::{
     ops::Range,
 };
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
+use pulldown_cmark::{
+    CodeBlockKind, CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd, html,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MarkdownAnalysis {
@@ -19,6 +21,25 @@ pub struct Heading {
     pub level: u8,
     pub text: String,
     pub line: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadingAnchor {
+    pub heading: Heading,
+    pub id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrontMatter {
+    pub fields: Vec<(String, String)>,
+    pub raw: String,
+    pub body_start: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MermaidBlock {
+    pub range: Range<usize>,
+    pub source: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -131,6 +152,7 @@ pub fn parser_options() -> Options {
     Options::ENABLE_GFM
         | Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_MATH
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_HEADING_ATTRIBUTES
@@ -187,10 +209,117 @@ pub fn analyze(source: &str) -> MarkdownAnalysis {
     }
 }
 
+pub fn heading_anchors(source: &str) -> Vec<HeadingAnchor> {
+    let mut occurrences = HashMap::<String, usize>::new();
+    analyze(source)
+        .headings
+        .into_iter()
+        .map(|heading| {
+            let base = heading_slug(&heading.text);
+            let occurrence = occurrences.entry(base.clone()).or_default();
+            let id = if *occurrence == 0 {
+                base
+            } else {
+                format!("{base}-{}", *occurrence)
+            };
+            *occurrence += 1;
+            HeadingAnchor { heading, id }
+        })
+        .collect()
+}
+
+pub fn parse_front_matter(source: &str) -> Option<FrontMatter> {
+    if !source.starts_with("---\n") {
+        return None;
+    }
+
+    let mut cursor = 4usize;
+    for line in source[4..].split_inclusive('\n') {
+        let line_start = cursor;
+        cursor += line.len();
+        if matches!(line.trim(), "---" | "...") {
+            let raw = source[4..line_start].trim_end_matches('\n').to_owned();
+            let fields = match serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&raw) {
+                Ok(serde_yaml_ng::Value::Mapping(mapping)) => mapping
+                    .into_iter()
+                    .map(|(key, value)| (yaml_value_text(&key), yaml_value_text(&value)))
+                    .collect(),
+                Ok(value) => vec![("value".to_owned(), yaml_value_text(&value))],
+                Err(error) => vec![("解析错误".to_owned(), error.to_string())],
+            };
+            return Some(FrontMatter {
+                fields,
+                raw,
+                body_start: cursor,
+            });
+        }
+    }
+    None
+}
+
+pub fn mermaid_blocks(source: &str) -> Vec<MermaidBlock> {
+    let mut blocks = Vec::new();
+    let mut active: Option<(usize, String)> = None;
+    for (event, range) in Parser::new_ext(source, parser_options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                if info
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|language| language.eq_ignore_ascii_case("mermaid")) =>
+            {
+                active = Some((range.start, String::new()));
+            }
+            Event::Text(text) if active.is_some() => {
+                if let Some((_, diagram)) = active.as_mut() {
+                    diagram.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) if active.is_some() => {
+                if let Some((start, diagram)) = active.take() {
+                    blocks.push(MermaidBlock {
+                        range: start..range.end,
+                        source: diagram,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+pub fn prepare_preview_markdown(source: &str) -> String {
+    expand_front_matter_and_toc(source)
+}
+
+pub fn render_math_svg(source: &str, inline: bool) -> Result<String, String> {
+    let nodes = ratex_parser::parse(source).map_err(|error| error.to_string())?;
+    let layout = ratex_layout::layout(&nodes, &ratex_layout::LayoutOptions::default());
+    let display_list = ratex_layout::to_display_list(&layout);
+    let options = ratex_svg::SvgOptions {
+        font_size: if inline { 24.0 } else { 34.0 },
+        padding: if inline { 2.0 } else { 8.0 },
+        embed_glyphs: true,
+        ..ratex_svg::SvgOptions::default()
+    };
+    Ok(ratex_svg::render_to_svg(&display_list, &options))
+}
+
+pub fn render_mermaid_svg(source: &str, dark: bool) -> Result<String, String> {
+    let theme = if dark {
+        mermaid_svg::Theme::dark()
+    } else {
+        mermaid_svg::Theme::default()
+    };
+    mermaid_svg::render_with(source, &theme).map_err(|error| error.to_string())
+}
+
 pub fn render_html_fragment(source: &str) -> String {
-    let parser = Parser::new_ext(source, parser_options());
-    let mut output = String::new();
-    html::push_html(&mut output, parser);
+    let (mut output, generated) = render_html_with_generated(source, false);
+    for (token, svg) in generated {
+        output = output.replace(&token, &svg);
+    }
     output
 }
 
@@ -207,8 +336,38 @@ pub fn local_link_destinations(source: &str) -> Vec<String> {
     destinations
 }
 
+pub fn synchronize_task_markers(source: &str, rendered_markdown: &str) -> Option<String> {
+    let source_markers = task_markers(source);
+    let rendered_states = task_markers(rendered_markdown)
+        .into_iter()
+        .map(|(_, checked)| checked)
+        .collect::<Vec<_>>();
+    if source_markers.len() != rendered_states.len() {
+        return None;
+    }
+    let mut output = source.to_owned();
+    let mut changed = false;
+    for ((range, before), after) in source_markers.into_iter().zip(rendered_states).rev() {
+        if before != after {
+            output.replace_range(range, if after { "[x]" } else { "[ ]" });
+            changed = true;
+        }
+    }
+    changed.then_some(output)
+}
+
 pub fn blocks(source: &str) -> Vec<MarkdownBlock> {
     BlockIndex::new(source).blocks
+}
+
+fn task_markers(source: &str) -> Vec<(Range<usize>, bool)> {
+    Parser::new_ext(source, parser_options())
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            Event::TaskListMarker(checked) => Some((range, checked)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn block_ranges(source: &str) -> Vec<Range<usize>> {
@@ -394,8 +553,213 @@ fn similarity_score(left: &str, right: &str) -> usize {
     prefix + suffix
 }
 
+fn expand_front_matter_and_toc(source: &str) -> String {
+    let (front_matter, body) = if let Some(front_matter) = parse_front_matter(source) {
+        let body = &source[front_matter.body_start..];
+        (Some(front_matter), body)
+    } else {
+        (None, source)
+    };
+    let anchors = heading_anchors(body);
+    let toc = render_toc_markdown(&anchors);
+    let mut output = String::new();
+
+    if let Some(front_matter) = front_matter {
+        output.push_str("> **文档元数据**\n");
+        for (key, value) in front_matter.fields {
+            output.push_str("> - **");
+            output.push_str(&key.replace(['*', '[', ']'], ""));
+            output.push_str("：** ");
+            output.push_str(&value.replace('\n', " "));
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+
+    let mut in_fence = false;
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        }
+        if !in_fence && trimmed.eq_ignore_ascii_case("[TOC]") {
+            output.push_str(&toc);
+            if line.ends_with('\n') && !toc.ends_with('\n') {
+                output.push('\n');
+            }
+        } else {
+            output.push_str(line);
+        }
+    }
+    if !body.is_empty() && !body.ends_with('\n') && output.is_empty() {
+        output.push_str(body);
+    }
+    output
+}
+
+fn render_toc_markdown(anchors: &[HeadingAnchor]) -> String {
+    if anchors.is_empty() {
+        return "> 文档暂无可用标题。\n".to_owned();
+    }
+    let minimum_level = anchors
+        .iter()
+        .map(|anchor| anchor.heading.level)
+        .min()
+        .unwrap_or(1);
+    let mut output = String::new();
+    for anchor in anchors {
+        let indent = anchor.heading.level.saturating_sub(minimum_level) as usize;
+        output.push_str(&"  ".repeat(indent));
+        output.push_str("- [");
+        output.push_str(
+            &anchor
+                .heading
+                .text
+                .replace('\\', "\\\\")
+                .replace('[', "\\[")
+                .replace(']', "\\]"),
+        );
+        output.push_str("](#");
+        output.push_str(&anchor.id);
+        output.push_str(")\n");
+    }
+    output
+}
+
+fn heading_slug(text: &str) -> String {
+    let mut output = String::new();
+    let mut pending_separator = false;
+    for character in text.chars() {
+        if character.is_alphanumeric() || matches!(character, '_' | '-') {
+            if pending_separator && !output.is_empty() && !output.ends_with('-') {
+                output.push('-');
+            }
+            output.extend(character.to_lowercase());
+            pending_separator = false;
+        } else if character.is_whitespace() {
+            pending_separator = true;
+        }
+    }
+    if output.is_empty() {
+        "section".to_owned()
+    } else {
+        output
+    }
+}
+
+fn yaml_value_text(value: &serde_yaml_ng::Value) -> String {
+    match value {
+        serde_yaml_ng::Value::Null => "null".to_owned(),
+        serde_yaml_ng::Value::Bool(value) => value.to_string(),
+        serde_yaml_ng::Value::Number(value) => value.to_string(),
+        serde_yaml_ng::Value::String(value) => value.clone(),
+        _ => serde_yaml_ng::to_string(value)
+            .unwrap_or_else(|_| format!("{value:?}"))
+            .trim()
+            .to_owned(),
+    }
+}
+
+fn render_html_with_generated(source: &str, dark: bool) -> (String, Vec<(String, String)>) {
+    let expanded = expand_front_matter_and_toc(source);
+    let anchors = heading_anchors(&expanded);
+    let mut heading_index = 0usize;
+    let mut generated = Vec::<(String, String)>::new();
+    let mut events = Vec::<Event<'static>>::new();
+    let mut parser = Parser::new_ext(&expanded, parser_options()).into_offset_iter();
+
+    while let Some((event, _)) = parser.next() {
+        match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                if info
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|language| language.eq_ignore_ascii_case("mermaid")) =>
+            {
+                let mut diagram = String::new();
+                for (event, _) in parser.by_ref() {
+                    match event {
+                        Event::Text(text) => diagram.push_str(&text),
+                        Event::End(TagEnd::CodeBlock) => break,
+                        _ => {}
+                    }
+                }
+                let token = generated_html_token(generated.len());
+                let rendered = render_mermaid_svg(&diagram, dark).unwrap_or_else(|error| {
+                    format!(
+                        "<pre class=\"diagram-error\">Mermaid：{}</pre>",
+                        escape_html(&error)
+                    )
+                });
+                generated.push((token.clone(), rendered));
+                events.push(Event::Html(CowStr::Boxed(token.into_boxed_str())));
+            }
+            Event::InlineMath(math) => {
+                let token = generated_html_token(generated.len());
+                let rendered = render_math_svg(&math, true).unwrap_or_else(|error| {
+                    format!(
+                        "<code class=\"math-error\" title=\"{}\">{}</code>",
+                        escape_html(&error),
+                        escape_html(&math)
+                    )
+                });
+                let rendered = format!("<span class=\"math-inline\">{rendered}</span>");
+                generated.push((token.clone(), rendered));
+                events.push(Event::Html(CowStr::Boxed(token.into_boxed_str())));
+            }
+            Event::DisplayMath(math) => {
+                let token = generated_html_token(generated.len());
+                let rendered = render_math_svg(&math, false).unwrap_or_else(|error| {
+                    format!(
+                        "<code class=\"math-error\" title=\"{}\">{}</code>",
+                        escape_html(&error),
+                        escape_html(&math)
+                    )
+                });
+                let rendered = format!("<div class=\"math-display\">{rendered}</div>");
+                generated.push((token.clone(), rendered));
+                events.push(Event::Html(CowStr::Boxed(token.into_boxed_str())));
+            }
+            Event::Start(Tag::Heading {
+                level,
+                id,
+                classes,
+                attrs,
+            }) => {
+                let generated_id = anchors
+                    .get(heading_index)
+                    .map(|anchor| anchor.id.clone())
+                    .unwrap_or_else(|| format!("section-{}", heading_index + 1));
+                heading_index += 1;
+                events.push(Event::Start(
+                    Tag::Heading {
+                        level,
+                        id: id.or_else(|| Some(CowStr::Boxed(generated_id.into_boxed_str()))),
+                        classes,
+                        attrs,
+                    }
+                    .into_static(),
+                ));
+            }
+            event => events.push(event.into_static()),
+        }
+    }
+
+    let mut output = String::new();
+    html::push_html(&mut output, events.into_iter());
+    (output, generated)
+}
+
+fn generated_html_token(index: usize) -> String {
+    format!("RUPORA_GENERATED_BLOCK_{index}_B5C4718D")
+}
+
 pub fn render_html_document(source: &str, title: &str, dark: bool) -> String {
-    let body = ammonia::clean(&render_html_fragment(source));
+    let (unsafe_body, generated) = render_html_with_generated(source, dark);
+    let mut body = ammonia::clean(&unsafe_body);
+    for (token, svg) in generated {
+        body = body.replace(&token, &svg);
+    }
     let (background, foreground, muted, code_background) = if dark {
         ("#111318", "#e8eaf0", "#a8adba", "#20242c")
     } else {
@@ -414,7 +778,7 @@ pub fn render_html_document(source: &str, title: &str, dark: bool) -> String {
     body {{
       max-width: 860px; margin: 0 auto; padding: 48px 28px 80px;
       background: {}; color: {}; line-height: 1.7;
-      font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      font-family: "RUPORA CJK", system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
     }}
     h1, h2 {{ border-bottom: 1px solid {}; padding-bottom: .3em; }}
     a {{ color: #4d7cff; }}
@@ -425,6 +789,10 @@ pub fn render_html_document(source: &str, title: &str, dark: bool) -> String {
     table {{ border-collapse: collapse; width: 100%; }}
     th, td {{ border: 1px solid {}; padding: 8px 12px; text-align: left; }}
     img {{ max-width: 100%; }}
+    svg {{ max-width: 100%; height: auto; }}
+    .math-inline svg {{ display: inline-block; width: auto; height: 1.4em; vertical-align: -.35em; }}
+    .math-display {{ margin: 1.2em 0; overflow-x: auto; text-align: center; }}
+    .math-display svg {{ width: auto; }}
   </style>
 </head>
 <body>{}</body>
@@ -508,6 +876,62 @@ mod tests {
     }
 
     #[test]
+    fn synchronizes_preview_task_changes_back_to_the_source() {
+        let source = "- [ ] first\n- [x] second\n";
+        let rendered = "> metadata\n\n- [x] first\n- [ ] second\n";
+        assert_eq!(
+            synchronize_task_markers(source, rendered).unwrap(),
+            "- [x] first\n- [ ] second\n"
+        );
+    }
+
+    #[test]
+    fn parses_yaml_front_matter_and_hides_it_from_the_document_body() {
+        let source = "---\ntitle: Native Rust\ntags: [editor, markdown]\n---\n# Body\n";
+        let front_matter = parse_front_matter(source).unwrap();
+        assert_eq!(
+            front_matter.fields[0],
+            ("title".to_owned(), "Native Rust".to_owned())
+        );
+        assert!(front_matter.body_start > front_matter.raw.len());
+
+        let html = render_html_fragment(source);
+        assert!(html.contains("文档元数据"));
+        assert!(html.contains("<h1 id=\"body\">Body</h1>"));
+        assert!(!html.contains("title: Native Rust"));
+    }
+
+    #[test]
+    fn creates_unique_unicode_heading_anchors_and_expands_toc() {
+        let source = "[TOC]\n\n# 开始\n\n## Same\n\n## Same\n";
+        let anchors = heading_anchors(source);
+        assert_eq!(anchors[0].id, "开始");
+        assert_eq!(anchors[1].id, "same");
+        assert_eq!(anchors[2].id, "same-1");
+
+        let html = render_html_fragment(source);
+        assert!(html.contains("href=\"#same-1\""));
+        assert!(html.contains("<h2 id=\"same-1\">Same</h2>"));
+    }
+
+    #[test]
+    fn renders_math_and_mermaid_without_a_browser_runtime() {
+        let math = render_math_svg(r"\frac{1}{2} + x^2", false).unwrap();
+        assert!(math.starts_with("<svg"));
+        assert!(math.contains("<path"));
+
+        let diagram = render_mermaid_svg("flowchart LR\nA[Start] --> B[Done]\n", false).unwrap();
+        assert!(diagram.starts_with("<svg"));
+        assert!(diagram.contains("Start"));
+
+        let html =
+            render_html_fragment("Inline $x^2$.\n\n```mermaid\nflowchart LR\nA --> B\n```\n");
+        assert!(html.contains("math-inline"));
+        assert!(html.contains("<svg"));
+        assert!(!html.contains("<code class=\"language-mermaid\""));
+    }
+
+    #[test]
     fn exported_html_removes_scripts_and_event_handlers() {
         let html = render_html_document(
             "<script>alert(1)</script><img src=\"safe.png\" onerror=\"alert(2)\">",
@@ -517,6 +941,17 @@ mod tests {
         assert!(!html.contains("<script"));
         assert!(!html.contains("onerror"));
         assert!(html.contains("safe.png"));
+    }
+
+    #[test]
+    fn generated_diagrams_do_not_reintroduce_active_html() {
+        let html = render_html_document(
+            "```mermaid\nflowchart LR\nA[<script>alert(1)</script>] --> B\n```\n",
+            "safe diagram",
+            false,
+        );
+        assert!(!html.to_ascii_lowercase().contains("<script"));
+        assert!(!html.to_ascii_lowercase().contains("onload="));
     }
 
     #[test]

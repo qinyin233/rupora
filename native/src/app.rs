@@ -1,7 +1,10 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -21,8 +24,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     document::{Document, EditKind},
     editing::{self, MarkdownCommand},
+    export,
     markdown::{self, BlockId, Heading},
     recovery::RecoveryStore,
+    table::{self, MarkdownTable},
     workspace::{Workspace, WorkspaceEntry},
 };
 
@@ -134,9 +139,19 @@ enum AppCommand {
     Undo,
     Redo,
     ExportHtml,
+    ExportPdf,
+    Print,
+    EditTable,
+    InsertToc,
+    InsertFootnote,
     PasteImage,
     Format(MarkdownCommand),
     SetView(ViewMode),
+}
+
+struct TableEditorState {
+    document: usize,
+    table: MarkdownTable,
 }
 
 enum ShortcutAction {
@@ -180,6 +195,8 @@ pub struct RuporaApp {
     collapsed_blocks: HashSet<(usize, BlockId)>,
     shortcut_settings_open: bool,
     external_diff_view: Option<String>,
+    generated_svg_cache: Rc<RefCell<HashMap<String, Arc<[u8]>>>>,
+    table_editor: Option<TableEditorState>,
 }
 
 impl RuporaApp {
@@ -231,6 +248,8 @@ impl RuporaApp {
             collapsed_blocks: HashSet::new(),
             shortcut_settings_open: false,
             external_diff_view: None,
+            generated_svg_cache: Rc::new(RefCell::new(HashMap::new())),
+            table_editor: None,
         };
 
         match recovered_entries {
@@ -553,6 +572,116 @@ impl RuporaApp {
         }
     }
 
+    fn export_pdf(&mut self) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let document = &self.documents[index];
+        let default_name = document
+            .title()
+            .trim_end_matches(".markdown")
+            .trim_end_matches(".md")
+            .to_owned()
+            + ".pdf";
+        let Some(path) = FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return;
+        };
+        let html =
+            markdown::render_html_document(&document.content, &document.title(), self.state.dark);
+        match export::write_pdf(&path, &html) {
+            Ok(()) => self.status = format!("已导出 PDF：{}", path.display()),
+            Err(error) => self.show_error("PDF 导出失败", &error),
+        }
+    }
+
+    fn print_active(&mut self) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let document = &self.documents[index];
+        let html =
+            markdown::render_html_document(&document.content, &document.title(), self.state.dark);
+        match export::print_html(&html) {
+            Ok(path) => self.status = format!("已提交系统打印任务：{}", path.display()),
+            Err(error) => self.show_error("打印失败", &error),
+        }
+    }
+
+    fn insert_text(&mut self, text: &str, kind: EditKind) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let selection = self.active_selection(index);
+        let before = self.documents[index].content.clone();
+        let start = char_to_byte(&before, selection.start);
+        let end = char_to_byte(&before, selection.end);
+        self.documents[index]
+            .content
+            .replace_range(start..end, text);
+        let cursor = selection.start + text.chars().count();
+        self.documents[index].record_edit(before, Some(selection), Some(cursor..cursor), kind);
+        self.queue_editor_selection(cursor..cursor);
+        if self.state.view_mode == ViewMode::Preview {
+            self.state.view_mode = ViewMode::Edit;
+        }
+    }
+
+    fn insert_footnote(&mut self) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let number = next_footnote_number(&self.documents[index].content);
+        let selection = self.active_selection(index);
+        let before = self.documents[index].content.clone();
+        let start = char_to_byte(&before, selection.start);
+        let end = char_to_byte(&before, selection.end);
+        let reference = format!("[^{number}]");
+        self.documents[index]
+            .content
+            .replace_range(start..end, &reference);
+        if !self.documents[index].content.ends_with('\n') {
+            self.documents[index].content.push('\n');
+        }
+        self.documents[index]
+            .content
+            .push_str(&format!("\n[^{number}]: 脚注内容\n"));
+        let cursor = selection.start + reference.chars().count();
+        self.documents[index].record_edit(
+            before,
+            Some(selection),
+            Some(cursor..cursor),
+            EditKind::Format,
+        );
+        self.queue_editor_selection(cursor..cursor);
+        if self.state.view_mode == ViewMode::Preview {
+            self.state.view_mode = ViewMode::Edit;
+        }
+        self.status = format!("已插入脚注 {number}");
+    }
+
+    fn insert_cross_reference(&mut self, label: &str, id: &str) {
+        self.insert_text(&format!("[{label}](#{id})"), EditKind::Format);
+        self.status = format!("已插入对“{label}”的交叉引用");
+    }
+
+    fn open_table_editor(&mut self) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let cursor = self.active_selection(index).start;
+        let cursor_byte = char_to_byte(&self.documents[index].content, cursor);
+        let table = table::find_table(&self.documents[index].content, cursor_byte)
+            .unwrap_or_else(|| table::new_table(cursor_byte));
+        self.table_editor = Some(TableEditorState {
+            document: index,
+            table,
+        });
+    }
+
     fn close_document(&mut self, index: usize) {
         if index >= self.documents.len() {
             return;
@@ -675,6 +804,11 @@ impl RuporaApp {
             AppCommand::Undo => self.undo_active(),
             AppCommand::Redo => self.redo_active(),
             AppCommand::ExportHtml => self.export_html(),
+            AppCommand::ExportPdf => self.export_pdf(),
+            AppCommand::Print => self.print_active(),
+            AppCommand::EditTable => self.open_table_editor(),
+            AppCommand::InsertToc => self.insert_text("[TOC]\n", EditKind::Format),
+            AppCommand::InsertFootnote => self.insert_footnote(),
             AppCommand::PasteImage => self.paste_clipboard_image(),
             AppCommand::Format(command) => self.apply_format(command),
             AppCommand::SetView(mode) => self.state.view_mode = mode,
@@ -1204,6 +1338,146 @@ impl RuporaApp {
         }
     }
 
+    fn table_editor_window(&mut self, root: &mut Ui) {
+        let Some(state) = self.table_editor.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("可视化表格编辑器")
+            .id(egui::Id::new("table-editor"))
+            .default_size([760.0, 420.0])
+            .open(&mut open)
+            .show(root.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("增加列").clicked() {
+                        state.table.add_column();
+                    }
+                    if ui
+                        .add_enabled(state.table.headers.len() > 1, Button::new("删除末列"))
+                        .clicked()
+                    {
+                        state.table.remove_column();
+                    }
+                    if ui.button("增加行").clicked() {
+                        state.table.add_row();
+                    }
+                    if ui
+                        .add_enabled(!state.table.rows.is_empty(), Button::new("删除末行"))
+                        .clicked()
+                    {
+                        state.table.remove_row();
+                    }
+                    ui.separator();
+                    ui.label(format!(
+                        "{} 列 × {} 行",
+                        state.table.headers.len(),
+                        state.table.rows.len()
+                    ));
+                });
+                ui.separator();
+                ScrollArea::both().show(ui, |ui| {
+                    egui::Grid::new("table-editor-grid")
+                        .striped(true)
+                        .spacing([8.0, 7.0])
+                        .show(ui, |ui| {
+                            for column in 0..state.table.headers.len() {
+                                ui.vertical(|ui| {
+                                    ui.add_sized(
+                                        [150.0, 24.0],
+                                        TextEdit::singleline(&mut state.table.headers[column]),
+                                    );
+                                    egui::ComboBox::from_id_salt(("table-alignment", column))
+                                        .selected_text(match state.table.alignments[column] {
+                                            table::Alignment::None => "默认对齐",
+                                            table::Alignment::Left => "左对齐",
+                                            table::Alignment::Center => "居中",
+                                            table::Alignment::Right => "右对齐",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut state.table.alignments[column],
+                                                table::Alignment::None,
+                                                "默认对齐",
+                                            );
+                                            ui.selectable_value(
+                                                &mut state.table.alignments[column],
+                                                table::Alignment::Left,
+                                                "左对齐",
+                                            );
+                                            ui.selectable_value(
+                                                &mut state.table.alignments[column],
+                                                table::Alignment::Center,
+                                                "居中",
+                                            );
+                                            ui.selectable_value(
+                                                &mut state.table.alignments[column],
+                                                table::Alignment::Right,
+                                                "右对齐",
+                                            );
+                                        });
+                                });
+                            }
+                            ui.end_row();
+                            for row in &mut state.table.rows {
+                                for cell in row {
+                                    ui.add_sized([150.0, 24.0], TextEdit::singleline(cell));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("应用到 Markdown").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if apply {
+            let state = self.table_editor.take().expect("table editor state");
+            if state.document >= self.documents.len() {
+                return;
+            }
+            let document = &mut self.documents[state.document];
+            let before = document.content.clone();
+            if state.table.range.end > before.len()
+                || !before.is_char_boundary(state.table.range.start)
+                || !before.is_char_boundary(state.table.range.end)
+            {
+                self.show_error("表格应用失败", "文档已发生变化，请重新打开表格编辑器。");
+                return;
+            }
+            let mut replacement = state.table.to_markdown();
+            if state.table.range.is_empty() {
+                if state.table.range.start > 0 && !before[..state.table.range.start].ends_with('\n')
+                {
+                    replacement.insert_str(0, "\n\n");
+                }
+                if state.table.range.start < before.len()
+                    && !before[state.table.range.start..].starts_with('\n')
+                {
+                    replacement.push_str("\n\n");
+                }
+            }
+            let cursor =
+                before[..state.table.range.start].chars().count() + replacement.chars().count();
+            document
+                .content
+                .replace_range(state.table.range, &replacement);
+            document.record_edit(before, None, Some(cursor..cursor), EditKind::Format);
+            self.queue_editor_selection(cursor..cursor);
+            self.status = "已应用可视化表格修改".to_owned();
+        } else if !open || cancel {
+            self.table_editor = None;
+        }
+    }
+
     fn top_bar(&mut self, root: &mut Ui) {
         Panel::top("toolbar").exact_size(48.0).show(root, |ui| {
             ui.add_space(7.0);
@@ -1246,9 +1520,20 @@ impl RuporaApp {
                 {
                     self.execute(AppCommand::Redo);
                 }
-                if ui.button("导出 HTML").clicked() {
-                    self.execute(AppCommand::ExportHtml);
-                }
+                ui.menu_button("导出", |ui| {
+                    if ui.button("HTML…").clicked() {
+                        self.execute(AppCommand::ExportHtml);
+                        ui.close();
+                    }
+                    if ui.button("PDF…").clicked() {
+                        self.execute(AppCommand::ExportPdf);
+                        ui.close();
+                    }
+                    if ui.button("打印…").clicked() {
+                        self.execute(AppCommand::Print);
+                        ui.close();
+                    }
+                });
 
                 ui.separator();
                 ui.menu_button("格式", |ui| {
@@ -1295,6 +1580,36 @@ impl RuporaApp {
                         self.execute(AppCommand::Format(MarkdownCommand::CodeBlock));
                         ui.close();
                     }
+                    ui.separator();
+                    if ui.button("目录 [TOC]").clicked() {
+                        self.execute(AppCommand::InsertToc);
+                        ui.close();
+                    }
+                    if ui.button("脚注").clicked() {
+                        self.execute(AppCommand::InsertFootnote);
+                        ui.close();
+                    }
+                    if ui.button("可视化表格…").clicked() {
+                        self.execute(AppCommand::EditTable);
+                        ui.close();
+                    }
+                    let anchors = self
+                        .active
+                        .map(|index| markdown::heading_anchors(&self.documents[index].content))
+                        .unwrap_or_default();
+                    ui.menu_button("交叉引用", |ui| {
+                        if anchors.is_empty() {
+                            ui.label("当前文档没有标题");
+                        }
+                        for anchor in &anchors {
+                            let label =
+                                format!("H{}  {}", anchor.heading.level, anchor.heading.text);
+                            if ui.button(label).clicked() {
+                                self.insert_cross_reference(&anchor.heading.text, &anchor.id);
+                                ui.close();
+                            }
+                        }
+                    });
                 });
                 if ui.button("查找").on_hover_text("Ctrl+F").clicked() {
                     self.find_open = true;
@@ -1385,6 +1700,11 @@ impl RuporaApp {
             ("撤销", AppCommand::Undo),
             ("重做", AppCommand::Redo),
             ("导出 HTML", AppCommand::ExportHtml),
+            ("导出 PDF", AppCommand::ExportPdf),
+            ("打印", AppCommand::Print),
+            ("编辑表格", AppCommand::EditTable),
+            ("插入目录", AppCommand::InsertToc),
+            ("插入脚注", AppCommand::InsertFootnote),
             ("粘贴剪贴板图片", AppCommand::PasteImage),
             ("快捷键设置", AppCommand::ShortcutSettings),
             ("切换到编辑模式", AppCommand::SetView(ViewMode::Edit)),
@@ -1840,16 +2160,26 @@ impl RuporaApp {
         scroll_offset: Option<f32>,
     ) -> PaneScroll {
         let before_content = self.documents[index].content.clone();
+        let mut preview_content = prepare_native_preview(
+            ui.ctx(),
+            &before_content,
+            self.state.dark,
+            &mut self.generated_svg_cache.borrow_mut(),
+        );
         let base_uri = self.preview_base_uri(index);
-        let local_links = markdown::local_link_destinations(&self.documents[index].content);
+        let local_links = markdown::local_link_destinations(&before_content);
         self.preview_cache.link_hooks_clear();
         for destination in &local_links {
             self.preview_cache.add_link_hook(destination);
         }
 
         let changed = {
-            let content = &mut self.documents[index].content;
             let cache = &mut self.preview_cache;
+            let svg_cache = self.generated_svg_cache.clone();
+            let dark = self.state.dark;
+            let render_math = move |ui: &mut Ui, math: &str, inline: bool| {
+                render_math_widget(ui, &mut svg_cache.borrow_mut(), math, inline, dark);
+            };
             let mut scroll_area = ScrollArea::vertical().id_salt(("preview-scroll", index));
             if let Some(offset) = scroll_offset {
                 scroll_area = scroll_area.vertical_scroll_offset(offset);
@@ -1864,7 +2194,8 @@ impl RuporaApp {
                             CommonMarkViewer::new()
                                 .default_implicit_uri_scheme(base_uri)
                                 .enable_scroll_to_heading(true)
-                                .show_mut(ui, cache, content)
+                                .render_math_fn(Some(&render_math))
+                                .show_mut(ui, cache, &mut preview_content)
                                 .response
                                 .changed()
                         })
@@ -1876,7 +2207,11 @@ impl RuporaApp {
             })
         };
 
-        if changed.inner {
+        if changed.inner
+            && let Some(next_content) =
+                markdown::synchronize_task_markers(&before_content, &preview_content)
+        {
+            self.documents[index].content = next_content;
             self.documents[index].record_edit(before_content, None, None, EditKind::TaskList);
             self.status = "已更新任务列表".to_owned();
         }
@@ -1902,10 +2237,29 @@ impl RuporaApp {
         let blocks = self.documents[index].blocks().to_vec();
         let base_uri = self.preview_base_uri(index);
         let local_links = markdown::local_link_destinations(&source);
+        let preview_blocks = blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.id,
+                    prepare_native_preview(
+                        ui.ctx(),
+                        &source[block.range.clone()],
+                        self.state.dark,
+                        &mut self.generated_svg_cache.borrow_mut(),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         self.preview_cache.link_hooks_clear();
         for destination in &local_links {
             self.preview_cache.add_link_hook(destination);
         }
+        let svg_cache = self.generated_svg_cache.clone();
+        let dark = self.state.dark;
+        let render_math = move |ui: &mut Ui, math: &str, inline: bool| {
+            render_math_widget(ui, &mut svg_cache.borrow_mut(), math, inline, dark);
+        };
 
         let mut pending_local = None;
         if let Some(cursor_range) = self.pending_editor_cursor.take() {
@@ -2053,7 +2407,10 @@ impl RuporaApp {
                                 }
                             });
                         } else {
-                            let block_text = &source[block.range.clone()];
+                            let block_text = preview_blocks
+                                .get(&block.id)
+                                .map(String::as_str)
+                                .unwrap_or(&source[block.range.clone()]);
                             let foldable = is_foldable_block(block_text);
                             let collapse_key = (index, block.id);
                             let collapsed = self.collapsed_blocks.contains(&collapse_key);
@@ -2089,6 +2446,7 @@ impl RuporaApp {
                                 ui.add_space(8.0);
                                 CommonMarkViewer::new()
                                     .default_implicit_uri_scheme(base_uri.clone())
+                                    .render_math_fn(Some(&render_math))
                                     .show(ui, &mut self.preview_cache, block_text);
                                 ui.add_space(8.0);
                             });
@@ -2272,6 +2630,7 @@ impl eframe::App for RuporaApp {
         self.command_palette(ui);
         self.shortcut_settings(ui);
         self.external_diff_window(ui);
+        self.table_editor_window(ui);
         self.external_change_bar(ui);
         self.status_bar(ui);
         self.sidebar(ui);
@@ -2576,6 +2935,127 @@ fn prompt_to_save(title: &str) -> MessageDialogResult {
         .show()
 }
 
+fn prepare_native_preview(
+    ctx: &Context,
+    source: &str,
+    dark: bool,
+    cache: &mut HashMap<String, Arc<[u8]>>,
+) -> String {
+    let mut output = markdown::prepare_preview_markdown(source);
+    for block in markdown::mermaid_blocks(&output).into_iter().rev() {
+        let key = generated_svg_key("mermaid", &block.source, dark);
+        let rendered = if let Some(bytes) = cache.get(&key) {
+            Ok(bytes.clone())
+        } else {
+            markdown::render_mermaid_svg(&block.source, dark).map(|svg| {
+                let bytes = Arc::<[u8]>::from(svg.into_bytes());
+                cache.insert(key.clone(), bytes.clone());
+                bytes
+            })
+        };
+        let replacement = match rendered {
+            Ok(bytes) => {
+                let uri = format!("bytes://rupora/{key}.svg");
+                ctx.include_bytes(uri.clone(), egui::load::Bytes::Shared(bytes));
+                format!("\n\n![Mermaid diagram]({uri})\n\n")
+            }
+            Err(error) => format!(
+                "\n\n> **Mermaid 图表错误：** {}\n\n",
+                error.replace('\n', " ")
+            ),
+        };
+        output.replace_range(block.range, &replacement);
+    }
+    output
+}
+
+fn render_math_widget(
+    ui: &mut Ui,
+    cache: &mut HashMap<String, Arc<[u8]>>,
+    math: &str,
+    inline: bool,
+    dark: bool,
+) {
+    let kind = if inline {
+        "math-inline"
+    } else {
+        "math-display"
+    };
+    let key = generated_svg_key(kind, math, dark);
+    let rendered = if let Some(bytes) = cache.get(&key) {
+        Ok(bytes.clone())
+    } else {
+        markdown::render_math_svg(math, inline).map(|mut svg| {
+            if dark {
+                svg = svg
+                    .replace("rgba(0,0,0,1)", "rgba(232,234,240,1)")
+                    .replace("rgba(0, 0, 0, 1)", "rgba(232, 234, 240, 1)")
+                    .replace("rgb(0,0,0)", "rgb(232,234,240)");
+            }
+            let bytes = Arc::<[u8]>::from(svg.into_bytes());
+            cache.insert(key.clone(), bytes.clone());
+            bytes
+        })
+    };
+    match rendered {
+        Ok(bytes) => {
+            let uri = format!("bytes://rupora/{key}.svg");
+            ui.add(
+                egui::Image::new(egui::ImageSource::Bytes {
+                    uri: uri.into(),
+                    bytes: egui::load::Bytes::Shared(bytes),
+                })
+                .fit_to_original_size(1.0)
+                .max_width(ui.available_width()),
+            );
+        }
+        Err(error) => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("公式错误：{math}（{error}）"),
+            );
+        }
+    }
+}
+
+fn generated_svg_key(kind: &str, source: &str, dark: bool) -> String {
+    let mut hasher = DefaultHasher::new();
+    kind.hash(&mut hasher);
+    source.hash(&mut hasher);
+    dark.hash(&mut hasher);
+    format!("{kind}-{:016x}", hasher.finish())
+}
+
+fn char_to_byte(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(index, _)| index)
+}
+
+fn next_footnote_number(source: &str) -> usize {
+    let mut used = HashSet::new();
+    let bytes = source.as_bytes();
+    let mut index = 0usize;
+    while index + 3 < bytes.len() {
+        if bytes[index] == b'[' && bytes[index + 1] == b'^' {
+            let digits_start = index + 2;
+            let mut end = digits_start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > digits_start
+                && bytes.get(end) == Some(&b']')
+                && let Ok(number) = source[digits_start..end].parse::<usize>()
+            {
+                used.insert(number);
+            }
+            index = end;
+        }
+        index += 1;
+    }
+    (1..).find(|number| !used.contains(number)).unwrap_or(1)
+}
+
 fn apply_theme(ctx: &Context, dark: bool) {
     if dark {
         ctx.set_visuals(egui::Visuals::dark());
@@ -2585,26 +3065,7 @@ fn apply_theme(ctx: &Context, dark: bool) {
 }
 
 fn install_fonts(ctx: &Context) {
-    let candidates = if cfg!(target_os = "windows") {
-        vec![
-            PathBuf::from(r"C:\Windows\Fonts\msyh.ttc"),
-            PathBuf::from(r"C:\Windows\Fonts\msyh.ttf"),
-            PathBuf::from(r"C:\Windows\Fonts\simhei.ttf"),
-        ]
-    } else if cfg!(target_os = "macos") {
-        vec![
-            PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
-            PathBuf::from("/System/Library/Fonts/STHeiti Light.ttc"),
-        ]
-    } else {
-        vec![
-            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-            PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
-            PathBuf::from("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"),
-        ]
-    };
-
-    let Some((path, bytes)) = candidates
+    let Some((path, bytes)) = export::cjk_font_candidates()
         .into_iter()
         .find_map(|path| fs::read(&path).ok().map(|bytes| (path, bytes)))
     else {
@@ -2635,6 +3096,28 @@ mod tests {
         assert!(is_markdown_path(Path::new("README.MD")));
         assert!(is_markdown_path(Path::new("notes.markdown")));
         assert!(!is_markdown_path(Path::new("image.png")));
+    }
+
+    #[test]
+    fn allocates_the_first_unused_numeric_footnote() {
+        assert_eq!(next_footnote_number("plain"), 1);
+        assert_eq!(next_footnote_number("[^1] and [^3]"), 2);
+        assert_eq!(next_footnote_number("[^2]: definition"), 1);
+    }
+
+    #[test]
+    fn replaces_mermaid_fences_with_registered_native_svg_images() {
+        let context = Context::default();
+        let mut cache = HashMap::new();
+        let preview = prepare_native_preview(
+            &context,
+            "```mermaid\nflowchart LR\nA --> B\n```\n",
+            false,
+            &mut cache,
+        );
+        assert!(preview.contains("bytes://rupora/mermaid-"));
+        assert!(!preview.contains("```mermaid"));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

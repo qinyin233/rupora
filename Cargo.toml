@@ -35,6 +35,7 @@ path = "native/src/main.rs"
 ammonia = "4.1.4"
 arboard = "3.6.1"
 chardetng = "0.1.17"
+diffy = "0.5.1"
 eframe = { version = "0.35.0", default-features = false, features = [
     "default_fonts",
     "glow",
@@ -49,13 +50,18 @@ egui_commonmark = { version = "0.24.0", features = [
 encoding_rs = "0.8.35"
 fs2 = "0.4.3"
 image = { version = "0.25.9", default-features = false, features = ["png"] }
+mermaid-svg = "0.7.0"
 open = "5.4.0"
 pathdiff = "0.2.3"
+printpdf = { version = "0.12.5", default-features = false, features = ["html", "svg"] }
 pulldown-cmark = "0.13.4"
+ratex-layout = "0.1.14"
+ratex-parser = "0.1.14"
+ratex-svg = { version = "0.1.14", features = ["embed-fonts"] }
 rfd = "0.17.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-diffy = "0.5.1"
+serde_yaml_ng = "0.10.0"
 tempfile = "3.27.0"
 
 [target.'cfg(windows)'.build-dependencies]
