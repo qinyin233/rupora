@@ -5,7 +5,11 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, TryRecvError},
+    },
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,12 +26,15 @@ use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, Messag
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    diagnostics,
     document::{Document, EditKind},
     editing::{self, MarkdownCommand},
     export,
+    instance::InstanceCoordinator,
     markdown::{self, BlockId, Heading},
     recovery::RecoveryStore,
     table::{self, MarkdownTable},
+    updater::{self, UpdateInfo, UpdateStatus},
     workspace::{Workspace, WorkspaceEntry},
 };
 
@@ -146,6 +153,10 @@ enum AppCommand {
     InsertToc,
     InsertFootnote,
     PasteImage,
+    CheckUpdates,
+    OpenDiagnostics,
+    OpenReleasePage,
+    About,
     Format(MarkdownCommand),
     SetView(ViewMode),
 }
@@ -198,10 +209,35 @@ pub struct RuporaApp {
     external_diff_view: Option<String>,
     generated_svg_cache: Rc<RefCell<HashMap<String, Arc<[u8]>>>>,
     table_editor: Option<TableEditorState>,
+    instance_coordinator: Option<InstanceCoordinator>,
+    update_receiver: Option<Receiver<Result<UpdateStatus, String>>>,
+    available_update: Option<UpdateInfo>,
+    about_open: bool,
 }
 
 impl RuporaApp {
     pub fn new(creation_context: &CreationContext<'_>) -> Self {
+        let startup_files = std::env::args_os()
+            .skip(1)
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .collect();
+        Self::build(creation_context, startup_files, None)
+    }
+
+    pub fn new_with_instance(
+        creation_context: &CreationContext<'_>,
+        startup_files: Vec<PathBuf>,
+        instance_coordinator: InstanceCoordinator,
+    ) -> Self {
+        Self::build(creation_context, startup_files, Some(instance_coordinator))
+    }
+
+    fn build(
+        creation_context: &CreationContext<'_>,
+        startup_files: Vec<PathBuf>,
+        instance_coordinator: Option<InstanceCoordinator>,
+    ) -> Self {
         install_fonts(&creation_context.egui_ctx);
         let state: PersistedState = creation_context
             .storage
@@ -251,6 +287,10 @@ impl RuporaApp {
             external_diff_view: None,
             generated_svg_cache: Rc::new(RefCell::new(HashMap::new())),
             table_editor: None,
+            instance_coordinator,
+            update_receiver: None,
+            available_update: None,
+            about_open: false,
         };
 
         match recovered_entries {
@@ -272,11 +312,6 @@ impl RuporaApp {
             }
         }
 
-        let startup_files = std::env::args_os()
-            .skip(1)
-            .map(PathBuf::from)
-            .filter(|path| path.is_file())
-            .collect::<Vec<_>>();
         if !startup_files.is_empty() {
             app.open_paths(startup_files);
         } else if app.documents.is_empty() {
@@ -722,6 +757,7 @@ impl RuporaApp {
 
     fn show_error(&mut self, title: &str, message: &str) {
         self.status = message.to_owned();
+        diagnostics::append_event("ERROR", &format!("{title}: {message}")).ok();
         MessageDialog::new()
             .set_level(MessageLevel::Error)
             .set_title(title)
@@ -811,8 +847,97 @@ impl RuporaApp {
             AppCommand::InsertToc => self.insert_text("[TOC]\n", EditKind::Format),
             AppCommand::InsertFootnote => self.insert_footnote(),
             AppCommand::PasteImage => self.paste_clipboard_image(),
+            AppCommand::CheckUpdates => self.start_update_check(),
+            AppCommand::OpenDiagnostics => self.open_diagnostics(),
+            AppCommand::OpenReleasePage => self.open_release_page(),
+            AppCommand::About => self.about_open = true,
             AppCommand::Format(command) => self.apply_format(command),
             AppCommand::SetView(mode) => self.state.view_mode = mode,
+        }
+    }
+
+    fn start_update_check(&mut self) {
+        if self.update_receiver.is_some() {
+            self.status = "正在检查更新…".to_owned();
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = updater::check_for_update(env!("CARGO_PKG_VERSION"));
+            let _ = sender.send(result);
+        });
+        self.update_receiver = Some(receiver);
+        self.status = "正在后台检查更新…".to_owned();
+    }
+
+    fn poll_update_check(&mut self) {
+        let result = match self.update_receiver.as_ref().map(Receiver::try_recv) {
+            Some(Ok(result)) => Some(result),
+            Some(Err(TryRecvError::Empty)) | None => None,
+            Some(Err(TryRecvError::Disconnected)) => Some(Err("更新检查线程意外结束".to_owned())),
+        };
+        let Some(result) = result else {
+            return;
+        };
+        self.update_receiver = None;
+        match result {
+            Ok(UpdateStatus::Current { latest }) => {
+                self.available_update = None;
+                self.status = format!("当前已是最新版本（{latest}）");
+            }
+            Ok(UpdateStatus::Available(info)) => {
+                self.status = format!("发现新版本 {}，可从“帮助”菜单打开发布页", info.version);
+                self.available_update = Some(info);
+            }
+            Err(error) => {
+                diagnostics::append_event("WARN", &format!("update check failed: {error}")).ok();
+                self.status = format!("检查更新失败：{error}");
+            }
+        }
+    }
+
+    fn open_release_page(&mut self) {
+        let url = self
+            .available_update
+            .as_ref()
+            .map(|update| update.page_url.as_str())
+            .unwrap_or(updater::RELEASES_URL);
+        if let Err(error) = open::that(url) {
+            self.show_error("无法打开发布页", &error.to_string());
+        }
+    }
+
+    fn open_diagnostics(&mut self) {
+        let Some(directory) = diagnostics::log_directory() else {
+            self.status = "当前平台没有可用的诊断目录".to_owned();
+            return;
+        };
+        if let Err(error) = fs::create_dir_all(&directory)
+            .and_then(|()| open::that(&directory).map_err(std::io::Error::other))
+        {
+            self.show_error("无法打开诊断目录", &error.to_string());
+        } else {
+            self.status = format!("已打开诊断目录：{}", directory.display());
+        }
+    }
+
+    fn poll_instance_requests(&mut self, ctx: &Context) {
+        let result = self
+            .instance_coordinator
+            .as_mut()
+            .map(InstanceCoordinator::poll);
+        match result {
+            Some(Ok(Some(request))) => {
+                if !request.paths.is_empty() {
+                    self.open_paths(request.paths);
+                }
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+            Some(Err(error)) => {
+                diagnostics::append_event("WARN", &format!("instance inbox failed: {error}")).ok();
+                self.status = format!("读取第二实例请求失败：{error}");
+            }
+            Some(Ok(None)) | None => {}
         }
     }
 
@@ -1535,6 +1660,33 @@ impl RuporaApp {
                         ui.close();
                     }
                 });
+                ui.menu_button("帮助", |ui| {
+                    if ui
+                        .add_enabled(self.update_receiver.is_none(), Button::new("检查更新…"))
+                        .clicked()
+                    {
+                        self.execute(AppCommand::CheckUpdates);
+                        ui.close();
+                    }
+                    if self.available_update.is_some() && ui.button("打开新版本发布页").clicked()
+                    {
+                        self.execute(AppCommand::OpenReleasePage);
+                        ui.close();
+                    }
+                    if ui.button("所有版本与校验信息").clicked() {
+                        self.execute(AppCommand::OpenReleasePage);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("打开诊断日志目录").clicked() {
+                        self.execute(AppCommand::OpenDiagnostics);
+                        ui.close();
+                    }
+                    if ui.button("关于 RUPORA").clicked() {
+                        self.execute(AppCommand::About);
+                        ui.close();
+                    }
+                });
 
                 ui.separator();
                 ui.menu_button("格式", |ui| {
@@ -1687,6 +1839,41 @@ impl RuporaApp {
             });
     }
 
+    fn about_window(&mut self, root: &mut Ui) {
+        if !self.about_open {
+            return;
+        }
+        let mut open = self.about_open;
+        let available_update = self.available_update.clone();
+        egui::Window::new("关于 RUPORA")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(root.ctx(), |ui| {
+                ui.heading("RUPORA");
+                ui.label(format!("版本 {}", env!("CARGO_PKG_VERSION")));
+                ui.add_space(6.0);
+                ui.label("使用 Rust 与 egui 实现的原生 Markdown 编辑器。");
+                ui.label("编辑、解析、数学公式、Mermaid 与 PDF 导出均不依赖浏览器内核。");
+                ui.add_space(8.0);
+                if let Some(update) = available_update.as_ref() {
+                    ui.label(
+                        RichText::new(format!("可用更新：{}", update.version))
+                            .color(ui.visuals().hyperlink_color),
+                    );
+                    if !update.notes.trim().is_empty() {
+                        ui.label(update.notes.lines().next().unwrap_or_default());
+                    }
+                }
+                ui.label(format!(
+                    "平台：{} / {}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ));
+            });
+        self.about_open = open;
+    }
+
     fn command_palette(&mut self, root: &mut Ui) {
         if !self.command_palette_open {
             return;
@@ -1708,6 +1895,9 @@ impl RuporaApp {
             ("插入脚注", AppCommand::InsertFootnote),
             ("粘贴剪贴板图片", AppCommand::PasteImage),
             ("快捷键设置", AppCommand::ShortcutSettings),
+            ("检查更新", AppCommand::CheckUpdates),
+            ("打开诊断日志目录", AppCommand::OpenDiagnostics),
+            ("关于 RUPORA", AppCommand::About),
             ("切换到编辑模式", AppCommand::SetView(ViewMode::Edit)),
             ("切换到分屏模式", AppCommand::SetView(ViewMode::Split)),
             ("切换到混合模式", AppCommand::SetView(ViewMode::Hybrid)),
@@ -2044,6 +2234,7 @@ impl RuporaApp {
         if let Some(offset) = scroll_offset {
             scroll_area = scroll_area.vertical_scroll_offset(offset);
         }
+        let mut context_command = None;
         let output = scroll_area.show(ui, |ui| {
             let available = ui.available_size();
             ui.set_min_size(Vec2::new(available.x, available.y.max(420.0)));
@@ -2062,10 +2253,47 @@ impl RuporaApp {
                 .id(editor_id)
                 .font(egui::TextStyle::Monospace)
                 .code_editor()
+                .hint_text("Markdown 源码编辑区")
                 .desired_width(f32::INFINITY)
                 .desired_rows(desired_rows)
                 .lock_focus(true)
                 .show(ui);
+            output.response.context_menu(|ui| {
+                if ui.button("撤销").clicked() {
+                    context_command = Some(AppCommand::Undo);
+                    ui.close();
+                }
+                if ui.button("重做").clicked() {
+                    context_command = Some(AppCommand::Redo);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("粗体").clicked() {
+                    context_command = Some(AppCommand::Format(MarkdownCommand::Bold));
+                    ui.close();
+                }
+                if ui.button("斜体").clicked() {
+                    context_command = Some(AppCommand::Format(MarkdownCommand::Italic));
+                    ui.close();
+                }
+                if ui.button("链接").clicked() {
+                    context_command = Some(AppCommand::Format(MarkdownCommand::Link));
+                    ui.close();
+                }
+                if ui.button("行内代码").clicked() {
+                    context_command = Some(AppCommand::Format(MarkdownCommand::InlineCode));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("粘贴剪贴板图片").clicked() {
+                    context_command = Some(AppCommand::PasteImage);
+                    ui.close();
+                }
+                if ui.button("可视化编辑表格").clicked() {
+                    context_command = Some(AppCommand::EditTable);
+                    ui.close();
+                }
+            });
             let mut selection_after = output.cursor_range.map(cursor_range_to_char_range);
             if let Some(cursor_range) = output.cursor_range {
                 self.editor_cursor = Some(cursor_range);
@@ -2144,6 +2372,9 @@ impl RuporaApp {
                 self.queue_editor_selection(selection);
             }
         });
+        if let Some(command) = context_command {
+            self.execute(command);
+        }
         PaneScroll {
             offset: output.state.offset.y,
             maximum: (output.content_size.y - output.inner_rect.height()).max(0.0),
@@ -2618,6 +2849,8 @@ impl RuporaApp {
 impl eframe::App for RuporaApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut Frame) {
         ctx.request_repaint_after(Duration::from_millis(500));
+        self.poll_instance_requests(ctx);
+        self.poll_update_check();
         self.handle_shortcuts(ctx);
         self.handle_dropped_files(ctx);
         self.save_recovery_snapshot_if_due();
@@ -2629,6 +2862,7 @@ impl eframe::App for RuporaApp {
         self.top_bar(ui);
         self.find_bar(ui);
         self.command_palette(ui);
+        self.about_window(ui);
         self.shortcut_settings(ui);
         self.external_diff_window(ui);
         self.table_editor_window(ui);
@@ -2656,6 +2890,7 @@ impl eframe::App for RuporaApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.recovery_store.clear();
+        diagnostics::append_event("INFO", "RUPORA exited normally").ok();
     }
 }
 

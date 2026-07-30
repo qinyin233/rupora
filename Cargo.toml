@@ -23,6 +23,10 @@ icons = [
 ]
 license-file = "LICENSE"
 category = "Productivity"
+file-associations = [
+    { extensions = ["md", "markdown", "mdown", "mkd"], mime-type = "text/markdown", description = "Markdown document", name = "Markdown Document", role = "editor" },
+    { extensions = ["txt"], mime-type = "text/plain", description = "Plain text document", name = "Text Document", role = "editor" },
+]
 
 [lib]
 path = "native/src/lib.rs"
@@ -41,6 +45,7 @@ arboard = "3.6.1"
 chardetng = "0.1.17"
 diffy = "0.5.1"
 eframe = { version = "0.35.0", default-features = false, features = [
+    "accesskit",
     "default_fonts",
     "glow",
     "persistence",
@@ -63,10 +68,12 @@ ratex-layout = "0.1.14"
 ratex-parser = "0.1.14"
 ratex-svg = { version = "0.1.14", features = ["embed-fonts"] }
 rfd = "0.17.2"
+semver = "1.0.28"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml_ng = "0.10.0"
 tempfile = "3.27.0"
+ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
