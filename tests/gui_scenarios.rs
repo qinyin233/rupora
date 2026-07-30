@@ -12,8 +12,10 @@ fn run_editor_frame(
     events: Vec<Event>,
     request_focus: bool,
 ) -> egui::FullOutput {
-    let mut input = RawInput::default();
-    input.events = events;
+    let input = RawInput {
+        events,
+        ..RawInput::default()
+    };
     context.run_ui(input, |ui| {
         let id = Id::new("gui-scenario-editor");
         if request_focus {

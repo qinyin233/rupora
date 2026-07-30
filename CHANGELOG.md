@@ -30,6 +30,7 @@
 - Criterion 性能预算、Proptest、fuzz、故障注入、cargo-deny 与 RustSec 门禁。
 - 发布产物的 SHA-256、CycloneDX SBOM、GitHub 来源证明及平台签名密钥入口。
 - 排版文本到 Markdown UTF-8 源码边界的映射，以及混合模式块内点击定位。
+- 中文 IME/emoji GUI 重放、命名 AccessKit 编辑器节点和 PDF 像素视觉回归。
 
 ### Known limitations
 

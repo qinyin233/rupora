@@ -4110,6 +4110,7 @@ dependencies = [
  "ratex-layout",
  "ratex-parser",
  "ratex-svg",
+ "resvg",
  "rfd",
  "semver",
  "serde",

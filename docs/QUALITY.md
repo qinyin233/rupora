@@ -15,6 +15,7 @@ cargo check --manifest-path fuzz/Cargo.toml --bins --locked
 
 - 解析 2 万个 Markdown 段落不超过 8 秒。
 - 在 2 万块文档中协调一次小修改不超过 1 秒。
+- 在 2 万段文档中记录一次不触发同步分析的编辑不超过 250 毫秒。
 - 将 2 千段 Markdown 导出为 HTML 不超过 2 秒。
 
 这些是回归预算，不是硬件性能宣传。Criterion 基准位于 `benches/editor_core.rs`。
@@ -22,6 +23,8 @@ cargo check --manifest-path fuzz/Cargo.toml --bins --locked
 ## 测试层次
 
 - 单元测试验证文档、编辑、解析、合并、恢复、导出和桌面模块。
+- 可重放 egui 帧验证中文 IME 与 AccessKit 编辑器语义。
+- 参考文档验证 HTML 结构，并把 PDF 页转为 SVG 和像素检查空白、裁切及布局坍缩。
 - Proptest 对任意 Unicode 文本验证格式往返、块索引、表格和三方合并性质。
 - 故障注入验证临时文件同步之后的提交失败不会破坏原文件。
 - `fuzz/` 提供 Markdown 流水线和表格解析两个 libFuzzer 目标。

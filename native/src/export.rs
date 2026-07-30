@@ -5,9 +5,31 @@ use std::{
     process::Command,
 };
 
-use printpdf::{Base64OrRaw, GeneratePdfOptions, PdfDocument, PdfSaveOptions};
+use printpdf::{Base64OrRaw, GeneratePdfOptions, PdfDocument, PdfSaveOptions, PdfToSvgOptions};
 
 pub fn render_pdf(html: &str) -> Result<Vec<u8>, String> {
+    let document = create_pdf_document(html)?;
+    let mut save_warnings = Vec::new();
+    let bytes = document.save(&PdfSaveOptions::default(), &mut save_warnings);
+    if bytes.len() < 5 || !bytes.starts_with(b"%PDF-") {
+        return Err("PDF 生成器没有返回有效文档".to_owned());
+    }
+    Ok(bytes)
+}
+
+pub fn render_pdf_svg_pages(html: &str) -> Result<Vec<String>, String> {
+    let document = create_pdf_document(html)?;
+    let mut warnings = Vec::new();
+    (1..=document.pages.len())
+        .map(|page| {
+            document
+                .page_to_svg(page, &PdfToSvgOptions::default(), &mut warnings)
+                .ok_or_else(|| format!("无法渲染 PDF 第 {page} 页"))
+        })
+        .collect()
+}
+
+fn create_pdf_document(html: &str) -> Result<PdfDocument, String> {
     let mut fonts = BTreeMap::new();
     if let Some(bytes) = system_cjk_font() {
         fonts.insert("RUPORA CJK".to_owned(), Base64OrRaw::Raw(bytes));
@@ -21,14 +43,8 @@ pub fn render_pdf(html: &str) -> Result<Vec<u8>, String> {
         ..GeneratePdfOptions::default()
     };
     let mut warnings = Vec::new();
-    let document = PdfDocument::from_html(html, &BTreeMap::new(), &fonts, &options, &mut warnings)
-        .map_err(|error| format!("HTML 转 PDF 失败：{error}"))?;
-    let mut save_warnings = Vec::new();
-    let bytes = document.save(&PdfSaveOptions::default(), &mut save_warnings);
-    if bytes.len() < 5 || !bytes.starts_with(b"%PDF-") {
-        return Err("PDF 生成器没有返回有效文档".to_owned());
-    }
-    Ok(bytes)
+    PdfDocument::from_html(html, &BTreeMap::new(), &fonts, &options, &mut warnings)
+        .map_err(|error| format!("HTML 转 PDF 失败：{error}"))
 }
 
 pub fn write_pdf(path: &Path, html: &str) -> Result<(), String> {
@@ -118,5 +134,18 @@ mod tests {
                 .unwrap();
         assert!(bytes.starts_with(b"%PDF-"));
         assert!(bytes.len() > 500);
+    }
+
+    #[test]
+    fn renders_pdf_pages_back_to_svg_for_visual_regression() {
+        let pages = render_pdf_svg_pages(
+            "<!doctype html><html><body><h1>RUPORA</h1><p>Visual page</p></body></html>",
+        )
+        .unwrap();
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].starts_with("<svg"));
+        assert!(pages[0].contains("<path") || pages[0].contains("<text"));
+        assert!(pages[0].len() > 1_000);
+        assert!(!pages[0].contains("NaN"));
     }
 }
