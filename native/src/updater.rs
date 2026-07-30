@@ -24,7 +24,7 @@ struct GitHubRelease {
     tag_name: String,
     html_url: String,
     #[serde(default)]
-    body: String,
+    body: Option<String>,
     #[serde(default)]
     draft: bool,
     #[serde(default)]
@@ -71,7 +71,12 @@ fn status_from_release(current: &Version, release: GitHubRelease) -> Result<Upda
         Ok(UpdateStatus::Available(UpdateInfo {
             version: latest,
             page_url: release.html_url,
-            notes: release.body.chars().take(4_000).collect(),
+            notes: release
+                .body
+                .unwrap_or_default()
+                .chars()
+                .take(4_000)
+                .collect(),
         }))
     } else {
         Ok(UpdateStatus::Current { latest })
@@ -91,7 +96,7 @@ mod tests {
         GitHubRelease {
             tag_name: tag.to_owned(),
             html_url: format!("{RELEASES_URL}/tag/{tag}"),
-            body: "release notes".to_owned(),
+            body: Some("release notes".to_owned()),
             draft: false,
             prerelease,
         }
@@ -131,5 +136,18 @@ mod tests {
         .unwrap();
 
         assert!(matches!(status, UpdateStatus::Available(_)));
+    }
+
+    #[test]
+    fn accepts_release_metadata_without_notes() {
+        let mut release = release("v2.1.0", false);
+        release.body = None;
+
+        let status = status_from_release(&Version::parse("2.0.0").unwrap(), release).unwrap();
+
+        let UpdateStatus::Available(update) = status else {
+            panic!("expected an update");
+        };
+        assert!(update.notes.is_empty());
     }
 }
