@@ -31,6 +31,7 @@
 - 发布产物的 SHA-256、CycloneDX SBOM、GitHub 来源证明及平台签名密钥入口。
 - 排版文本到 Markdown UTF-8 源码边界的映射，以及混合模式块内点击定位。
 - 中文 IME/emoji GUI 重放、命名 AccessKit 编辑器节点和 PDF 像素视觉回归。
+- Ed25519 签名的架构更新清单、六架构发布矩阵与默认关闭的进程外扩展服务协议。
 
 ### Known limitations
 

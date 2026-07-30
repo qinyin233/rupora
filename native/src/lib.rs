@@ -5,6 +5,7 @@ pub mod document;
 pub mod editing;
 pub mod editor_buffer;
 pub mod export;
+pub mod extensions;
 pub mod instance;
 pub mod markdown;
 pub mod merge;

@@ -19,6 +19,7 @@ use crate::{
     editing::{self, MarkdownCommand},
     editor_buffer::{TrackingTextBuffer, set_accessible_label},
     export,
+    extensions::{self, ExtensionInvocation, ExtensionRegistry},
     instance::InstanceCoordinator,
     markdown::{self, BlockId, Heading},
     native_preview::{prepare_native_preview, render_math_widget},
@@ -60,6 +61,12 @@ struct TableEditorState {
     table: MarkdownTable,
 }
 
+struct ExtensionJobResult {
+    document: usize,
+    before: String,
+    invocation: ExtensionInvocation,
+}
+
 pub struct RuporaApp {
     documents: Vec<Document>,
     active: Option<usize>,
@@ -98,6 +105,8 @@ pub struct RuporaApp {
     table_editor: Option<TableEditorState>,
     instance_coordinator: Option<InstanceCoordinator>,
     update_receiver: Option<Receiver<Result<UpdateStatus, String>>>,
+    extension_registry: ExtensionRegistry,
+    extension_receiver: Option<Receiver<Result<ExtensionJobResult, String>>>,
     available_update: Option<UpdateInfo>,
     about_open: bool,
 }
@@ -137,6 +146,14 @@ impl RuporaApp {
             .workspace_root
             .as_ref()
             .and_then(|root| Workspace::open(root.clone()).ok());
+        let extension_path = eframe::storage_dir("RUPORA")
+            .unwrap_or_else(std::env::temp_dir)
+            .join("extensions.json");
+        let (extension_registry, extension_error) =
+            match ExtensionRegistry::load(extension_path.clone()) {
+                Ok(registry) => (registry, None),
+                Err(error) => (ExtensionRegistry::disabled(extension_path), Some(error)),
+            };
 
         let mut app = Self {
             documents: Vec::new(),
@@ -176,9 +193,14 @@ impl RuporaApp {
             table_editor: None,
             instance_coordinator,
             update_receiver: None,
+            extension_registry,
+            extension_receiver: None,
             available_update: None,
             about_open: false,
         };
+        if let Some(error) = extension_error {
+            app.status = error;
+        }
 
         match recovered_entries {
             Ok(entries) if !entries.is_empty() => {
@@ -736,6 +758,9 @@ impl RuporaApp {
             AppCommand::PasteImage => self.paste_clipboard_image(),
             AppCommand::CheckUpdates => self.start_update_check(),
             AppCommand::OpenDiagnostics => self.open_diagnostics(),
+            AppCommand::OpenExtensionConfig => self.open_extension_config(),
+            AppCommand::ReloadExtensions => self.reload_extensions(),
+            AppCommand::RunExtension(index) => self.start_extension(index),
             AppCommand::OpenReleasePage => self.open_release_page(),
             AppCommand::About => self.about_open = true,
             AppCommand::Format(command) => self.apply_format(command),
@@ -805,6 +830,117 @@ impl RuporaApp {
             self.show_error("无法打开诊断目录", &error.to_string());
         } else {
             self.status = format!("已打开诊断目录：{}", directory.display());
+        }
+    }
+
+    fn open_extension_config(&mut self) {
+        if let Err(error) = self.extension_registry.ensure_template() {
+            self.show_error("无法创建扩展配置", &error);
+            return;
+        }
+        if let Err(error) = open::that(self.extension_registry.config_path()) {
+            self.show_error("无法打开扩展配置", &error.to_string());
+        }
+    }
+
+    fn reload_extensions(&mut self) {
+        match self.extension_registry.reload() {
+            Ok(()) => {
+                self.status = if self.extension_registry.is_enabled() {
+                    format!(
+                        "已加载 {} 个扩展服务",
+                        self.extension_registry.services().len()
+                    )
+                } else {
+                    "扩展服务保持关闭".to_owned()
+                };
+            }
+            Err(error) => self.show_error("无法加载扩展配置", &error),
+        }
+    }
+
+    fn start_extension(&mut self, service_index: usize) {
+        if self.extension_receiver.is_some() {
+            self.status = "已有扩展服务正在运行".to_owned();
+            return;
+        }
+        let Some(document) = self.active else {
+            self.status = "没有可交给扩展的活动文档".to_owned();
+            return;
+        };
+        let Some(service) = self
+            .extension_registry
+            .services()
+            .get(service_index)
+            .cloned()
+        else {
+            self.status = "扩展服务不存在或扩展功能已关闭".to_owned();
+            return;
+        };
+        let before = self.documents[document].content.clone();
+        let path = self.documents[document].path.clone();
+        let name = service.name.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = extensions::invoke(&service, &before, path.as_deref()).map(|invocation| {
+                ExtensionJobResult {
+                    document,
+                    before,
+                    invocation,
+                }
+            });
+            let _ = sender.send(result);
+        });
+        self.extension_receiver = Some(receiver);
+        self.status = format!("正在运行扩展“{name}”…");
+    }
+
+    fn poll_extension(&mut self) {
+        let result = match self.extension_receiver.as_ref().map(Receiver::try_recv) {
+            Some(Ok(result)) => Some(result),
+            Some(Err(TryRecvError::Empty)) | None => None,
+            Some(Err(TryRecvError::Disconnected)) => Some(Err("扩展工作线程意外结束".to_owned())),
+        };
+        let Some(result) = result else {
+            return;
+        };
+        self.extension_receiver = None;
+        match result {
+            Err(error) => {
+                diagnostics::append_event("WARN", &format!("extension failed: {error}")).ok();
+                self.status = format!("扩展失败：{error}");
+            }
+            Ok(job)
+                if self
+                    .documents
+                    .get(job.document)
+                    .is_none_or(|document| document.content != job.before) =>
+            {
+                self.status = "文档在扩展运行期间已变化，已丢弃过期结果".to_owned();
+            }
+            Ok(job) => {
+                if let Some(replacement) = job.invocation.replacement
+                    && replacement != job.before
+                {
+                    self.documents[job.document].content = replacement;
+                    self.documents[job.document].record_edit(
+                        job.before,
+                        None,
+                        None,
+                        EditKind::Other,
+                    );
+                    self.active = Some(job.document);
+                    self.status = job
+                        .invocation
+                        .message
+                        .unwrap_or_else(|| "扩展已更新活动文档".to_owned());
+                } else {
+                    self.status = job
+                        .invocation
+                        .message
+                        .unwrap_or_else(|| "扩展已完成，没有文档修改".to_owned());
+                }
+            }
         }
     }
 
@@ -1492,6 +1628,12 @@ impl RuporaApp {
     }
 
     fn top_bar(&mut self, root: &mut Ui) {
+        let extension_names = self
+            .extension_registry
+            .services()
+            .iter()
+            .map(|service| service.name.clone())
+            .collect::<Vec<_>>();
         Panel::top("toolbar").exact_size(48.0).show(root, |ui| {
             ui.add_space(7.0);
             ui.horizontal(|ui| {
@@ -1544,6 +1686,34 @@ impl RuporaApp {
                     }
                     if ui.button("打印…").clicked() {
                         self.execute(AppCommand::Print);
+                        ui.close();
+                    }
+                });
+                ui.menu_button("扩展", |ui| {
+                    if !self.extension_registry.is_enabled() {
+                        ui.label("扩展默认关闭");
+                    } else if extension_names.is_empty() {
+                        ui.label("没有已配置的扩展服务");
+                    }
+                    for (index, name) in extension_names.iter().enumerate() {
+                        if ui
+                            .add_enabled(
+                                self.extension_receiver.is_none() && self.active.is_some(),
+                                Button::new(name),
+                            )
+                            .clicked()
+                        {
+                            self.execute(AppCommand::RunExtension(index));
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("打开扩展配置").clicked() {
+                        self.execute(AppCommand::OpenExtensionConfig);
+                        ui.close();
+                    }
+                    if ui.button("重新加载扩展配置").clicked() {
+                        self.execute(AppCommand::ReloadExtensions);
                         ui.close();
                     }
                 });
@@ -2775,6 +2945,7 @@ impl eframe::App for RuporaApp {
         }
         self.poll_instance_requests(ctx);
         self.poll_update_check();
+        self.poll_extension();
         self.handle_shortcuts(ctx);
         self.handle_dropped_files(ctx);
         self.save_recovery_snapshot_if_due();

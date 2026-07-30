@@ -115,6 +115,7 @@ native/src/
 ├── document.rs    # 文档模型、编码、换行、冲突检测与原子写入
 ├── editing.rs     # 查找替换、格式命令和字符位置映射
 ├── export.rs      # 原生 PDF 与打印
+├── extensions.rs  # 默认关闭的进程外扩展服务协议
 ├── instance.rs    # 单实例协调和文件转交
 ├── markdown.rs    # GFM、公式、图表、块范围、大纲、统计和 HTML
 ├── merge.rs       # 外部修改三方合并
@@ -133,8 +134,9 @@ assets/icons/      # 桌面窗口与安装包使用的跨平台图标
 
 P1–P7 已逐项完成，但混合模式仍不是 Typora 的像素级复制：块内点击已映射到对应源码附近，
 尚未共享 CommonMark 渲染器的逐字形排版坐标；跨块富文本选择和多光标仍属于后续编辑器研究。
-平台代码签名还必须由维护者提供外部证书，源码不能生成可信身份。
-完整状态见 [P1–P7 路线图](docs/ROADMAP.md)，质量门禁见 [质量说明](docs/QUALITY.md)。
+平台代码签名还必须由维护者提供外部证书，源码不能生成可信身份。扩展服务是进程隔离而非
+OS 沙箱，只应配置可信程序。完整状态见 [P1–P8 路线图](docs/ROADMAP.md)，质量门禁见
+[质量说明](docs/QUALITY.md)，扩展边界见 [扩展协议](docs/EXTENSIONS.md)。
 
 ## License
 
