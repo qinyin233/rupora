@@ -1,0 +1,29 @@
+[package]
+name = "rupora-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rupora = { path = ".." }
+
+[[bin]]
+name = "markdown_pipeline"
+path = "fuzz_targets/markdown_pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "table_parser"
+path = "fuzz_targets/table_parser.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

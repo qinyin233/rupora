@@ -692,10 +692,19 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .write_all(bytes)
         .and_then(|()| temporary.as_file_mut().sync_all())
         .map_err(|error| format!("无法写入 {}：{error}", path.display()))?;
+    #[cfg(test)]
+    if FAIL_BEFORE_ATOMIC_PERSIST.with(|failure| failure.replace(false)) {
+        return Err("测试注入：临时文件同步后、原子替换前失败".to_owned());
+    }
     temporary
         .persist(path)
         .map_err(|error| format!("无法替换 {}：{}", path.display(), error.error))?;
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_BEFORE_ATOMIC_PERSIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn trim_history(history: &mut Vec<EditTransaction>) {
@@ -891,6 +900,21 @@ mod tests {
         fs::create_dir(&invalid_target).unwrap();
         assert!(document.save_as(invalid_target, true).is_err());
         assert_eq!(document.path.as_deref(), Some(original_path.as_path()));
+    }
+
+    #[test]
+    fn injected_atomic_commit_failure_preserves_the_original_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("atomic.md");
+        fs::write(&path, "durable original").unwrap();
+        let mut document = Document::open(&path).unwrap();
+        document.content = "new editor content".to_owned();
+        document.update_after_edit();
+
+        FAIL_BEFORE_ATOMIC_PERSIST.with(|failure| failure.set(true));
+        assert!(document.save(true).unwrap_err().contains("测试注入"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "durable original");
+        assert!(document.dirty);
     }
 
     #[test]

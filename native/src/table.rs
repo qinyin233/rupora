@@ -77,9 +77,9 @@ impl MarkdownTable {
             let width = widths[index].max(3);
             let separator = match alignment {
                 Alignment::None => "-".repeat(width),
-                Alignment::Left => format!(":{}", "-".repeat(width.saturating_sub(1))),
-                Alignment::Center => format!(":{}:", "-".repeat(width.saturating_sub(2).max(1))),
-                Alignment::Right => format!("{}:", "-".repeat(width.saturating_sub(1))),
+                Alignment::Left => format!(":{}", "-".repeat(width)),
+                Alignment::Center => format!(":{}:", "-".repeat(width)),
+                Alignment::Right => format!("{}:", "-".repeat(width)),
             };
             output.push(' ');
             output.push_str(&separator);
@@ -286,5 +286,19 @@ mod tests {
         table.remove_column();
         assert_eq!(table.headers.len(), 1);
         assert!(table.rows.iter().all(|row| row.len() == 1));
+    }
+
+    #[test]
+    fn serializes_empty_centered_headers_as_a_parseable_table() {
+        let table = MarkdownTable {
+            range: 0..0,
+            headers: vec![String::new(); 3],
+            alignments: vec![Alignment::Center; 3],
+            rows: Vec::new(),
+        };
+        let markdown = table.to_markdown();
+        let reparsed = find_table(&markdown, 0).unwrap();
+        assert_eq!(reparsed.headers.len(), 3);
+        assert_eq!(reparsed.alignments, vec![Alignment::Center; 3]);
     }
 }

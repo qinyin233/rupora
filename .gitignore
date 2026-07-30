@@ -20,6 +20,9 @@ src-tauri/target/
 
 # Native Rust build output
 /target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
 
 # Editor directories and files
 .vscode/*

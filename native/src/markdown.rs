@@ -8,6 +8,9 @@ use pulldown_cmark::{
     CodeBlockKind, CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd, html,
 };
 
+const MAX_MATH_BYTES: usize = 16 * 1024;
+const MAX_MERMAID_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MarkdownAnalysis {
     pub headings: Vec<Heading>,
@@ -62,12 +65,19 @@ pub struct BlockIndex {
 impl BlockIndex {
     pub fn new(source: &str) -> Self {
         let mut next_id = 1;
+        let mut previous_start = 0usize;
+        let mut line = 1usize;
         let blocks = block_ranges(source)
             .into_iter()
             .map(|range| {
                 let id = BlockId(next_id);
                 next_id += 1;
-                block_from_range(source, id, range)
+                line += source[previous_start..range.start]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count();
+                previous_start = range.start;
+                MarkdownBlock { id, range, line }
             })
             .collect();
         Self {
@@ -130,6 +140,8 @@ impl BlockIndex {
         );
 
         let mut next_id = self.next_id;
+        let mut previous_start = 0usize;
+        let mut line = 1usize;
         self.blocks = new_ranges
             .into_iter()
             .enumerate()
@@ -139,7 +151,12 @@ impl BlockIndex {
                     next_id += 1;
                     id
                 });
-                block_from_range(source, id, range)
+                line += source[previous_start..range.start]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count();
+                previous_start = range.start;
+                MarkdownBlock { id, range, line }
             })
             .collect();
         self.next_id = next_id;
@@ -294,6 +311,9 @@ pub fn prepare_preview_markdown(source: &str) -> String {
 }
 
 pub fn render_math_svg(source: &str, inline: bool) -> Result<String, String> {
+    if source.len() > MAX_MATH_BYTES {
+        return Err(format!("公式超过 {} KiB 渲染上限", MAX_MATH_BYTES / 1024));
+    }
     let nodes = ratex_parser::parse(source).map_err(|error| error.to_string())?;
     let layout = ratex_layout::layout(&nodes, &ratex_layout::LayoutOptions::default());
     let display_list = ratex_layout::to_display_list(&layout);
@@ -307,6 +327,12 @@ pub fn render_math_svg(source: &str, inline: bool) -> Result<String, String> {
 }
 
 pub fn render_mermaid_svg(source: &str, dark: bool) -> Result<String, String> {
+    if source.len() > MAX_MERMAID_BYTES {
+        return Err(format!(
+            "Mermaid 源码超过 {} MiB 渲染上限",
+            MAX_MERMAID_BYTES / 1024 / 1024
+        ));
+    }
     let theme = if dark {
         mermaid_svg::Theme::dark()
     } else {
@@ -422,18 +448,6 @@ fn block_ranges(source: &str) -> Vec<Range<usize>> {
     merged
 }
 
-fn block_from_range(source: &str, id: BlockId, range: Range<usize>) -> MarkdownBlock {
-    MarkdownBlock {
-        id,
-        line: source[..range.start]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count()
-            + 1,
-        range,
-    }
-}
-
 fn block_hash(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
@@ -448,14 +462,19 @@ fn reconcile_changed_gaps(
     old_used: &mut [bool],
     assigned: &mut [Option<BlockId>],
 ) {
+    let old_positions = old_blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.id, index))
+        .collect::<HashMap<_, _>>();
     let anchors = assigned
         .iter()
         .enumerate()
         .filter_map(|(new_index, id)| {
             id.and_then(|id| {
-                old_blocks
-                    .iter()
-                    .position(|block| block.id == id)
+                old_positions
+                    .get(&id)
+                    .copied()
                     .map(|old_index| (old_index, new_index))
             })
         })
@@ -929,6 +948,12 @@ mod tests {
         assert!(html.contains("math-inline"));
         assert!(html.contains("<svg"));
         assert!(!html.contains("<code class=\"language-mermaid\""));
+    }
+
+    #[test]
+    fn rejects_pathologically_large_generated_content() {
+        assert!(render_math_svg(&"x".repeat(MAX_MATH_BYTES + 1), true).is_err());
+        assert!(render_mermaid_svg(&"x".repeat(MAX_MERMAID_BYTES + 1), false).is_err());
     }
 
     #[test]

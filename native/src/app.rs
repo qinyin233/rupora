@@ -32,6 +32,7 @@ use crate::{
 };
 
 const APP_STATE_KEY: &str = "rupora-native-state";
+const MAX_GENERATED_SVG_CACHE_ENTRIES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 enum ViewMode {
@@ -2949,7 +2950,7 @@ fn prepare_native_preview(
         } else {
             markdown::render_mermaid_svg(&block.source, dark).map(|svg| {
                 let bytes = Arc::<[u8]>::from(svg.into_bytes());
-                cache.insert(key.clone(), bytes.clone());
+                cache_generated_svg(cache, key.clone(), bytes.clone());
                 bytes
             })
         };
@@ -2993,7 +2994,7 @@ fn render_math_widget(
                     .replace("rgb(0,0,0)", "rgb(232,234,240)");
             }
             let bytes = Arc::<[u8]>::from(svg.into_bytes());
-            cache.insert(key.clone(), bytes.clone());
+            cache_generated_svg(cache, key.clone(), bytes.clone());
             bytes
         })
     };
@@ -3024,6 +3025,13 @@ fn generated_svg_key(kind: &str, source: &str, dark: bool) -> String {
     source.hash(&mut hasher);
     dark.hash(&mut hasher);
     format!("{kind}-{:016x}", hasher.finish())
+}
+
+fn cache_generated_svg(cache: &mut HashMap<String, Arc<[u8]>>, key: String, bytes: Arc<[u8]>) {
+    if cache.len() >= MAX_GENERATED_SVG_CACHE_ENTRIES && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(key, bytes);
 }
 
 fn char_to_byte(text: &str, char_index: usize) -> usize {
@@ -3118,6 +3126,16 @@ mod tests {
         assert!(preview.contains("bytes://rupora/mermaid-"));
         assert!(!preview.contains("```mermaid"));
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn bounds_the_generated_svg_cache() {
+        let mut cache = HashMap::new();
+        for index in 0..=MAX_GENERATED_SVG_CACHE_ENTRIES {
+            cache_generated_svg(&mut cache, format!("key-{index}"), Arc::from([index as u8]));
+        }
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&format!("key-{MAX_GENERATED_SVG_CACHE_ENTRIES}")));
     }
 
     #[test]
