@@ -70,6 +70,8 @@ UTF-8 源码边界的单调映射；实体解码后仍只返回合法字符边�
 - `cargo-packager` 从 Cargo 元数据读取名称、标识符、图标、许可证和文件关联。
 - 三平台 CI 执行格式、单元/属性测试、Clippy 和 release 构建；定时任务编译 fuzz 目标。
 - `cargo-deny` 与 RustSec 阻断漏洞、未知来源和未允许许可证。
-- `v2.*` 标签触发 Windows、Linux、macOS 安装包，并附加 SHA-256、CycloneDX SBOM 和
-  GitHub OIDC 构建来源证明。
+- `v2.*` 标签在 Windows、Linux、macOS 的 x86_64/ARM64 原生 runner 上构建安装包，并附加
+  SHA-256、CycloneDX SBOM 和 GitHub OIDC 构建来源证明。
+- 更新检查只信任 target 匹配的 Ed25519 签名清单；清单把版本、架构、产物 URL、长度和
+  SHA-256 绑定在同一个签名载荷中，任何缺失或篡改都会安全失败。
 - macOS 证书和 Windows Authenticode 证书只从仓库密钥注入，不进入源码或构建日志。
