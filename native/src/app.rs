@@ -2,7 +2,6 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     fs,
-    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -13,6 +12,20 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::{
+    app_state::{AppCommand, KeyBindings, PersistedState, ShortcutAction, ViewMode},
+    diagnostics,
+    document::{Document, EditKind},
+    editing::{self, MarkdownCommand},
+    export,
+    instance::InstanceCoordinator,
+    markdown::{self, BlockId, Heading},
+    native_preview::{prepare_native_preview, render_math_widget},
+    recovery::RecoveryStore,
+    table::{self, MarkdownTable},
+    updater::{self, UpdateInfo, UpdateStatus},
+    workspace::{Workspace, WorkspaceEntry},
+};
 use eframe::{
     CreationContext, Frame, Storage,
     egui::{
@@ -23,32 +36,8 @@ use eframe::{
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
-use serde::{Deserialize, Serialize};
-
-use crate::{
-    diagnostics,
-    document::{Document, EditKind},
-    editing::{self, MarkdownCommand},
-    export,
-    instance::InstanceCoordinator,
-    markdown::{self, BlockId, Heading},
-    recovery::RecoveryStore,
-    table::{self, MarkdownTable},
-    updater::{self, UpdateInfo, UpdateStatus},
-    workspace::{Workspace, WorkspaceEntry},
-};
 
 const APP_STATE_KEY: &str = "rupora-native-state";
-const MAX_GENERATED_SVG_CACHE_ENTRIES: usize = 128;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-enum ViewMode {
-    Edit,
-    #[default]
-    Split,
-    Hybrid,
-    Preview,
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SplitScrollDriver {
@@ -64,113 +53,9 @@ struct PaneScroll {
     hovered: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(default)]
-struct PersistedState {
-    dark: bool,
-    show_sidebar: bool,
-    show_outline: bool,
-    view_mode: ViewMode,
-    recent_files: Vec<PathBuf>,
-    session_files: Vec<PathBuf>,
-    active_session_file: Option<PathBuf>,
-    workspace_root: Option<PathBuf>,
-    cursor_positions: HashMap<PathBuf, usize>,
-    scroll_positions: HashMap<PathBuf, f32>,
-    key_bindings: KeyBindings,
-}
-
-impl Default for PersistedState {
-    fn default() -> Self {
-        Self {
-            dark: false,
-            show_sidebar: true,
-            show_outline: true,
-            view_mode: ViewMode::Split,
-            recent_files: Vec::new(),
-            session_files: Vec::new(),
-            active_session_file: None,
-            workspace_root: None,
-            cursor_positions: HashMap::new(),
-            scroll_positions: HashMap::new(),
-            key_bindings: KeyBindings::default(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-struct KeyBindings {
-    new_document: String,
-    open_file: String,
-    open_folder: String,
-    save: String,
-    save_as: String,
-    undo: String,
-    redo: String,
-    find: String,
-    replace: String,
-    command_palette: String,
-    bold: String,
-    italic: String,
-    link: String,
-}
-
-impl Default for KeyBindings {
-    fn default() -> Self {
-        Self {
-            new_document: "Ctrl+N".to_owned(),
-            open_file: "Ctrl+O".to_owned(),
-            open_folder: "Ctrl+Shift+O".to_owned(),
-            save: "Ctrl+S".to_owned(),
-            save_as: "Ctrl+Shift+S".to_owned(),
-            undo: "Ctrl+Z".to_owned(),
-            redo: "Ctrl+Shift+Z".to_owned(),
-            find: "Ctrl+F".to_owned(),
-            replace: "Ctrl+H".to_owned(),
-            command_palette: "Ctrl+Shift+P".to_owned(),
-            bold: "Ctrl+B".to_owned(),
-            italic: "Ctrl+I".to_owned(),
-            link: "Ctrl+K".to_owned(),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum AppCommand {
-    New,
-    Open,
-    OpenFolder,
-    ShortcutSettings,
-    Save,
-    SaveAs,
-    Undo,
-    Redo,
-    ExportHtml,
-    ExportPdf,
-    Print,
-    EditTable,
-    InsertToc,
-    InsertFootnote,
-    PasteImage,
-    CheckUpdates,
-    OpenDiagnostics,
-    OpenReleasePage,
-    About,
-    Format(MarkdownCommand),
-    SetView(ViewMode),
-}
-
 struct TableEditorState {
     document: usize,
     table: MarkdownTable,
-}
-
-enum ShortcutAction {
-    Command(AppCommand),
-    Find,
-    Replace,
-    Palette,
 }
 
 pub struct RuporaApp {
@@ -3171,104 +3056,6 @@ fn prompt_to_save(title: &str) -> MessageDialogResult {
         .show()
 }
 
-fn prepare_native_preview(
-    ctx: &Context,
-    source: &str,
-    dark: bool,
-    cache: &mut HashMap<String, Arc<[u8]>>,
-) -> String {
-    let mut output = markdown::prepare_preview_markdown(source);
-    for block in markdown::mermaid_blocks(&output).into_iter().rev() {
-        let key = generated_svg_key("mermaid", &block.source, dark);
-        let rendered = if let Some(bytes) = cache.get(&key) {
-            Ok(bytes.clone())
-        } else {
-            markdown::render_mermaid_svg(&block.source, dark).map(|svg| {
-                let bytes = Arc::<[u8]>::from(svg.into_bytes());
-                cache_generated_svg(cache, key.clone(), bytes.clone());
-                bytes
-            })
-        };
-        let replacement = match rendered {
-            Ok(bytes) => {
-                let uri = format!("bytes://rupora/{key}.svg");
-                ctx.include_bytes(uri.clone(), egui::load::Bytes::Shared(bytes));
-                format!("\n\n![Mermaid diagram]({uri})\n\n")
-            }
-            Err(error) => format!(
-                "\n\n> **Mermaid 图表错误：** {}\n\n",
-                error.replace('\n', " ")
-            ),
-        };
-        output.replace_range(block.range, &replacement);
-    }
-    output
-}
-
-fn render_math_widget(
-    ui: &mut Ui,
-    cache: &mut HashMap<String, Arc<[u8]>>,
-    math: &str,
-    inline: bool,
-    dark: bool,
-) {
-    let kind = if inline {
-        "math-inline"
-    } else {
-        "math-display"
-    };
-    let key = generated_svg_key(kind, math, dark);
-    let rendered = if let Some(bytes) = cache.get(&key) {
-        Ok(bytes.clone())
-    } else {
-        markdown::render_math_svg(math, inline).map(|mut svg| {
-            if dark {
-                svg = svg
-                    .replace("rgba(0,0,0,1)", "rgba(232,234,240,1)")
-                    .replace("rgba(0, 0, 0, 1)", "rgba(232, 234, 240, 1)")
-                    .replace("rgb(0,0,0)", "rgb(232,234,240)");
-            }
-            let bytes = Arc::<[u8]>::from(svg.into_bytes());
-            cache_generated_svg(cache, key.clone(), bytes.clone());
-            bytes
-        })
-    };
-    match rendered {
-        Ok(bytes) => {
-            let uri = format!("bytes://rupora/{key}.svg");
-            ui.add(
-                egui::Image::new(egui::ImageSource::Bytes {
-                    uri: uri.into(),
-                    bytes: egui::load::Bytes::Shared(bytes),
-                })
-                .fit_to_original_size(1.0)
-                .max_width(ui.available_width()),
-            );
-        }
-        Err(error) => {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                format!("公式错误：{math}（{error}）"),
-            );
-        }
-    }
-}
-
-fn generated_svg_key(kind: &str, source: &str, dark: bool) -> String {
-    let mut hasher = DefaultHasher::new();
-    kind.hash(&mut hasher);
-    source.hash(&mut hasher);
-    dark.hash(&mut hasher);
-    format!("{kind}-{:016x}", hasher.finish())
-}
-
-fn cache_generated_svg(cache: &mut HashMap<String, Arc<[u8]>>, key: String, bytes: Arc<[u8]>) {
-    if cache.len() >= MAX_GENERATED_SVG_CACHE_ENTRIES && !cache.contains_key(&key) {
-        cache.clear();
-    }
-    cache.insert(key, bytes);
-}
-
 fn char_to_byte(text: &str, char_index: usize) -> usize {
     text.char_indices()
         .nth(char_index)
@@ -3333,6 +3120,7 @@ fn install_fonts(ctx: &Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_preview::{MAX_GENERATED_SVG_CACHE_ENTRIES, cache_generated_svg};
 
     #[test]
     fn accepts_supported_document_extensions_case_insensitively() {
