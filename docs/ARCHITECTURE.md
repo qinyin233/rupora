@@ -17,8 +17,11 @@ OS window + native input
           ├── Document：内容、编码、换行、dirty、指纹和文件生命周期
           ├── editing：字符安全的选择区、查找替换与 Markdown 命令
           ├── pulldown-cmark：GFM、源码范围、块、大纲和 HTML
-          ├── egui_commonmark：原生预览与非活动块排版
-          ├── RecoveryStore：崩溃快照和会话
+          ├── egui_commonmark / RaTeX / mermaid-svg：原生预览
+          ├── printpdf：原生 PDF 导出
+          ├── RecoveryStore：带校验的崩溃快照和会话
+          ├── InstanceCoordinator：单实例文件转交
+          ├── diagnostics / updater：诊断日志与后台更新检查
           └── Workspace：受限递归目录树
 ```
 
@@ -60,6 +63,9 @@ OS window + native input
 ## 发布
 
 - `build.rs` 在 Windows 可执行文件中嵌入 ICO 和产品元数据。
-- `cargo-packager` 从 Cargo 元数据读取名称、标识符、图标和许可证。
-- 三平台 CI 执行格式、测试、Clippy 和 release 构建。
-- `v2.*` 标签触发 Windows、Linux、macOS 安装包，并附加到 GitHub Release。
+- `cargo-packager` 从 Cargo 元数据读取名称、标识符、图标、许可证和文件关联。
+- 三平台 CI 执行格式、单元/属性测试、Clippy 和 release 构建；定时任务编译 fuzz 目标。
+- `cargo-deny` 与 RustSec 阻断漏洞、未知来源和未允许许可证。
+- `v2.*` 标签触发 Windows、Linux、macOS 安装包，并附加 SHA-256、CycloneDX SBOM 和
+  GitHub OIDC 构建来源证明。
+- macOS 证书和 Windows Authenticode 证书只从仓库密钥注入，不进入源码或构建日志。

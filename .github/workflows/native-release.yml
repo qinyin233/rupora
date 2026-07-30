@@ -7,11 +7,18 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   package:
     name: Package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      HAS_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_ID != '' && secrets.APPLE_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+      HAS_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
+      WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
     strategy:
       fail-fast: false
       matrix:
@@ -24,7 +31,7 @@ jobs:
             artifact: macos
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -32,36 +39,110 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: 1.92.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
-      - name: Install cargo-packager
-        run: cargo install cargo-packager --locked --version 0.11.8
+      - name: Install release tooling
+        run: |
+          cargo install cargo-packager --locked --version 0.11.8
+          cargo install cargo-cyclonedx --locked --version 0.5.9
 
       - name: Build platform package
+        if: runner.os != 'macOS'
         run: cargo packager --release
 
+      - name: Build signed and notarized macOS package
+        if: runner.os == 'macOS' && env.HAS_APPLE_CERTIFICATE == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: cargo packager --release
+
+      - name: Build attested macOS package without Apple signing
+        if: runner.os == 'macOS' && env.HAS_APPLE_CERTIFICATE != 'true'
+        run: |
+          echo "::warning::Apple signing secrets are not configured; producing an unsigned developer package"
+          cargo packager --release
+
+      - name: Sign Windows installers
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERTIFICATE == 'true'
+        shell: pwsh
+        run: |
+          $certificatePath = Join-Path $env:RUNNER_TEMP "rupora-signing.pfx"
+          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signTool) { throw "signtool.exe was not found" }
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64)
+          )
+          Get-ChildItem target/release -File |
+            Where-Object { $_.Extension -in ".exe", ".msi" } |
+            ForEach-Object {
+              & $signTool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
+                /f $certificatePath /p $env:WINDOWS_CERTIFICATE_PASSWORD $_.FullName
+              if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed" }
+            }
+
+      - name: Report unsigned Windows developer package
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERTIFICATE != 'true'
+        run: echo "::warning::Windows signing secrets are not configured; producing an unsigned developer package"
+
+      - name: Generate CycloneDX SBOM
+        run: cargo cyclonedx --format json
+
+      - name: Stage packages, SBOM and SHA-256 checksums
+        shell: pwsh
+        env:
+          ARTIFACT_NAME: ${{ matrix.artifact }}
+        run: |
+          $staging = "target/release-artifacts"
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          $extensions = ".exe", ".msi", ".dmg", ".deb", ".AppImage"
+          $packages = Get-ChildItem target/release -File |
+            Where-Object { $_.Extension -in $extensions }
+          if (-not $packages) { throw "No release packages were produced" }
+          $packages | Copy-Item -Destination $staging
+
+          $sbom = Get-Item "rupora.cdx.json" -ErrorAction SilentlyContinue
+          if (-not $sbom) { $sbom = Get-Item "bom.json" -ErrorAction SilentlyContinue }
+          if (-not $sbom) { throw "CycloneDX SBOM was not produced" }
+          Copy-Item $sbom.FullName (Join-Path $staging "rupora-$env:ARTIFACT_NAME.cdx.json")
+
+          $checksumPath = Join-Path $staging "SHA256SUMS-$env:ARTIFACT_NAME.txt"
+          $checksumLines = Get-ChildItem $staging -File |
+            Where-Object { $_.Name -ne (Split-Path $checksumPath -Leaf) } |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash *$($_.Name)"
+            }
+          [IO.File]::WriteAllLines(
+            $checksumPath,
+            $checksumLines,
+            (New-Object Text.UTF8Encoding($false))
+          )
+
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rupora-${{ matrix.artifact }}
-          path: |
-            target/release/*-setup.exe
-            target/release/*.msi
-            target/release/*.dmg
-            target/release/*.deb
-            target/release/*.AppImage
+          path: target/release-artifacts/*
           if-no-files-found: error
 
-      - name: Attach packages to GitHub release
-        uses: softprops/action-gh-release@v2
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
         with:
-          files: |
-            target/release/*-setup.exe
-            target/release/*.msi
-            target/release/*.dmg
-            target/release/*.deb
-            target/release/*.AppImage
+          subject-path: target/release-artifacts/*
+
+      - name: Attach packages to GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: target/release-artifacts/*

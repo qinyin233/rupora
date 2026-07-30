@@ -21,7 +21,7 @@ Tauri 或 WebView。
 |---|---|
 | 窗口、输入、控件与渲染 | `eframe` / `egui` |
 | Markdown 解析 | `pulldown-cmark` |
-| Markdown 原生预览 | `egui_commonmark` |
+| Markdown 原生预览 | `egui_commonmark`、RaTeX、`mermaid-svg` |
 | 文档、编码、恢复与文件生命周期 | Rust |
 | 文件对话框 | `rfd` 原生对话框 |
 
@@ -32,18 +32,20 @@ Tauri 或 WebView。
 
 - 多文档打开、切换、关闭、最近文件、拖放打开和会话恢复
 - 编辑、分屏、预览，以及“当前块源码 + 其余块排版”的原生混合模式
-- GFM 表格、任务列表、删除线、脚注、标题大纲和相对图片
+- GFM 表格、任务列表、删除线、脚注、交叉引用、front matter、标题大纲和相对图片
+- 纯 Rust 数学公式与 Mermaid 图表渲染，以及可视化表格单元格编辑
 - 可点击大纲、工作区目录树、相对文档链接和本地附件打开
 - 查找/替换、常用 Markdown 格式命令及快捷键
 - 文档级撤销/重做；连续输入自动合并，格式化和替换保持独立历史步骤
 - UTF-8、UTF-8 BOM、UTF-16 LE/BE BOM、GBK/GB18030 检测与往返保存
 - 保存时保留原文件编码与 LF / CRLF / CR 换行风格
-- 精确未保存状态、原子保存、外部修改冲突保护
-- 外部文件变更监控：干净文档自动重载，脏文档显示持续冲突提示
-- 崩溃恢复快照、自动恢复和上次会话恢复
-- HTML 导出、浅色/深色主题、窗口和可执行文件图标
+- 精确未保存状态、原子保存、文件锁、外部修改三方合并与移动文件重新关联
+- 外部文件变更监控：干净文档自动重载，脏文档显示差异和持续冲突提示
+- 带校验与损坏隔离的崩溃恢复快照、自动恢复和上次会话恢复
+- HTML/PDF 导出、系统打印、浅色/深色主题、窗口和可执行文件图标
 - 跨解析稳定的块 ID，避免前方编辑导致活动块和控件状态错位
-- 36 项 Rust 回归测试、三平台 CI 和三平台发布打包工作流
+- 单实例文件转交、文件关联、后台更新检查和轮转诊断日志
+- 单元/属性/fuzz/性能测试、三平台 CI 和带 SBOM、校验和、来源证明的发布工作流
 
 ## 快捷键
 
@@ -77,6 +79,8 @@ cargo run
 cargo fmt --all -- --check
 cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
+cargo run --release --locked --example perf_guard
+cargo deny check --hide-inclusion-graph
 cargo build --release --locked
 ```
 
@@ -98,17 +102,24 @@ Windows 也可运行：
 ```
 
 产物写入 `target/release`。推送 `v2.*` 标签时，GitHub Actions 会在 Windows、Linux 和
-macOS 分别构建安装包并附加到对应 Release。
+macOS 分别构建安装包，并附加 SHA-256 校验、CycloneDX SBOM 与构建来源证明。签名密钥和
+回滚流程见 [发布指南](docs/RELEASE.md)。
 
 ## 项目结构
 
 ```text
 native/src/
 ├── app.rs         # 原生 UI、窗口、命令、多文档与混合编辑交互
+├── diagnostics.rs # 轮转运行日志与 panic 回溯
 ├── document.rs    # 文档模型、编码、换行、冲突检测与原子写入
 ├── editing.rs     # 查找替换、格式命令和字符位置映射
-├── markdown.rs    # GFM 解析、块范围、大纲、统计和 HTML 导出
+├── export.rs      # 原生 PDF 与打印
+├── instance.rs    # 单实例协调和文件转交
+├── markdown.rs    # GFM、公式、图表、块范围、大纲、统计和 HTML
+├── merge.rs       # 外部修改三方合并
 ├── recovery.rs    # 崩溃恢复快照
+├── table.rs       # 表格解析与可视化编辑模型
+├── updater.rs     # 后台 Release 更新检查
 ├── workspace.rs   # 工作区目录树
 ├── lib.rs
 └── main.rs
@@ -119,9 +130,10 @@ src-tauri/         # 1.x Tauri 旧实现，仅作迁移对照和复用图标
 
 ## 仍需诚实说明的限制
 
-混合模式已经实现块级“当前块显示源码、其他块排版”，但还不是 Typora 的完全等价实现：
-点击排版块会把光标放到块首，尚未把排版字形的精确点击位置映射回 Markdown 标记中的字符；
-表格的单元格内编辑、跨块选择与复合编辑事务仍需专用编辑模型。公式、图表和 PDF 导出尚未迁移。
+P1–P5 已逐项完成，但混合模式仍不是 Typora 的像素级复制：点击排版块目前定位到块首，
+尚未把排版字形坐标精确映射回 Markdown 标记字符；跨块富文本选择、多光标、语言服务和插件
+API 仍属于后续编辑器研究。平台代码签名还必须由维护者提供外部证书，源码不能生成可信身份。
+完整状态见 [P1–P5 路线图](docs/ROADMAP.md)，质量门禁见 [质量说明](docs/QUALITY.md)。
 
 ## License
 

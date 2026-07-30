@@ -23,6 +23,7 @@ src-tauri/target/
 /fuzz/artifacts/
 /fuzz/corpus/
 /fuzz/target/
+/rupora.cdx.json
 
 # Editor directories and files
 .vscode/*

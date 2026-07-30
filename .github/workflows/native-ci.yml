@@ -20,7 +20,7 @@ jobs:
         os: [windows-latest, ubuntu-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -28,12 +28,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: 1.92.0
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -51,27 +51,27 @@ jobs:
     name: Security and performance gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: 1.92.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Enforce large-document performance budgets
         run: cargo run --release --locked --example perf_guard
 
       - name: Check advisories, licenses, bans and dependency sources
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
 
       - name: Audit RustSec vulnerabilities
-        uses: rustsec/audit-check@v2
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -80,20 +80,22 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: nightly
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
       - name: Build fuzz targets
         working-directory: fuzz
-        run: cargo fuzz build
+        run: cargo fuzz build --locked
