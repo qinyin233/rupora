@@ -1751,6 +1751,11 @@ impl RuporaApp {
                     if !update.notes.trim().is_empty() {
                         ui.label(update.notes.lines().next().unwrap_or_default());
                     }
+                    ui.label(format!(
+                        "已验证 {} 的 {} 个发布产物",
+                        update.target,
+                        update.artifacts.len()
+                    ));
                 }
                 ui.label(format!(
                     "平台：{} / {}",

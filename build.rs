@@ -1,4 +1,7 @@
 fn main() {
+    if let Ok(target) = std::env::var("TARGET") {
+        println!("cargo:rustc-env=RUPORA_BUILD_TARGET={target}");
+    }
     println!("cargo:rerun-if-changed=assets/icons/icon.ico");
 
     #[cfg(windows)]
