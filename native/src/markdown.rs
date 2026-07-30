@@ -1,4 +1,8 @@
-use std::ops::Range;
+use std::{
+    collections::{HashMap, VecDeque},
+    hash::{DefaultHasher, Hash, Hasher},
+    ops::Range,
+};
 
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
 
@@ -17,10 +21,110 @@ pub struct Heading {
     pub line: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BlockId(u64);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkdownBlock {
+    pub id: BlockId,
     pub range: Range<usize>,
     pub line: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct BlockIndex {
+    source: String,
+    blocks: Vec<MarkdownBlock>,
+    next_id: u64,
+}
+
+impl BlockIndex {
+    pub fn new(source: &str) -> Self {
+        let mut next_id = 1;
+        let blocks = block_ranges(source)
+            .into_iter()
+            .map(|range| {
+                let id = BlockId(next_id);
+                next_id += 1;
+                block_from_range(source, id, range)
+            })
+            .collect();
+        Self {
+            source: source.to_owned(),
+            blocks,
+            next_id,
+        }
+    }
+
+    pub fn blocks(&self) -> &[MarkdownBlock] {
+        &self.blocks
+    }
+
+    pub fn update(&mut self, source: &str) {
+        if self.source == source {
+            return;
+        }
+
+        let new_ranges = block_ranges(source);
+        let mut assigned = vec![None; new_ranges.len()];
+        let mut exact_positions = HashMap::<u64, VecDeque<usize>>::new();
+        for (index, block) in self.blocks.iter().enumerate() {
+            exact_positions
+                .entry(block_hash(&self.source[block.range.clone()]))
+                .or_default()
+                .push_back(index);
+        }
+
+        let mut old_used = vec![false; self.blocks.len()];
+        let mut last_old = 0usize;
+        for (new_index, range) in new_ranges.iter().enumerate() {
+            let text = &source[range.clone()];
+            let hash = block_hash(text);
+            let Some(candidates) = exact_positions.get_mut(&hash) else {
+                continue;
+            };
+            while candidates.front().is_some_and(|index| *index < last_old) {
+                candidates.pop_front();
+            }
+            let Some(old_index) = candidates.iter().copied().find(|old_index| {
+                !old_used[*old_index] && self.source[self.blocks[*old_index].range.clone()] == *text
+            }) else {
+                continue;
+            };
+            while candidates.front().is_some_and(|index| *index <= old_index) {
+                candidates.pop_front();
+            }
+            assigned[new_index] = Some(self.blocks[old_index].id);
+            old_used[old_index] = true;
+            last_old = old_index + 1;
+        }
+
+        reconcile_changed_gaps(
+            &self.source,
+            &self.blocks,
+            source,
+            &new_ranges,
+            &mut old_used,
+            &mut assigned,
+        );
+
+        let mut next_id = self.next_id;
+        self.blocks = new_ranges
+            .into_iter()
+            .enumerate()
+            .map(|(index, range)| {
+                let id = assigned[index].unwrap_or_else(|| {
+                    let id = BlockId(next_id);
+                    next_id += 1;
+                    id
+                });
+                block_from_range(source, id, range)
+            })
+            .collect();
+        self.next_id = next_id;
+        self.source.clear();
+        self.source.push_str(source);
+    }
 }
 
 pub fn parser_options() -> Options {
@@ -104,11 +208,12 @@ pub fn local_link_destinations(source: &str) -> Vec<String> {
 }
 
 pub fn blocks(source: &str) -> Vec<MarkdownBlock> {
+    BlockIndex::new(source).blocks
+}
+
+fn block_ranges(source: &str) -> Vec<Range<usize>> {
     if source.is_empty() {
-        return vec![MarkdownBlock {
-            range: 0..0,
-            line: 1,
-        }];
+        return std::iter::once(0..0).collect();
     }
 
     let mut ranges = Vec::<Range<usize>>::new();
@@ -156,16 +261,137 @@ pub fn blocks(source: &str) -> Vec<MarkdownBlock> {
     }
 
     merged
-        .into_iter()
-        .map(|range| MarkdownBlock {
-            line: source[..range.start]
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count()
-                + 1,
-            range,
+}
+
+fn block_from_range(source: &str, id: BlockId, range: Range<usize>) -> MarkdownBlock {
+    MarkdownBlock {
+        id,
+        line: source[..range.start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1,
+        range,
+    }
+}
+
+fn block_hash(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn reconcile_changed_gaps(
+    old_source: &str,
+    old_blocks: &[MarkdownBlock],
+    new_source: &str,
+    new_ranges: &[Range<usize>],
+    old_used: &mut [bool],
+    assigned: &mut [Option<BlockId>],
+) {
+    let anchors = assigned
+        .iter()
+        .enumerate()
+        .filter_map(|(new_index, id)| {
+            id.and_then(|id| {
+                old_blocks
+                    .iter()
+                    .position(|block| block.id == id)
+                    .map(|old_index| (old_index, new_index))
+            })
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let mut previous_old = 0usize;
+    let mut previous_new = 0usize;
+    for (next_old, next_new) in anchors
+        .into_iter()
+        .chain(std::iter::once((old_blocks.len(), new_ranges.len())))
+    {
+        match_changed_gap(
+            old_source,
+            old_blocks,
+            previous_old..next_old,
+            new_source,
+            new_ranges,
+            previous_new..next_new,
+            old_used,
+            assigned,
+        );
+        previous_old = next_old.saturating_add(1);
+        previous_new = next_new.saturating_add(1);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn match_changed_gap(
+    old_source: &str,
+    old_blocks: &[MarkdownBlock],
+    old_gap: Range<usize>,
+    new_source: &str,
+    new_ranges: &[Range<usize>],
+    new_gap: Range<usize>,
+    old_used: &mut [bool],
+    assigned: &mut [Option<BlockId>],
+) {
+    let old_indices = old_gap
+        .filter(|index| !old_used[*index])
+        .collect::<Vec<_>>();
+    let new_indices = new_gap
+        .filter(|index| assigned[*index].is_none())
+        .collect::<Vec<_>>();
+    if old_indices.is_empty() || new_indices.is_empty() {
+        return;
+    }
+
+    if old_indices.len() == new_indices.len() {
+        for (old_index, new_index) in old_indices.into_iter().zip(new_indices) {
+            assigned[new_index] = Some(old_blocks[old_index].id);
+            old_used[old_index] = true;
+        }
+        return;
+    }
+
+    let mut candidates = old_indices
+        .iter()
+        .flat_map(|old_index| {
+            new_indices.iter().map(move |new_index| {
+                let old = &old_source[old_blocks[*old_index].range.clone()];
+                let new = &new_source[new_ranges[*new_index].clone()];
+                (
+                    similarity_score(old, new),
+                    old_index.abs_diff(*new_index),
+                    *old_index,
+                    *new_index,
+                )
+            })
+        })
+        .filter(|(score, _, _, _)| *score > 0)
+        .collect::<Vec<_>>();
+    candidates
+        .sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+
+    for (_, _, old_index, new_index) in candidates {
+        if !old_used[old_index] && assigned[new_index].is_none() {
+            assigned[new_index] = Some(old_blocks[old_index].id);
+            old_used[old_index] = true;
+        }
+    }
+}
+
+fn similarity_score(left: &str, right: &str) -> usize {
+    let prefix = left
+        .chars()
+        .zip(right.chars())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = left
+        .chars()
+        .rev()
+        .zip(right.chars().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    prefix + suffix
 }
 
 pub fn render_html_document(source: &str, title: &str, dark: bool) -> String {
@@ -317,12 +543,57 @@ mod tests {
 
     #[test]
     fn returns_an_editable_block_for_an_empty_document() {
-        assert_eq!(
-            blocks(""),
-            vec![MarkdownBlock {
-                range: 0..0,
-                line: 1,
-            }]
-        );
+        let blocks = blocks("");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].range, 0..0);
+        assert_eq!(blocks[0].line, 1);
+    }
+
+    #[test]
+    fn stable_block_ids_survive_content_inserted_before_them() {
+        let original = "# Heading\n\nFirst paragraph.\n\nSecond paragraph.";
+        let mut index = BlockIndex::new(original);
+        let original_ids = index
+            .blocks()
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>();
+
+        let updated = "New introduction.\n\n# Heading\n\nFirst paragraph.\n\nSecond paragraph.";
+        index.update(updated);
+        let updated_ids = index
+            .blocks()
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(&updated_ids[1..], original_ids);
+        assert_ne!(updated_ids[0], original_ids[0]);
+    }
+
+    #[test]
+    fn edited_block_keeps_its_identity_between_unchanged_anchors() {
+        let original = "# Heading\n\nOriginal paragraph.\n\n## End";
+        let mut index = BlockIndex::new(original);
+        let paragraph_id = index.blocks()[1].id;
+
+        index.update("# Heading\n\nChanged paragraph with 中文.\n\n## End");
+
+        assert_eq!(index.blocks()[1].id, paragraph_id);
+    }
+
+    #[test]
+    fn inserting_a_block_preserves_surrounding_identities() {
+        let original = "Alpha.\n\nOmega.";
+        let mut index = BlockIndex::new(original);
+        let alpha = index.blocks()[0].id;
+        let omega = index.blocks()[1].id;
+
+        index.update("Alpha.\n\nInserted.\n\nOmega.");
+
+        assert_eq!(index.blocks()[0].id, alpha);
+        assert_eq!(index.blocks()[2].id, omega);
+        assert_ne!(index.blocks()[1].id, alpha);
+        assert_ne!(index.blocks()[1].id, omega);
     }
 }

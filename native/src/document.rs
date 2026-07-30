@@ -12,7 +12,7 @@ use std::{
 use encoding_rs::{Encoding, GB18030, GBK};
 use tempfile::NamedTempFile;
 
-use crate::markdown::{MarkdownAnalysis, analyze};
+use crate::markdown::{BlockIndex, MarkdownAnalysis, MarkdownBlock, analyze};
 
 const MAX_HISTORY_ENTRIES: usize = 256;
 const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
@@ -92,11 +92,13 @@ pub struct Document {
     file_fingerprint: Option<FileFingerprint>,
     undo_history: Vec<EditTransaction>,
     redo_history: Vec<EditTransaction>,
+    block_index: BlockIndex,
 }
 
 impl Document {
     pub fn untitled(id: usize) -> Self {
         let content = String::new();
+        let block_index = BlockIndex::new(&content);
         Self {
             path: None,
             analysis: analyze(&content),
@@ -109,6 +111,7 @@ impl Document {
             file_fingerprint: None,
             undo_history: Vec::new(),
             redo_history: Vec::new(),
+            block_index,
         }
     }
 
@@ -119,6 +122,7 @@ impl Document {
         let decoded = decode_bytes(&bytes);
         let line_ending = detect_line_ending(&decoded.text);
         let content = normalize_line_endings(&decoded.text);
+        let block_index = BlockIndex::new(&content);
         let file_fingerprint = fingerprint_from_bytes(path, &bytes);
         Ok(Self {
             path: Some(path.to_path_buf()),
@@ -132,6 +136,7 @@ impl Document {
             file_fingerprint: Some(file_fingerprint),
             undo_history: Vec::new(),
             redo_history: Vec::new(),
+            block_index,
         })
     }
 
@@ -152,6 +157,11 @@ impl Document {
     pub fn update_after_edit(&mut self) {
         self.dirty = self.content != self.saved_content;
         self.analysis = analyze(&self.content);
+        self.block_index.update(&self.content);
+    }
+
+    pub fn blocks(&self) -> &[MarkdownBlock] {
+        self.block_index.blocks()
     }
 
     pub fn record_edit(
@@ -167,10 +177,12 @@ impl Document {
 
         let now = Instant::now();
         let after = self.content.clone();
+        let before_hash = text_hash(&before);
+        let after_hash = text_hash(&after);
         let can_coalesce = kind == EditKind::Typing
             && self.undo_history.last().is_some_and(|previous| {
                 previous.kind == EditKind::Typing
-                    && previous.after == before
+                    && previous.after_hash == before_hash
                     && previous.selection_after == selection_before
                     && now.duration_since(previous.created_at) <= TYPING_COALESCE_WINDOW
             });
@@ -180,13 +192,21 @@ impl Document {
                 .undo_history
                 .last_mut()
                 .expect("coalescing requires an existing transaction");
-            previous.after = after;
+            let mut original_before = before;
+            let reversed = previous.patch.apply_reverse(&mut original_before);
+            debug_assert!(
+                reversed,
+                "coalesced transaction must match its prior result"
+            );
+            previous.patch = TextPatch::between(&original_before, &after);
             previous.selection_after = selection_after;
             previous.created_at = now;
+            previous.after_hash = after_hash;
         } else {
             self.undo_history.push(EditTransaction {
-                before,
-                after,
+                patch: TextPatch::between(&before, &after),
+                before_hash,
+                after_hash,
                 selection_before,
                 selection_after,
                 kind,
@@ -209,7 +229,12 @@ impl Document {
 
     pub fn undo(&mut self) -> Option<HistoryOutcome> {
         let transaction = self.undo_history.pop()?;
-        self.content.clone_from(&transaction.before);
+        if text_hash(&self.content) != transaction.after_hash
+            || !transaction.patch.apply_reverse(&mut self.content)
+        {
+            self.undo_history.push(transaction);
+            return None;
+        }
         let outcome = HistoryOutcome {
             selection: transaction.selection_before.clone(),
         };
@@ -221,7 +246,12 @@ impl Document {
 
     pub fn redo(&mut self) -> Option<HistoryOutcome> {
         let transaction = self.redo_history.pop()?;
-        self.content.clone_from(&transaction.after);
+        if text_hash(&self.content) != transaction.before_hash
+            || !transaction.patch.apply_forward(&mut self.content)
+        {
+            self.redo_history.push(transaction);
+            return None;
+        }
         let outcome = HistoryOutcome {
             selection: transaction.selection_after.clone(),
         };
@@ -314,12 +344,20 @@ struct FileFingerprint {
 
 #[derive(Clone, Debug)]
 struct EditTransaction {
-    before: String,
-    after: String,
+    patch: TextPatch,
+    before_hash: u64,
+    after_hash: u64,
     selection_before: Option<Range<usize>>,
     selection_after: Option<Range<usize>>,
     kind: EditKind,
     created_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct TextPatch {
+    start: usize,
+    removed: String,
+    inserted: String,
 }
 
 struct DecodedText {
@@ -484,6 +522,12 @@ fn fingerprint_from_bytes(path: &Path, bytes: &[u8]) -> FileFingerprint {
     }
 }
 
+fn text_hash(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
@@ -524,7 +568,58 @@ fn trim_history(history: &mut Vec<EditTransaction>) {
 
 impl EditTransaction {
     fn memory_cost(&self) -> usize {
-        self.before.len() + self.after.len()
+        self.patch.removed.len() + self.patch.inserted.len()
+    }
+}
+
+impl TextPatch {
+    fn between(before: &str, after: &str) -> Self {
+        let mut prefix = 0usize;
+        for (left, right) in before.chars().zip(after.chars()) {
+            if left != right {
+                break;
+            }
+            prefix += left.len_utf8();
+        }
+
+        let mut suffix = 0usize;
+        for (left, right) in before[prefix..]
+            .chars()
+            .rev()
+            .zip(after[prefix..].chars().rev())
+        {
+            if left != right
+                || prefix + suffix + left.len_utf8() > before.len()
+                || prefix + suffix + right.len_utf8() > after.len()
+            {
+                break;
+            }
+            suffix += left.len_utf8();
+        }
+
+        Self {
+            start: prefix,
+            removed: before[prefix..before.len() - suffix].to_owned(),
+            inserted: after[prefix..after.len() - suffix].to_owned(),
+        }
+    }
+
+    fn apply_forward(&self, text: &mut String) -> bool {
+        let range = self.start..self.start + self.removed.len();
+        if text.get(range.clone()) != Some(self.removed.as_str()) {
+            return false;
+        }
+        text.replace_range(range, &self.inserted);
+        true
+    }
+
+    fn apply_reverse(&self, text: &mut String) -> bool {
+        let range = self.start..self.start + self.inserted.len();
+        if text.get(range.clone()) != Some(self.inserted.as_str()) {
+            return false;
+        }
+        text.replace_range(range, &self.removed);
+        true
     }
 }
 
@@ -728,5 +823,33 @@ mod tests {
         assert!(!document.dirty);
         document.redo();
         assert!(document.dirty);
+    }
+
+    #[test]
+    fn text_patch_round_trips_unicode_insert_delete_and_replace() {
+        for (before, after) in [
+            ("你好 world", "你好 brave world"),
+            ("emoji 😀 test", "emoji test"),
+            ("alpha 中文 omega", "alpha 汉字 omega"),
+            ("same suffix suffix", "different suffix"),
+        ] {
+            let patch = TextPatch::between(before, after);
+            let mut text = before.to_owned();
+            assert!(patch.apply_forward(&mut text));
+            assert_eq!(text, after);
+            assert!(patch.apply_reverse(&mut text));
+            assert_eq!(text, before);
+        }
+    }
+
+    #[test]
+    fn history_stores_only_the_changed_slice() {
+        let before = format!("{}old{}", "a".repeat(100_000), "z".repeat(100_000));
+        let after = format!("{}new{}", "a".repeat(100_000), "z".repeat(100_000));
+        let patch = TextPatch::between(&before, &after);
+
+        assert_eq!(patch.removed, "old");
+        assert_eq!(patch.inserted, "new");
+        assert_eq!(patch.removed.len() + patch.inserted.len(), 6);
     }
 }

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     document::{Document, EditKind},
     editing::{self, MarkdownCommand},
-    markdown::{self, Heading},
+    markdown::{self, BlockId, Heading},
     recovery::RecoveryStore,
     workspace::{Workspace, WorkspaceEntry},
 };
@@ -95,7 +95,7 @@ pub struct RuporaApp {
     find_match_case: bool,
     find_focus_requested: bool,
     workspace: Option<Workspace>,
-    hybrid_active: Option<(usize, usize)>,
+    hybrid_active: Option<(usize, BlockId)>,
 }
 
 impl RuporaApp {
@@ -1187,7 +1187,7 @@ impl RuporaApp {
     fn hybrid_pane(&mut self, ui: &mut Ui, index: usize) {
         let source = self.documents[index].content.clone();
         let selection_before = self.editor_cursor.map(cursor_range_to_char_range);
-        let blocks = markdown::blocks(&source);
+        let blocks = self.documents[index].blocks().to_vec();
         let base_uri = self.preview_base_uri(index);
         let local_links = markdown::local_link_destinations(&source);
         self.preview_cache.link_hooks_clear();
@@ -1204,17 +1204,18 @@ impl RuporaApp {
                 CCursor::new(selection_start.index.0.saturating_sub(block_char_start)),
                 CCursor::new(selection_end.index.0.saturating_sub(block_char_start)),
             ));
-            self.hybrid_active = Some((index, selected_block.range.start));
+            self.hybrid_active = Some((index, selected_block.id));
         }
 
-        let active_start = self
+        let active_block = self
             .hybrid_active
-            .filter(|(document, start)| {
-                *document == index && blocks.iter().any(|block| block.range.start == *start)
+            .filter(|(document, id)| {
+                *document == index && blocks.iter().any(|block| block.id == *id)
             })
-            .map(|(_, start)| start)
-            .unwrap_or(blocks[0].range.start);
-        self.hybrid_active = Some((index, active_start));
+            .and_then(|(_, id)| blocks.iter().find(|block| block.id == id))
+            .unwrap_or(&blocks[0]);
+        let active_id = active_block.id;
+        self.hybrid_active = Some((index, active_id));
 
         let mut pending_edit = None;
         let mut activate = None;
@@ -1226,11 +1227,11 @@ impl RuporaApp {
                 ui.add_space(12.0);
                 ui.set_max_width((ui.available_width() - 28.0).max(260.0));
                 for block in &blocks {
-                    ui.push_id(("hybrid-block", block.range.start), |ui| {
-                        if block.range.start == active_start {
+                    ui.push_id(("hybrid-block", block.id), |ui| {
+                        if block.id == active_id {
                             let mut block_content = source[block.range.clone()].to_owned();
                             let editor_id =
-                                ui.make_persistent_id(("hybrid-editor", index, block.range.start));
+                                ui.make_persistent_id(("hybrid-editor", index, block.id));
                             if let Some(cursor_range) = pending_local.take() {
                                 let mut state =
                                     TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
@@ -1281,7 +1282,7 @@ impl RuporaApp {
                             let response = ui
                                 .interact(
                                     shown.response.rect,
-                                    ui.make_persistent_id(("activate-block", block.range.start)),
+                                    ui.make_persistent_id(("activate-block", block.id)),
                                     egui::Sense::click(),
                                 )
                                 .on_hover_text(format!(
@@ -1297,7 +1298,7 @@ impl RuporaApp {
                                 );
                             }
                             if response.clicked() {
-                                activate = Some(block.range.start);
+                                activate = Some((block.id, block.range.start));
                             }
                         }
                     });
@@ -1320,12 +1321,12 @@ impl RuporaApp {
                 selection_after,
                 EditKind::Typing,
             );
-            self.hybrid_active = Some((index, range.start));
+            self.hybrid_active = Some((index, active_id));
             self.status = "已更新当前 Markdown 块".to_owned();
         }
-        if let Some(start) = activate {
+        if let Some((id, start)) = activate {
             let char_start = source[..start].chars().count();
-            self.hybrid_active = Some((index, start));
+            self.hybrid_active = Some((index, id));
             self.queue_editor_selection(char_start..char_start);
         }
 
