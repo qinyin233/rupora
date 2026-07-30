@@ -26,7 +26,8 @@ OS window + native input
 ```
 
 运行 `cargo build` 或 `cargo run` 不会调用 Node.js、Vite、Vue、Vditor、Tauri 或 WebView。
-旧实现暂留在 `src/` 和 `src-tauri/` 作迁移对照；`src-tauri/icons/` 中的跨平台图标继续复用。
+2.x 仓库已移除 1.x WebView 实现及其 Node/Tauri 构建链；跨平台图标独立保存在
+`assets/icons/`。
 
 ## 文档不变量
 

@@ -124,8 +124,7 @@ native/src/
 ├── lib.rs
 └── main.rs
 
-src/               # 1.x Vue/Vditor 旧实现，仅作迁移对照
-src-tauri/         # 1.x Tauri 旧实现，仅作迁移对照和复用图标
+assets/icons/      # 桌面窗口与安装包使用的跨平台图标
 ```
 
 ## 仍需诚实说明的限制

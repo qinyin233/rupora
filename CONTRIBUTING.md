@@ -34,7 +34,7 @@ cargo build --release --locked
 - `native/src/markdown.rs`：Markdown 解析、块范围、大纲、统计和 HTML
 - `native/src/recovery.rs`：崩溃恢复快照
 - `native/src/workspace.rs`：工作区目录树
-- `src/`、`src-tauri/`：1.x WebView 旧实现，仅用于迁移对照
+- `assets/icons/`：桌面窗口和安装包使用的跨平台图标
 
 ## 提交要求
 

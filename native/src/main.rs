@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_min_inner_size([760.0, 520.0]);
 
     if let Ok(icon) =
-        eframe::icon_data::from_png_bytes(include_bytes!("../../src-tauri/icons/icon.png"))
+        eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icons/icon.png"))
     {
         viewport = viewport.with_icon(icon);
     }
