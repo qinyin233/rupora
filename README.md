@@ -44,8 +44,12 @@ Tauri 或 WebView。
 - 带校验与损坏隔离的崩溃恢复快照、自动恢复和上次会话恢复
 - HTML/PDF 导出、系统打印、浅色/深色主题、窗口和可执行文件图标
 - 跨解析稳定的块 ID，避免前方编辑导致活动块和控件状态错位
-- 单实例文件转交、文件关联、后台更新检查和轮转诊断日志
-- 单元/属性/fuzz/性能测试、三平台 CI 和带 SBOM、校验和、来源证明的发布工作流
+- 大文档输入期间延迟全量派生分析，编辑缓冲只在真实修改时惰性捕获历史正文
+- 排版文本到 Markdown UTF-8 边界的源码映射，支持混合模式块内点击精确定位
+- 单实例文件转交、文件关联、Ed25519 签名更新检查和轮转诊断日志
+- 默认关闭的进程外扩展服务，以及权限、超时、输入/输出上限和过期结果保护
+- 中文 IME、Emoji、AccessKit、HTML/PDF 视觉回归、属性、fuzz 和大文档性能测试
+- 六种原生平台/架构 CI，发布产物带签名清单、SBOM、校验和与来源证明
 
 ## 快捷键
 
@@ -78,7 +82,7 @@ cargo run
 ```bash
 cargo fmt --all -- --check
 cargo test --all-targets --locked
-cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo run --release --locked --example perf_guard
 cargo deny check --hide-inclusion-graph
 cargo build --release --locked
@@ -101,9 +105,33 @@ Windows 也可运行：
 ./scripts/package.ps1 -Format nsis
 ```
 
-产物写入 `target/release`。推送 `v2.*` 标签时，GitHub Actions 会在 Windows、Linux 和
-macOS 分别构建安装包，并附加 SHA-256 校验、CycloneDX SBOM 与构建来源证明。签名密钥和
-回滚流程见 [发布指南](docs/RELEASE.md)。
+产物写入 `target/release`。推送 `v2.*` 标签时，GitHub Actions 会为 Windows、Linux 和
+macOS 的 x86_64/ARM64 六种目标分别构建架构命名安装包，并附加 Ed25519 更新清单、
+SHA-256 校验、CycloneDX SBOM 与构建来源证明。
+
+正式发布前需要配置：
+
+- secret `UPDATE_SIGNING_KEY_BASE64`：随机 32 字节 Ed25519 私钥的 Base64。
+- variable `UPDATE_PUBLIC_KEY_BASE64`：运行
+  `cargo run --locked --example update_public_key` 从同一私钥派生的公钥。
+- 可选的 Windows Authenticode 和 Apple 签名/公证证书。
+
+签名、验证和回滚流程见 [发布指南](docs/RELEASE.md)。
+
+## 扩展
+
+扩展默认关闭，并作为独立进程通过 stdin/stdout 上的一次性 JSON 协议运行，不会把第三方
+动态库载入编辑器地址空间。可从“扩展 → 打开扩展配置”创建 `extensions.json`，然后为每个
+绝对程序路径明确授予 `read_document`、`read_document_path` 或 `replace_document` 权限。
+
+仓库包含一个最小 Rust 示例：
+
+```bash
+cargo build --locked --example extension_uppercase
+```
+
+协议、配置和安全边界见 [扩展文档](docs/EXTENSIONS.md)。进程隔离并不等同于操作系统沙箱，
+只应配置可信程序。
 
 ## 项目结构
 
@@ -114,15 +142,17 @@ native/src/
 ├── diagnostics.rs # 轮转运行日志与 panic 回溯
 ├── document.rs    # 文档模型、编码、换行、冲突检测与原子写入
 ├── editing.rs     # 查找替换、格式命令和字符位置映射
+├── editor_buffer.rs # egui 编辑缓冲、惰性历史快照与 IME 适配
 ├── export.rs      # 原生 PDF 与打印
 ├── extensions.rs  # 默认关闭的进程外扩展服务协议
 ├── instance.rs    # 单实例协调和文件转交
 ├── markdown.rs    # GFM、公式、图表、块范围、大纲、统计和 HTML
 ├── merge.rs       # 外部修改三方合并
+├── native_preview.rs # 数学、Mermaid 与 SVG 的原生预览和有界缓存
 ├── recovery.rs    # 崩溃恢复快照
 ├── source_map.rs  # 排版文本到 Markdown 源码的 Unicode 安全映射
 ├── table.rs       # 表格解析与可视化编辑模型
-├── updater.rs     # 后台 Release 更新检查
+├── updater.rs     # Ed25519 签名的目标架构更新清单验证
 ├── workspace.rs   # 工作区目录树
 ├── lib.rs
 └── main.rs
@@ -132,7 +162,7 @@ assets/icons/      # 桌面窗口与安装包使用的跨平台图标
 
 ## 仍需诚实说明的限制
 
-P1–P7 已逐项完成，但混合模式仍不是 Typora 的像素级复制：块内点击已映射到对应源码附近，
+P1–P8 已逐项完成，但混合模式仍不是 Typora 的像素级复制：块内点击已映射到对应源码附近，
 尚未共享 CommonMark 渲染器的逐字形排版坐标；跨块富文本选择和多光标仍属于后续编辑器研究。
 平台代码签名还必须由维护者提供外部证书，源码不能生成可信身份。扩展服务是进程隔离而非
 OS 沙箱，只应配置可信程序。完整状态见 [P1–P8 路线图](docs/ROADMAP.md)，质量门禁见
