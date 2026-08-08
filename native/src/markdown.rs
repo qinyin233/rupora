@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
+    sync::{Arc, OnceLock},
 };
 
 use pulldown_cmark::{
@@ -10,6 +11,7 @@ use pulldown_cmark::{
 
 const MAX_MATH_BYTES: usize = 16 * 1024;
 const MAX_MERMAID_BYTES: usize = 1024 * 1024;
+const MAX_GENERATED_SVG_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MarkdownAnalysis {
@@ -323,7 +325,7 @@ pub fn render_math_svg(source: &str, inline: bool) -> Result<String, String> {
         embed_glyphs: true,
         ..ratex_svg::SvgOptions::default()
     };
-    Ok(ratex_svg::render_to_svg(&display_list, &options))
+    bound_generated_svg(ratex_svg::render_to_svg(&display_list, &options), "公式")
 }
 
 pub fn render_mermaid_svg(source: &str, dark: bool) -> Result<String, String> {
@@ -338,11 +340,13 @@ pub fn render_mermaid_svg(source: &str, dark: bool) -> Result<String, String> {
     } else {
         mermaid_svg::Theme::default()
     };
-    mermaid_svg::render_with(source, &theme).map_err(|error| error.to_string())
+    let svg = mermaid_svg::render_with(source, &theme).map_err(|error| error.to_string())?;
+    bound_generated_svg(svg, "Mermaid")
 }
 
 pub fn render_html_fragment(source: &str) -> String {
     let (mut output, generated) = render_html_with_generated(source, false);
+    output = ammonia::clean(&output);
     for (token, svg) in generated {
         output = output.replace(&token, &svg);
     }
@@ -704,37 +708,43 @@ fn render_html_with_generated(source: &str, dark: bool) -> (String, Vec<(String,
                     }
                 }
                 let token = generated_html_token(generated.len());
-                let rendered = render_mermaid_svg(&diagram, dark).unwrap_or_else(|error| {
-                    format!(
-                        "<pre class=\"diagram-error\">Mermaid：{}</pre>",
-                        escape_html(&error)
-                    )
-                });
+                let rendered = render_mermaid_svg(&diagram, dark)
+                    .and_then(|svg| static_svg_for_html(&svg))
+                    .unwrap_or_else(|error| {
+                        format!(
+                            "<pre class=\"diagram-error\">Mermaid：{}</pre>",
+                            escape_html(&error)
+                        )
+                    });
                 generated.push((token.clone(), rendered));
                 events.push(Event::Html(CowStr::Boxed(token.into_boxed_str())));
             }
             Event::InlineMath(math) => {
                 let token = generated_html_token(generated.len());
-                let rendered = render_math_svg(&math, true).unwrap_or_else(|error| {
-                    format!(
-                        "<code class=\"math-error\" title=\"{}\">{}</code>",
-                        escape_html(&error),
-                        escape_html(&math)
-                    )
-                });
+                let rendered = render_math_svg(&math, true)
+                    .and_then(|svg| static_svg_for_html(&svg))
+                    .unwrap_or_else(|error| {
+                        format!(
+                            "<code class=\"math-error\" title=\"{}\">{}</code>",
+                            escape_html(&error),
+                            escape_html(&math)
+                        )
+                    });
                 let rendered = format!("<span class=\"math-inline\">{rendered}</span>");
                 generated.push((token.clone(), rendered));
                 events.push(Event::Html(CowStr::Boxed(token.into_boxed_str())));
             }
             Event::DisplayMath(math) => {
                 let token = generated_html_token(generated.len());
-                let rendered = render_math_svg(&math, false).unwrap_or_else(|error| {
-                    format!(
-                        "<code class=\"math-error\" title=\"{}\">{}</code>",
-                        escape_html(&error),
-                        escape_html(&math)
-                    )
-                });
+                let rendered = render_math_svg(&math, false)
+                    .and_then(|svg| static_svg_for_html(&svg))
+                    .unwrap_or_else(|error| {
+                        format!(
+                            "<code class=\"math-error\" title=\"{}\">{}</code>",
+                            escape_html(&error),
+                            escape_html(&math)
+                        )
+                    });
                 let rendered = format!("<div class=\"math-display\">{rendered}</div>");
                 generated.push((token.clone(), rendered));
                 events.push(Event::Html(CowStr::Boxed(token.into_boxed_str())));
@@ -771,6 +781,40 @@ fn render_html_with_generated(source: &str, dark: bool) -> (String, Vec<(String,
 
 fn generated_html_token(index: usize) -> String {
     format!("RUPORA_GENERATED_BLOCK_{index}_B5C4718D")
+}
+
+fn bound_generated_svg(svg: String, kind: &str) -> Result<String, String> {
+    if svg.len() > MAX_GENERATED_SVG_BYTES {
+        return Err(format!(
+            "{kind} SVG 超过 {} MiB 输出上限",
+            MAX_GENERATED_SVG_BYTES / 1024 / 1024
+        ));
+    }
+    Ok(svg)
+}
+
+fn static_svg_for_html(svg: &str) -> Result<String, String> {
+    static FONT_DATABASE: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
+
+    let font_database = FONT_DATABASE.get_or_init(|| {
+        let mut database = usvg::fontdb::Database::new();
+        database.load_system_fonts();
+        Arc::new(database)
+    });
+    let mut options = usvg::Options {
+        fontdb: Arc::clone(font_database),
+        ..usvg::Options::default()
+    };
+    // Export generated content only as static artwork. Resolving an image from
+    // a user-controlled SVG could otherwise expose local or network resources.
+    options.image_href_resolver = usvg::ImageHrefResolver {
+        resolve_data: Box::new(|_, _, _| None),
+        resolve_string: Box::new(|_, _| None),
+    };
+    let tree = usvg::Tree::from_str(svg, &options)
+        .map_err(|error| format!("无法安全解析生成的 SVG：{error}"))?;
+    let static_svg = tree.to_string(&usvg::WriteOptions::default());
+    bound_generated_svg(static_svg, "静态")
 }
 
 pub fn render_html_document(source: &str, title: &str, dark: bool) -> String {
@@ -977,6 +1021,35 @@ mod tests {
         );
         assert!(!html.to_ascii_lowercase().contains("<script"));
         assert!(!html.to_ascii_lowercase().contains("onload="));
+    }
+
+    #[test]
+    fn generated_diagram_interactions_are_exported_as_static_svg() {
+        let html = render_html_document(
+            "```mermaid\nflowchart TD\nA[Open] --> B[Done]\nclick A runDanger \"callback\"\nclick B \"javascript:alert(1)\"\n```\n",
+            "static diagram",
+            false,
+        );
+        let lowercase = html.to_ascii_lowercase();
+        assert!(lowercase.contains("<svg"));
+        assert!(!lowercase.contains("onclick"));
+        assert!(!lowercase.contains("javascript:"));
+        assert!(!lowercase.contains("<script"));
+    }
+
+    #[test]
+    fn html_fragments_are_sanitized_before_static_svg_is_inserted() {
+        let html = render_html_fragment(
+            "<img src=\"safe.png\" onerror=\"alert(1)\"><script>alert(2)</script>",
+        );
+        assert!(html.contains("safe.png"));
+        assert!(!html.contains("onerror"));
+        assert!(!html.contains("<script"));
+    }
+
+    #[test]
+    fn rejects_oversized_generated_svg_output() {
+        assert!(bound_generated_svg("x".repeat(MAX_GENERATED_SVG_BYTES + 1), "test").is_err());
     }
 
     #[test]

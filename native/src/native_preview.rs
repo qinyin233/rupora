@@ -9,6 +9,7 @@ use eframe::egui::{self, Context, Ui};
 use crate::markdown;
 
 pub(crate) const MAX_GENERATED_SVG_CACHE_ENTRIES: usize = 128;
+pub(crate) const MAX_GENERATED_SVG_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) fn prepare_native_preview(
     ctx: &Context,
@@ -24,7 +25,7 @@ pub(crate) fn prepare_native_preview(
         } else {
             markdown::render_mermaid_svg(&block.source, dark).map(|svg| {
                 let bytes = Arc::<[u8]>::from(svg.into_bytes());
-                cache_generated_svg(cache, key.clone(), bytes.clone());
+                cache_generated_svg(ctx, cache, key.clone(), bytes.clone());
                 bytes
             })
         };
@@ -68,7 +69,7 @@ pub(crate) fn render_math_widget(
                     .replace("rgb(0,0,0)", "rgb(232,234,240)");
             }
             let bytes = Arc::<[u8]>::from(svg.into_bytes());
-            cache_generated_svg(cache, key.clone(), bytes.clone());
+            cache_generated_svg(ui.ctx(), cache, key.clone(), bytes.clone());
             bytes
         })
     };
@@ -102,11 +103,25 @@ fn generated_svg_key(kind: &str, source: &str, dark: bool) -> String {
 }
 
 pub(crate) fn cache_generated_svg(
+    ctx: &Context,
     cache: &mut HashMap<String, Arc<[u8]>>,
     key: String,
     bytes: Arc<[u8]>,
 ) {
-    if cache.len() >= MAX_GENERATED_SVG_CACHE_ENTRIES && !cache.contains_key(&key) {
+    if bytes.len() > MAX_GENERATED_SVG_CACHE_BYTES {
+        return;
+    }
+    let existing_bytes = cache.get(&key).map_or(0, |existing| existing.len());
+    let cached_bytes = cache.values().map(|value| value.len()).sum::<usize>();
+    let projected_bytes = cached_bytes
+        .saturating_sub(existing_bytes)
+        .saturating_add(bytes.len());
+    if (cache.len() >= MAX_GENERATED_SVG_CACHE_ENTRIES && !cache.contains_key(&key))
+        || projected_bytes > MAX_GENERATED_SVG_CACHE_BYTES
+    {
+        for cached_key in cache.keys() {
+            ctx.forget_image(&format!("bytes://rupora/{cached_key}.svg"));
+        }
         cache.clear();
     }
     cache.insert(key, bytes);

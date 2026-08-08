@@ -3330,7 +3330,9 @@ fn install_fonts(ctx: &Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_preview::{MAX_GENERATED_SVG_CACHE_ENTRIES, cache_generated_svg};
+    use crate::native_preview::{
+        MAX_GENERATED_SVG_CACHE_BYTES, MAX_GENERATED_SVG_CACHE_ENTRIES, cache_generated_svg,
+    };
 
     #[test]
     fn accepts_supported_document_extensions_case_insensitively() {
@@ -3363,12 +3365,43 @@ mod tests {
 
     #[test]
     fn bounds_the_generated_svg_cache() {
+        let context = Context::default();
         let mut cache = HashMap::new();
         for index in 0..=MAX_GENERATED_SVG_CACHE_ENTRIES {
-            cache_generated_svg(&mut cache, format!("key-{index}"), Arc::from([index as u8]));
+            cache_generated_svg(
+                &context,
+                &mut cache,
+                format!("key-{index}"),
+                Arc::from([index as u8]),
+            );
         }
         assert_eq!(cache.len(), 1);
         assert!(cache.contains_key(&format!("key-{MAX_GENERATED_SVG_CACHE_ENTRIES}")));
+    }
+
+    #[test]
+    fn bounds_the_generated_svg_cache_by_bytes() {
+        let context = Context::default();
+        let mut cache = HashMap::new();
+        let shared = Arc::<[u8]>::from(vec![0; MAX_GENERATED_SVG_CACHE_BYTES / 4]);
+        for index in 0..4 {
+            cache_generated_svg(
+                &context,
+                &mut cache,
+                format!("large-{index}"),
+                shared.clone(),
+            );
+        }
+        assert_eq!(cache.len(), 4);
+
+        cache_generated_svg(
+            &context,
+            &mut cache,
+            "replacement".to_owned(),
+            Arc::from([1]),
+        );
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key("replacement"));
     }
 
     #[test]
