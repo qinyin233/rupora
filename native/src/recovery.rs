@@ -8,11 +8,12 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::document::Document;
 
-const RECOVERY_VERSION: u32 = 2;
+const RECOVERY_VERSION: u32 = 3;
 const MAX_RECOVERY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RECOVERY_DOCUMENTS: usize = 100;
 
@@ -20,6 +21,12 @@ const MAX_RECOVERY_DOCUMENTS: usize = 100;
 pub struct RecoveryEntry {
     pub path: Option<PathBuf>,
     pub content: String,
+    #[serde(default)]
+    pub base_content: Option<String>,
+    #[serde(default)]
+    pub encoding: Option<String>,
+    #[serde(default)]
+    pub line_ending: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -30,6 +37,13 @@ struct RecoverySnapshot {
     documents: Vec<RecoveryEntry>,
     #[serde(default)]
     checksum: Option<u64>,
+    #[serde(default)]
+    checksum_sha256: Option<String>,
+}
+
+enum RecoveryLoadError {
+    Corrupt(String),
+    Preserve(String),
 }
 
 pub struct RecoveryStore {
@@ -56,7 +70,8 @@ impl RecoveryStore {
         }
         match self.load_snapshot(path) {
             Ok(entries) => Ok(entries),
-            Err(error) => {
+            Err(RecoveryLoadError::Preserve(error)) => Err(error),
+            Err(RecoveryLoadError::Corrupt(error)) => {
                 let quarantine = quarantine_corrupt_snapshot(path);
                 Err(match quarantine {
                     Ok(Some(backup)) => {
@@ -72,14 +87,33 @@ impl RecoveryStore {
     }
 
     pub fn save(&self, documents: &[Document]) -> Result<(), String> {
-        let entries = documents
-            .iter()
-            .filter(|document| document.dirty)
-            .map(|document| RecoveryEntry {
+        let mut entries = Vec::new();
+        let mut estimated_bytes = 0usize;
+        for document in documents.iter().filter(|document| document.dirty) {
+            let base_content = document.recovery_base_content();
+            let path_bytes = document
+                .path
+                .as_deref()
+                .map_or(0, |path| path.as_os_str().len());
+            estimated_bytes = estimated_bytes
+                .checked_add(document.content.len())
+                .and_then(|size| size.checked_add(base_content.len()))
+                .and_then(|size| size.checked_add(path_bytes))
+                .ok_or_else(|| "恢复数据大小溢出".to_owned())?;
+            if estimated_bytes as u64 > MAX_RECOVERY_BYTES {
+                return Err(format!(
+                    "恢复数据超过 {} MiB 安全上限",
+                    MAX_RECOVERY_BYTES / 1024 / 1024
+                ));
+            }
+            entries.push(RecoveryEntry {
                 path: document.path.clone(),
                 content: document.content.clone(),
-            })
-            .collect::<Vec<_>>();
+                base_content: Some(base_content.to_owned()),
+                encoding: Some(document.encoding.label().to_owned()),
+                line_ending: Some(document.line_ending.label().to_owned()),
+            });
+        }
 
         if entries.is_empty() {
             return self.clear();
@@ -99,13 +133,15 @@ impl RecoveryStore {
                 .map_err(|error| format!("无法创建恢复目录 {}：{error}", parent.display()))?;
         }
 
+        let checksum_sha256 = Some(entries_sha256(&entries)?);
         let snapshot = RecoverySnapshot {
             version: RECOVERY_VERSION,
             saved_at_unix_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis(),
-            checksum: Some(entries_checksum(&entries)),
+            checksum: None,
+            checksum_sha256,
             documents: entries,
         };
         let json = serde_json::to_vec_pretty(&snapshot)
@@ -130,35 +166,49 @@ impl RecoveryStore {
         }
     }
 
-    fn load_snapshot(&self, path: &Path) -> Result<Vec<RecoveryEntry>, String> {
-        let metadata = fs::metadata(path)
-            .map_err(|error| format!("无法检查恢复数据 {}：{error}", path.display()))?;
+    fn load_snapshot(&self, path: &Path) -> Result<Vec<RecoveryEntry>, RecoveryLoadError> {
+        let metadata = fs::metadata(path).map_err(|error| {
+            RecoveryLoadError::Preserve(format!("无法检查恢复数据 {}：{error}", path.display()))
+        })?;
         if metadata.len() > MAX_RECOVERY_BYTES {
-            return Err(format!(
+            return Err(RecoveryLoadError::Corrupt(format!(
                 "恢复数据超过 {} MiB 安全上限：{}",
                 MAX_RECOVERY_BYTES / 1024 / 1024,
                 path.display()
-            ));
+            )));
         }
-        let bytes = fs::read(path)
-            .map_err(|error| format!("无法读取恢复数据 {}：{error}", path.display()))?;
-        let snapshot: RecoverySnapshot = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("恢复数据格式无效 {}：{error}", path.display()))?;
-        if !matches!(snapshot.version, 1 | RECOVERY_VERSION) {
-            return Err(format!(
+        let bytes = fs::read(path).map_err(|error| {
+            RecoveryLoadError::Preserve(format!("无法读取恢复数据 {}：{error}", path.display()))
+        })?;
+        let snapshot: RecoverySnapshot = serde_json::from_slice(&bytes).map_err(|error| {
+            RecoveryLoadError::Corrupt(format!("恢复数据格式无效 {}：{error}", path.display()))
+        })?;
+        if !(1..=RECOVERY_VERSION).contains(&snapshot.version) {
+            return Err(RecoveryLoadError::Preserve(format!(
                 "恢复数据版本 {} 不受支持（当前版本 {}）",
                 snapshot.version, RECOVERY_VERSION
-            ));
+            )));
         }
         if snapshot.documents.len() > MAX_RECOVERY_DOCUMENTS {
-            return Err(format!(
+            return Err(RecoveryLoadError::Corrupt(format!(
                 "恢复数据包含过多文档：{}",
                 snapshot.documents.len()
+            )));
+        }
+        if snapshot.version == 2 && snapshot.checksum != Some(entries_checksum(&snapshot.documents))
+        {
+            return Err(RecoveryLoadError::Corrupt(
+                "恢复数据校验失败，内容可能已损坏".to_owned(),
             ));
         }
-        if snapshot.version >= 2 && snapshot.checksum != Some(entries_checksum(&snapshot.documents))
-        {
-            return Err("恢复数据校验失败，内容可能已损坏".to_owned());
+        if snapshot.version >= 3 {
+            let expected =
+                entries_sha256(&snapshot.documents).map_err(RecoveryLoadError::Corrupt)?;
+            if snapshot.checksum_sha256.as_deref() != Some(expected.as_str()) {
+                return Err(RecoveryLoadError::Corrupt(
+                    "恢复数据 SHA-256 校验失败，内容可能已损坏".to_owned(),
+                ));
+            }
         }
         Ok(snapshot.documents)
     }
@@ -188,6 +238,12 @@ fn entries_checksum(entries: &[RecoveryEntry]) -> u64 {
         entry.content.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+fn entries_sha256(entries: &[RecoveryEntry]) -> Result<String, String> {
+    let payload =
+        serde_json::to_vec(entries).map_err(|error| format!("无法编码恢复校验载荷：{error}"))?;
+    Ok(format!("{:x}", Sha256::digest(payload)))
 }
 
 fn quarantine_corrupt_snapshot(path: &Path) -> Result<Option<PathBuf>, String> {

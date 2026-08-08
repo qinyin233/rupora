@@ -10,6 +10,7 @@ use std::{
 };
 
 use encoding_rs::{Encoding, GB18030, GBK};
+use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::{
@@ -34,6 +35,13 @@ pub enum EditKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryOutcome {
     pub selection: Option<Range<usize>>,
+}
+
+#[derive(Debug)]
+pub struct RecoveryOutcome {
+    pub document: Document,
+    pub conflicts: usize,
+    pub warning: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,13 +134,14 @@ impl Document {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
-        let path = path.as_ref();
-        let lock = DocumentLock::acquire(path)?;
-        Self::open_with_lock(path, Some(lock))
+        let path = canonical_document_path(path.as_ref())?;
+        let lock = DocumentLock::acquire(&path)?;
+        Self::open_with_lock(&path, Some(lock))
     }
 
     fn open_unlocked(path: impl AsRef<Path>) -> Result<Self, String> {
-        Self::open_with_lock(path.as_ref(), None)
+        let path = canonical_document_path(path.as_ref())?;
+        Self::open_with_lock(&path, None)
     }
 
     fn open_with_lock(path: &Path, lock: Option<DocumentLock>) -> Result<Self, String> {
@@ -147,7 +156,8 @@ impl Document {
         }
         let bytes =
             fs::read(path).map_err(|error| format!("无法读取 {}：{error}", path.display()))?;
-        let decoded = decode_bytes(&bytes);
+        let decoded = decode_bytes(&bytes)
+            .map_err(|error| format!("无法安全解码 {}：{error}", path.display()))?;
         let line_ending = detect_line_ending(&decoded.text);
         let content = normalize_line_endings(&decoded.text);
         let block_index = BlockIndex::new(&content);
@@ -422,6 +432,7 @@ impl Document {
         }
         let content = self.line_ending.apply(&self.content);
         let bytes = encode_text(&content, &self.encoding)?;
+        ensure_document_size(bytes.len())?;
         write_atomically(path, &bytes)?;
         self.file_fingerprint = Some(fingerprint_from_bytes(path, &bytes));
         self.saved_content.clone_from(&self.content);
@@ -433,6 +444,11 @@ impl Document {
         if path.exists() && !overwrite_existing {
             return Err(format!("目标文件已存在：{}", path.display()));
         }
+        let path = if path.exists() {
+            canonical_document_path(&path)?
+        } else {
+            path
+        };
         if self
             .path
             .as_deref()
@@ -467,19 +483,93 @@ impl Document {
         Ok(())
     }
 
-    pub fn recover(path: Option<PathBuf>, content: String, untitled_id: usize) -> Self {
-        let mut document = path
-            .as_deref()
-            .filter(|path| path.exists())
-            .and_then(|path| Self::open(path).ok())
-            .unwrap_or_else(|| {
-                let mut document = Self::untitled(untitled_id);
-                document.path = path;
-                document
-            });
-        document.content = content;
-        document.update_after_edit();
-        document
+    pub fn recover(
+        path: Option<PathBuf>,
+        content: String,
+        base_content: Option<String>,
+        encoding: Option<&str>,
+        line_ending: Option<&str>,
+        untitled_id: usize,
+    ) -> RecoveryOutcome {
+        let Some(path) = path else {
+            return RecoveryOutcome {
+                document: recovered_copy(content, encoding, line_ending, untitled_id),
+                conflicts: 0,
+                warning: None,
+            };
+        };
+
+        if path.exists() {
+            return match Self::open(&path) {
+                Ok(mut document) => {
+                    if let Some(base_content) = base_content {
+                        let merged =
+                            merge::three_way_merge(&base_content, &content, &document.content);
+                        document.content = merged.content;
+                        document.update_after_edit();
+                        RecoveryOutcome {
+                            document,
+                            conflicts: merged.conflicts,
+                            warning: None,
+                        }
+                    } else if document.content == content {
+                        RecoveryOutcome {
+                            document,
+                            conflicts: 0,
+                            warning: None,
+                        }
+                    } else {
+                        RecoveryOutcome {
+                            document: recovered_copy(content, encoding, line_ending, untitled_id),
+                            conflicts: 0,
+                            warning: Some(format!(
+                                "旧版恢复快照无法验证磁盘基线，已将 {} 作为未命名副本打开",
+                                path.display()
+                            )),
+                        }
+                    }
+                }
+                Err(error) => RecoveryOutcome {
+                    document: recovered_copy(content, encoding, line_ending, untitled_id),
+                    conflicts: 0,
+                    warning: Some(format!(
+                        "无法安全重新关联 {}（{error}），已作为未命名副本打开",
+                        path.display()
+                    )),
+                },
+            };
+        }
+
+        let mut document = recovered_copy(content, encoding, line_ending, untitled_id);
+        match DocumentLock::acquire(&path) {
+            Ok(lock) => {
+                document.path = Some(path.clone());
+                document.saved_content = base_content.unwrap_or_default();
+                document.file_fingerprint = None;
+                document.lock = Some(lock);
+                document.dirty = document.content != document.saved_content;
+                RecoveryOutcome {
+                    document,
+                    conflicts: 0,
+                    warning: Some(format!(
+                        "原文件 {} 已不存在；保存将重新创建该文件",
+                        path.display()
+                    )),
+                }
+            }
+            Err(error) => RecoveryOutcome {
+                document,
+                conflicts: 0,
+                warning: Some(format!(
+                    "无法锁定恢复目标 {}（{error}），已作为未命名副本打开",
+                    path.display()
+                )),
+            },
+        }
+    }
+
+    pub(crate) fn recovery_base_content(&self) -> &str {
+        &self.saved_content
     }
 }
 
@@ -490,13 +580,10 @@ struct DocumentLock {
 
 impl DocumentLock {
     fn acquire(path: &Path) -> Result<Self, String> {
-        let identity = absolute_path_identity(path);
-        let mut hasher = DefaultHasher::new();
-        identity.hash(&mut hasher);
         let lock_directory = std::env::temp_dir().join("rupora-document-locks");
         fs::create_dir_all(&lock_directory)
             .map_err(|error| format!("无法创建文档锁目录 {}：{error}", lock_directory.display()))?;
-        let lock_path = lock_directory.join(format!("{:016x}.lock", hasher.finish()));
+        let lock_path = document_lock_path(&lock_directory, path);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -508,6 +595,64 @@ impl DocumentLock {
             .map_err(|_| format!("文档已由另一个 RUPORA 实例编辑：{}", path.display()))?;
         Ok(Self { _file: file })
     }
+}
+
+fn canonical_document_path(path: &Path) -> Result<PathBuf, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("无法解析文档路径 {}：{error}", path.display()))?;
+    Ok(normalize_windows_verbatim_path(canonical))
+}
+
+#[cfg(windows)]
+fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const UNC: &[u16] = &[b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
+    if wide.starts_with(VERBATIM) {
+        let suffix = &wide[VERBATIM.len()..];
+        if suffix.starts_with(UNC) {
+            let mut normalized = vec![b'\\' as u16, b'\\' as u16];
+            normalized.extend_from_slice(&suffix[UNC.len()..]);
+            return PathBuf::from(OsString::from_wide(&normalized));
+        }
+        return PathBuf::from(OsString::from_wide(suffix));
+    }
+    path
+}
+
+#[cfg(not(windows))]
+fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
+    path
+}
+
+fn document_lock_path(lock_directory: &Path, path: &Path) -> PathBuf {
+    let identity = absolute_path_identity(path);
+    let digest = Sha256::digest(path_identity_bytes(&identity));
+    lock_directory.join(format!("{digest:x}.lock"))
+}
+
+#[cfg(windows)]
+fn path_identity_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt as _;
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(unix)]
+fn path_identity_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn path_identity_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
 }
 
 fn absolute_path_identity(path: &Path) -> PathBuf {
@@ -557,33 +702,34 @@ struct DecodedText {
     encoding: TextEncoding,
 }
 
-fn decode_bytes(bytes: &[u8]) -> DecodedText {
+fn decode_bytes(bytes: &[u8]) -> Result<DecodedText, String> {
     if let Some(rest) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
-        return DecodedText {
-            text: String::from_utf8_lossy(rest).into_owned(),
+        return Ok(DecodedText {
+            text: String::from_utf8(rest.to_vec())
+                .map_err(|_| "UTF-8 BOM 文件包含无效 UTF-8 字节".to_owned())?,
             encoding: TextEncoding::Utf8Bom,
-        };
+        });
     }
 
     if let Some(rest) = bytes.strip_prefix(&[0xff, 0xfe]) {
-        return DecodedText {
-            text: decode_utf16(rest, true),
+        return Ok(DecodedText {
+            text: decode_utf16(rest, true)?,
             encoding: TextEncoding::Utf16Le,
-        };
+        });
     }
 
     if let Some(rest) = bytes.strip_prefix(&[0xfe, 0xff]) {
-        return DecodedText {
-            text: decode_utf16(rest, false),
+        return Ok(DecodedText {
+            text: decode_utf16(rest, false)?,
             encoding: TextEncoding::Utf16Be,
-        };
+        });
     }
 
     if let Ok(text) = std::str::from_utf8(bytes) {
-        return DecodedText {
+        return Ok(DecodedText {
             text: text.to_owned(),
             encoding: TextEncoding::Utf8,
-        };
+        });
     }
 
     let mut detector = chardetng::EncodingDetector::new();
@@ -597,11 +743,17 @@ fn decode_bytes(bytes: &[u8]) -> DecodedText {
     } else {
         detected
     };
-    let (text, _, _) = encoding.decode(bytes);
-    DecodedText {
+    let (text, _, had_errors) = encoding.decode(bytes);
+    if had_errors {
+        return Err(format!(
+            "检测为 {}，但输入包含无法无损解码的字节",
+            encoding.name()
+        ));
+    }
+    Ok(DecodedText {
         text: text.into_owned(),
         encoding: TextEncoding::Legacy(encoding),
-    }
+    })
 }
 
 fn contains_gb18030_four_byte_sequence(bytes: &[u8]) -> bool {
@@ -613,17 +765,60 @@ fn contains_gb18030_four_byte_sequence(bytes: &[u8]) -> bool {
     })
 }
 
-fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
-    let units = bytes.chunks_exact(2).map(|pair| {
-        if little_endian {
-            u16::from_le_bytes([pair[0], pair[1]])
-        } else {
-            u16::from_be_bytes([pair[0], pair[1]])
-        }
-    });
-    char::decode_utf16(units)
-        .map(|result| result.unwrap_or(char::REPLACEMENT_CHARACTER))
-        .collect()
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, String> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err("UTF-16 文件末尾包含不完整的代码单元".to_owned());
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).map_err(|_| "UTF-16 文件包含未配对的代理项".to_owned())
+}
+
+fn ensure_document_size(bytes: usize) -> Result<(), String> {
+    if bytes as u64 > MAX_DOCUMENT_BYTES {
+        Err(format!(
+            "保存内容超过 {} MiB 安全上限",
+            MAX_DOCUMENT_BYTES / 1024 / 1024
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn recovered_copy(
+    content: String,
+    encoding: Option<&str>,
+    line_ending: Option<&str>,
+    untitled_id: usize,
+) -> Document {
+    let mut document = Document::untitled(untitled_id);
+    document.encoding = recovery_encoding(encoding).unwrap_or(TextEncoding::Utf8);
+    document.line_ending = match line_ending {
+        Some("CRLF") => LineEnding::CrLf,
+        Some("CR") => LineEnding::Cr,
+        _ => LineEnding::Lf,
+    };
+    document.content = content;
+    document.update_after_edit();
+    document
+}
+
+fn recovery_encoding(label: Option<&str>) -> Option<TextEncoding> {
+    match label? {
+        "UTF-8" => Some(TextEncoding::Utf8),
+        "UTF-8 BOM" => Some(TextEncoding::Utf8Bom),
+        "UTF-16 LE" => Some(TextEncoding::Utf16Le),
+        "UTF-16 BE" => Some(TextEncoding::Utf16Be),
+        label => Encoding::for_label(label.as_bytes()).map(TextEncoding::Legacy),
+    }
 }
 
 fn encode_text(text: &str, encoding: &TextEncoding) -> Result<Vec<u8>, String> {
@@ -840,7 +1035,7 @@ mod tests {
         let original = "你好, RUPORA\n";
         for encoding in [TextEncoding::Utf16Le, TextEncoding::Utf16Be] {
             let bytes = encode_text(original, &encoding).unwrap();
-            let decoded = decode_bytes(&bytes);
+            let decoded = decode_bytes(&bytes).unwrap();
             assert_eq!(decoded.text, original);
             assert_eq!(decoded.encoding, encoding);
         }
@@ -862,7 +1057,7 @@ mod tests {
         let (bytes, _, had_errors) = GB18030.encode(original);
         assert!(!had_errors);
 
-        let decoded = decode_bytes(&bytes);
+        let decoded = decode_bytes(&bytes).unwrap();
         assert_eq!(decoded.text, original);
         assert_eq!(decoded.encoding, TextEncoding::Legacy(GBK));
     }
@@ -873,7 +1068,7 @@ mod tests {
         let (bytes, _, had_errors) = GB18030.encode(original);
         assert!(!had_errors);
 
-        let decoded = decode_bytes(&bytes);
+        let decoded = decode_bytes(&bytes).unwrap();
         assert_eq!(decoded.text, original);
         assert_eq!(decoded.encoding, TextEncoding::Legacy(GB18030));
     }
@@ -898,7 +1093,7 @@ mod tests {
 
         let bytes = fs::read(path).unwrap();
         assert!(bytes.starts_with(&[0xff, 0xfe]));
-        let decoded = decode_bytes(&bytes);
+        let decoded = decode_bytes(&bytes).unwrap();
         assert!(decoded.text.contains("正文\r\n结尾\r\n"));
     }
 

@@ -23,7 +23,7 @@ use crate::{
     instance::InstanceCoordinator,
     markdown::{self, BlockId, Heading},
     native_preview::{prepare_native_preview, render_math_widget},
-    recovery::RecoveryStore,
+    recovery::{RecoveryEntry, RecoveryStore},
     source_map::SourceMap,
     table::{self, MarkdownTable},
     updater::{self, UpdateInfo, UpdateStatus},
@@ -205,14 +205,36 @@ impl RuporaApp {
         match recovered_entries {
             Ok(entries) if !entries.is_empty() => {
                 let recovered_count = entries.len();
+                let mut warning_count = 0usize;
+                let mut conflict_count = 0usize;
                 for entry in entries {
-                    let document =
-                        Document::recover(entry.path, entry.content, app.next_untitled_id);
+                    let RecoveryEntry {
+                        path,
+                        content,
+                        base_content,
+                        encoding,
+                        line_ending,
+                    } = entry;
+                    let outcome = Document::recover(
+                        path,
+                        content,
+                        base_content,
+                        encoding.as_deref(),
+                        line_ending.as_deref(),
+                        app.next_untitled_id,
+                    );
+                    conflict_count += outcome.conflicts;
+                    if let Some(warning) = outcome.warning {
+                        warning_count += 1;
+                        diagnostics::append_event("WARN", &warning).ok();
+                    }
                     app.next_untitled_id += 1;
-                    app.documents.push(document);
+                    app.documents.push(outcome.document);
                 }
                 app.active = Some(0);
-                app.status = format!("已恢复 {recovered_count} 个未保存文档");
+                app.status = format!(
+                    "已恢复 {recovered_count} 个未保存文档；{warning_count} 项需要注意；{conflict_count} 处合并冲突"
+                );
             }
             Ok(_) => {}
             Err(error) => {

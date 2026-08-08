@@ -346,7 +346,7 @@ pub fn render_mermaid_svg(source: &str, dark: bool) -> Result<String, String> {
 
 pub fn render_html_fragment(source: &str) -> String {
     let (mut output, generated) = render_html_with_generated(source, false);
-    output = ammonia::clean(&output);
+    output = sanitize_user_html(&output);
     for (token, svg) in generated {
         output = output.replace(&token, &svg);
     }
@@ -819,7 +819,7 @@ fn static_svg_for_html(svg: &str) -> Result<String, String> {
 
 pub fn render_html_document(source: &str, title: &str, dark: bool) -> String {
     let (unsafe_body, generated) = render_html_with_generated(source, dark);
-    let mut body = ammonia::clean(&unsafe_body);
+    let mut body = sanitize_user_html(&unsafe_body);
     for (token, svg) in generated {
         body = body.replace(&token, &svg);
     }
@@ -872,6 +872,15 @@ pub fn render_html_document(source: &str, title: &str, dark: bool) -> String {
         muted,
         body
     )
+}
+
+fn sanitize_user_html(html: &str) -> String {
+    let mut builder = ammonia::Builder::default();
+    builder
+        .add_tags(&["input"])
+        .add_generic_attributes(&["id", "class"])
+        .add_tag_attributes("input", &["type", "checked", "disabled"]);
+    builder.clean(html).to_string()
 }
 
 fn heading_level(level: HeadingLevel) -> u8 {
