@@ -62,9 +62,15 @@ struct TableEditorState {
 }
 
 struct ExtensionJobResult {
-    document: usize,
+    document_id: u64,
     before: String,
     invocation: ExtensionInvocation,
+}
+
+fn extension_document_index(documents: &[Document], document_id: u64) -> Option<usize> {
+    documents
+        .iter()
+        .position(|document| document.id() == document_id)
 }
 
 pub struct RuporaApp {
@@ -901,12 +907,13 @@ impl RuporaApp {
         };
         let before = self.documents[document].content.clone();
         let path = self.documents[document].path.clone();
+        let document_id = self.documents[document].id();
         let name = service.name.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let result = extensions::invoke(&service, &before, path.as_deref()).map(|invocation| {
                 ExtensionJobResult {
-                    document,
+                    document_id,
                     before,
                     invocation,
                 }
@@ -932,26 +939,22 @@ impl RuporaApp {
                 diagnostics::append_event("WARN", &format!("extension failed: {error}")).ok();
                 self.status = format!("扩展失败：{error}");
             }
-            Ok(job)
-                if self
-                    .documents
-                    .get(job.document)
-                    .is_none_or(|document| document.content != job.before) =>
-            {
-                self.status = "文档在扩展运行期间已变化，已丢弃过期结果".to_owned();
-            }
             Ok(job) => {
+                let Some(document) = extension_document_index(&self.documents, job.document_id)
+                else {
+                    self.status = "扩展运行期间目标文档已关闭，已丢弃过期结果".to_owned();
+                    return;
+                };
+                if self.documents[document].content != job.before {
+                    self.status = "扩展运行期间目标文档已变化，已丢弃过期结果".to_owned();
+                    return;
+                }
                 if let Some(replacement) = job.invocation.replacement
                     && replacement != job.before
                 {
-                    self.documents[job.document].content = replacement;
-                    self.documents[job.document].record_edit(
-                        job.before,
-                        None,
-                        None,
-                        EditKind::Other,
-                    );
-                    self.active = Some(job.document);
+                    self.documents[document].content = replacement;
+                    self.documents[document].record_edit(job.before, None, None, EditKind::Other);
+                    self.active = Some(document);
                     self.status = job
                         .invocation
                         .message
@@ -3361,6 +3364,21 @@ mod tests {
         assert!(is_markdown_path(Path::new("README.MD")));
         assert!(is_markdown_path(Path::new("notes.markdown")));
         assert!(!is_markdown_path(Path::new("image.png")));
+    }
+
+    #[test]
+    fn extension_results_follow_document_identity_after_tabs_shift() {
+        let first = Document::untitled(1);
+        let target = Document::untitled(2);
+        let target_id = target.id();
+        let trailing = Document::untitled(3);
+        let mut documents = vec![first, target, trailing];
+
+        documents.remove(0);
+        assert_eq!(extension_document_index(&documents, target_id), Some(0));
+
+        documents.remove(0);
+        assert_eq!(extension_document_index(&documents, target_id), None);
     }
 
     #[test]

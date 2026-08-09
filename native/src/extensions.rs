@@ -14,6 +14,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_SERVICES: usize = 32;
@@ -22,6 +27,7 @@ const HARD_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_OUTPUT_BYTES: usize = 1024 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const HARD_MAX_TIMEOUT_MS: u64 = 30_000;
+const MAX_RESPONSE_TEXT_CHARS: usize = 512;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -216,6 +222,7 @@ fn run_process(service: &ExtensionService, request: &[u8]) -> Result<Vec<u8>, St
         .stderr(Stdio::null())
         .env_clear()
         .env("RUPORA_EXTENSION_PROTOCOL", "1");
+    configure_process_group(&mut command);
     for variable in ["SystemRoot", "WINDIR", "HOME", "USERPROFILE", "TMP", "TEMP"] {
         if let Some(value) = std::env::var_os(variable) {
             command.env(variable, value);
@@ -254,15 +261,18 @@ fn run_process(service: &ExtensionService, request: &[u8]) -> Result<Vec<u8>, St
     let timeout = Duration::from_millis(service.timeout_ms);
     let started = Instant::now();
     let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("无法等待扩展“{}”：{error}", service.name))?
-        {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                terminate_process_tree(&mut child);
+                return Err(format!("无法等待扩展“{}”：{error}", service.name));
+            }
+        };
+        if let Some(status) = status {
             break status;
         }
         if started.elapsed() >= timeout {
-            child.kill().ok();
-            child.wait().ok();
+            terminate_process_tree(&mut child);
             return Err(format!(
                 "扩展“{}”超过 {} ms 超时",
                 service.name, service.timeout_ms
@@ -271,15 +281,23 @@ fn run_process(service: &ExtensionService, request: &[u8]) -> Result<Vec<u8>, St
         thread::sleep(Duration::from_millis(5));
     };
     let remaining = timeout.saturating_sub(started.elapsed());
-    writer_receiver
-        .recv_timeout(remaining)
-        .map_err(|_| format!("扩展“{}”没有在超时前关闭输入", service.name))?
-        .map_err(|error| format!("无法发送扩展请求：{error}"))?;
+    let writer_result = match writer_receiver.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(_) => {
+            terminate_process_tree(&mut child);
+            return Err(format!("扩展“{}”没有在超时前关闭输入", service.name));
+        }
+    };
+    writer_result.map_err(|error| format!("无法发送扩展请求：{error}"))?;
     let remaining = timeout.saturating_sub(started.elapsed());
-    let output = reader_receiver
-        .recv_timeout(remaining)
-        .map_err(|_| format!("扩展“{}”没有在超时前关闭输出", service.name))?
-        .map_err(|error| format!("无法读取扩展响应：{error}"))?;
+    let output_result = match reader_receiver.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(_) => {
+            terminate_process_tree(&mut child);
+            return Err(format!("扩展“{}”没有在超时前关闭输出", service.name));
+        }
+    };
+    let output = output_result.map_err(|error| format!("无法读取扩展响应：{error}"))?;
     if output.len() > service.max_output_bytes {
         return Err(format!(
             "扩展“{}”响应超过 {} 字节上限",
@@ -292,6 +310,51 @@ fn run_process(service: &ExtensionService, request: &[u8]) -> Result<Vec<u8>, St
     Ok(output)
 }
 
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn configure_process_group(command: &mut Command) {
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    let process_group = format!("-{}", child.id());
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", "--", &process_group])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let taskkill = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| root.join(r"System32\taskkill.exe"));
+    if let Some(taskkill) = taskkill {
+        let mut command = Command::new(taskkill);
+        command
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW);
+        let _ = command.status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn validate_response(
     service: &ExtensionService,
     request_id: u64,
@@ -302,12 +365,22 @@ fn validate_response(
     if response.protocol != PROTOCOL_VERSION || response.request_id != request_id {
         return Err(format!("扩展“{}”返回了错误的协议或请求 ID", service.name));
     }
-    if let Some(error) = response.error {
-        return Err(format!("扩展“{}”报告错误：{error}", service.name));
-    }
-    let result = response
-        .result
-        .ok_or_else(|| format!("扩展“{}”没有返回结果", service.name))?;
+    let result = match (response.result, response.error) {
+        (Some(_), Some(_)) => {
+            return Err(format!("扩展“{}”同时返回了 result 和 error", service.name));
+        }
+        (None, None) => return Err(format!("扩展“{}”没有返回结果", service.name)),
+        (None, Some(error)) => {
+            let error = sanitize_response_text(&error);
+            let error = if error.is_empty() {
+                "未提供错误详情".to_owned()
+            } else {
+                error
+            };
+            return Err(format!("扩展“{}”报告错误：{error}", service.name));
+        }
+        (Some(result), None) => result,
+    };
     if result.replacement.is_some()
         && !service
             .permissions
@@ -322,8 +395,48 @@ fn validate_response(
         replacement: result.replacement,
         message: result
             .message
-            .map(|message| message.chars().take(512).collect()),
+            .map(|message| sanitize_response_text(&message))
+            .filter(|message| !message.is_empty()),
     })
+}
+
+fn sanitize_response_text(text: &str) -> String {
+    let mut sanitized = String::new();
+    let mut previous_was_space = false;
+    let mut emitted = 0;
+    for character in text.chars() {
+        if emitted >= MAX_RESPONSE_TEXT_CHARS {
+            break;
+        }
+        if character.is_whitespace()
+            || character.is_control()
+            || is_unsafe_display_character(character)
+        {
+            if !previous_was_space && !sanitized.is_empty() {
+                sanitized.push(' ');
+                previous_was_space = true;
+                emitted += 1;
+            }
+        } else {
+            sanitized.push(character);
+            previous_was_space = false;
+            emitted += 1;
+        }
+    }
+    sanitized.trim_end().to_owned()
+}
+
+fn is_unsafe_display_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+    )
 }
 
 fn validate_config(config: &ExtensionConfig) -> Result<(), String> {
@@ -341,8 +454,17 @@ fn validate_config(config: &ExtensionConfig) -> Result<(), String> {
 }
 
 fn validate_service(service: &ExtensionService) -> Result<(), String> {
-    if service.name.trim().is_empty() || service.name.chars().count() > 64 {
-        return Err("扩展服务名称必须为 1–64 个字符".to_owned());
+    let has_unsafe_name_character = service.name.chars().any(|character| {
+        character.is_control()
+            || (character.is_whitespace() && character != ' ')
+            || is_unsafe_display_character(character)
+    });
+    if service.name.trim().is_empty()
+        || service.name.trim() != service.name
+        || service.name.chars().count() > 64
+        || has_unsafe_name_character
+    {
+        return Err("扩展服务名称必须为 1–64 个安全的可显示字符，且首尾不能留白".to_owned());
     }
     if !service.program.is_absolute() {
         return Err(format!("扩展“{}”必须使用绝对可执行路径", service.name));
@@ -408,6 +530,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_service_names_that_can_spoof_status_or_log_lines() {
+        for name in [
+            " leading",
+            "trailing ",
+            "line\nbreak",
+            "safe\u{202e}txt.exe",
+        ] {
+            let mut extension = service(&[ExtensionPermission::ReadDocument]);
+            extension.name = name.to_owned();
+            assert!(validate_service(&extension).is_err(), "accepted {name:?}");
+        }
+
+        let mut extension = service(&[ExtensionPermission::ReadDocument]);
+        extension.name = "安全扩展 1.0".to_owned();
+        assert!(validate_service(&extension).is_ok());
+    }
+
+    #[test]
     fn rejects_replacement_without_an_explicit_permission() {
         let extension = service(&[ExtensionPermission::ReadDocument]);
         let response = br#"{"protocol":1,"requestId":42,"result":{"replacement":"changed"}}"#;
@@ -432,6 +572,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ambiguous_result_and_error_responses() {
+        let extension = service(&[ExtensionPermission::ReadDocument]);
+        let response = br#"{"protocol":1,"requestId":42,"result":{},"error":"failed"}"#;
+        let error = validate_response(&extension, 42, response).unwrap_err();
+        assert!(error.contains("result 和 error"));
+    }
+
+    #[test]
+    fn sanitizes_untrusted_response_text() {
+        let extension = service(&[ExtensionPermission::ReadDocument]);
+        let response = br#"{"protocol":1,"requestId":42,"error":"first\nsecond\u0000\u202elast"}"#;
+        let error = validate_response(&extension, 42, response).unwrap_err();
+        assert!(!error.contains('\n'));
+        assert!(!error.contains('\0'));
+        assert!(!error.contains('\u{202e}'));
+        assert!(error.contains("first second last"));
+
+        let long_message = "x".repeat(MAX_RESPONSE_TEXT_CHARS + 100);
+        let response =
+            format!(r#"{{"protocol":1,"requestId":42,"result":{{"message":"{long_message}"}}}}"#);
+        let invocation = validate_response(&extension, 42, response.as_bytes()).unwrap();
+        assert_eq!(
+            invocation.message.unwrap().chars().count(),
+            MAX_RESPONSE_TEXT_CHARS
+        );
+
+        let empty_message = br#"{"protocol":1,"requestId":42,"result":{"message":"\n\u0000"}}"#;
+        let invocation = validate_response(&extension, 42, empty_message).unwrap();
+        assert!(invocation.message.is_none());
+    }
+
+    #[test]
     fn executes_a_json_service_without_a_shell_wrapper() {
         let response = r#"{"protocol":1,"requestId":42,"result":{"message":"ok"}}"#;
         let extension = platform_service(response, false);
@@ -450,6 +622,70 @@ mod tests {
 
         assert!(error.contains("超时"));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn timeout_terminates_descendant_processes() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("descendant-survived");
+        let extension = descendant_service(&marker);
+
+        assert!(run_process(&extension, b"{}").is_err());
+        thread::sleep(Duration::from_millis(1_200));
+
+        assert!(
+            !marker.exists(),
+            "a descendant process survived the extension timeout"
+        );
+    }
+
+    #[cfg(windows)]
+    fn descendant_service(marker: &Path) -> ExtensionService {
+        use base64::Engine as _;
+
+        let program = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let marker = marker.to_string_lossy().replace('\'', "''");
+        let child_script =
+            format!("Start-Sleep -Milliseconds 700; [IO.File]::WriteAllText('{marker}', 'leaked')");
+        let child_script = child_script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(child_script);
+        let command = format!(
+            "Start-Process -FilePath $PSHOME\\powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','{encoded}'); while ($true) {{}}"
+        );
+        ExtensionService {
+            name: "descendant-test".to_owned(),
+            program,
+            args: vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                command,
+            ],
+            permissions: [ExtensionPermission::ReadDocument].into_iter().collect(),
+            timeout_ms: 150,
+            max_output_bytes: 4_096,
+        }
+    }
+
+    #[cfg(unix)]
+    fn descendant_service(marker: &Path) -> ExtensionService {
+        ExtensionService {
+            name: "descendant-test".to_owned(),
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_owned(),
+                "(/bin/sleep 0.7; printf leaked > \"$1\") & while :; do :; done".to_owned(),
+                "rupora-extension-test".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            permissions: [ExtensionPermission::ReadDocument].into_iter().collect(),
+            timeout_ms: 150,
+            max_output_bytes: 4_096,
+        }
     }
 
     #[cfg(windows)]

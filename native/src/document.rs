@@ -6,6 +6,7 @@ use std::{
     io::Write,
     ops::Range,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -22,6 +23,7 @@ const MAX_HISTORY_ENTRIES: usize = 256;
 const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 const TYPING_COALESCE_WINDOW: Duration = Duration::from_millis(900);
 const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
+static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditKind {
@@ -93,6 +95,7 @@ impl LineEnding {
 
 #[derive(Debug)]
 pub struct Document {
+    id: u64,
     pub path: Option<PathBuf>,
     pub content: String,
     pub encoding: TextEncoding,
@@ -115,6 +118,7 @@ impl Document {
         let content = String::new();
         let block_index = BlockIndex::new(&content);
         Self {
+            id: next_document_id(),
             path: None,
             analysis: analyze(&content),
             content,
@@ -163,6 +167,7 @@ impl Document {
         let block_index = BlockIndex::new(&content);
         let file_fingerprint = fingerprint_from_bytes(path, &bytes);
         Ok(Self {
+            id: next_document_id(),
             path: Some(path.to_path_buf()),
             analysis: analyze(&content),
             saved_content: content.clone(),
@@ -193,6 +198,11 @@ impl Document {
                     format!("未命名-{}.md", self.untitled_id)
                 }
             })
+    }
+
+    /// Returns an identity that remains stable while the document moves within the tab list.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn update_after_edit(&mut self) {
@@ -595,6 +605,10 @@ impl DocumentLock {
             .map_err(|_| format!("文档已由另一个 RUPORA 实例编辑：{}", path.display()))?;
         Ok(Self { _file: file })
     }
+}
+
+fn next_document_id() -> u64 {
+    NEXT_DOCUMENT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 fn canonical_document_path(path: &Path) -> Result<PathBuf, String> {
