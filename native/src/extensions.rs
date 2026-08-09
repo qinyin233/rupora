@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
-    fs,
-    io::{Read as _, Write as _},
+    fs::{self, File, OpenOptions},
+    io::{Read, Write as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -114,14 +114,7 @@ struct ExtensionResult {
 
 impl ExtensionRegistry {
     pub fn load(path: PathBuf) -> Result<Self, String> {
-        let config = if path.exists() {
-            let metadata = fs::metadata(&path)
-                .map_err(|error| format!("无法检查扩展配置 {}：{error}", path.display()))?;
-            if metadata.len() > MAX_CONFIG_BYTES {
-                return Err("扩展配置超过 256 KiB 上限".to_owned());
-            }
-            let bytes = fs::read(&path)
-                .map_err(|error| format!("无法读取扩展配置 {}：{error}", path.display()))?;
+        let config = if let Some(bytes) = read_config_bounded(&path)? {
             serde_json::from_slice(&bytes)
                 .map_err(|error| format!("扩展配置无效 {}：{error}", path.display()))?
         } else {
@@ -160,8 +153,15 @@ impl ExtensionRegistry {
     }
 
     pub fn ensure_template(&self) -> Result<(), String> {
-        if self.path.exists() {
-            return Ok(());
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.is_file() => return Ok(()),
+            Ok(_) => {
+                return Err(format!("扩展配置路径不是普通文件：{}", self.path.display()));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("无法检查扩展配置 {}：{error}", self.path.display()));
+            }
         }
         let parent = self
             .path
@@ -171,9 +171,64 @@ impl ExtensionRegistry {
             .map_err(|error| format!("无法创建扩展配置目录 {}：{error}", parent.display()))?;
         let bytes = serde_json::to_vec_pretty(&ExtensionConfig::default())
             .map_err(|error| format!("无法生成扩展配置：{error}"))?;
-        fs::write(&self.path, bytes)
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.path)
+            .map_err(|error| format!("无法创建扩展配置 {}：{error}", self.path.display()))?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
             .map_err(|error| format!("无法写入扩展配置 {}：{error}", self.path.display()))
     }
+}
+
+fn read_config_bounded(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!("无法检查扩展配置 {}：{error}", path.display()));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(format!("扩展配置不是普通文件：{}", path.display()));
+    }
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err("扩展配置超过 256 KiB 上限".to_owned());
+    }
+
+    let mut file = open_config_readonly(path)
+        .map_err(|error| format!("无法打开扩展配置 {}：{error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("无法复核扩展配置 {}：{error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("扩展配置不是普通文件：{}", path.display()));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().min(MAX_CONFIG_BYTES) as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("无法读取扩展配置 {}：{error}", path.display()))?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err("扩展配置读取期间增长并超过 256 KiB 上限".to_owned());
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(unix)]
+fn open_config_readonly(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_config_readonly(path: &Path) -> std::io::Result<File> {
+    File::open(path)
 }
 
 pub fn invoke(
@@ -634,6 +689,25 @@ mod tests {
         let registry = ExtensionRegistry::load(directory.path().join("extensions.json")).unwrap();
         assert!(!registry.is_enabled());
         assert!(registry.services().is_empty());
+    }
+
+    #[test]
+    fn rejects_non_regular_or_oversized_extension_configs() {
+        let directory = tempfile::tempdir().unwrap();
+        let non_regular = directory.path().join("directory.json");
+        fs::create_dir(&non_regular).unwrap();
+        assert!(ExtensionRegistry::load(non_regular).is_err());
+
+        let oversized = directory.path().join("oversized.json");
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_CONFIG_BYTES + 1)
+            .unwrap();
+        assert!(
+            ExtensionRegistry::load(oversized)
+                .unwrap_err()
+                .contains("256 KiB")
+        );
     }
 
     #[test]
