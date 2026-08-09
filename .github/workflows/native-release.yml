@@ -3,23 +3,66 @@ name: Native release
 on:
   push:
     tags:
-      - "v2.*"
+      - "v*"
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
+
+concurrency:
+  group: native-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.92.0
+
+      - name: Match the tag to Cargo.toml
+        id: release
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -ne "tag") {
+            throw "Native releases must run from a tag"
+          }
+
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed" }
+          $packages = @($metadata.packages | Where-Object { $_.name -eq "rupora" })
+          if ($packages.Count -ne 1) {
+            throw "Expected exactly one rupora package, found $($packages.Count)"
+          }
+
+          $version = [string]$packages[0].version
+          $expectedTag = "v$version"
+          if ($env:GITHUB_REF_NAME -cne $expectedTag) {
+            throw "Release tag $env:GITHUB_REF_NAME does not match Cargo.toml version $expectedTag"
+          }
+
+          $versionWithoutBuildMetadata = $version.Split("+", 2)[0]
+          $isPrerelease = $versionWithoutBuildMetadata.Contains("-").ToString().ToLowerInvariant()
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "prerelease=$isPrerelease" >> $env:GITHUB_OUTPUT
+
   package:
     name: Package (${{ matrix.artifact }})
+    needs: validate
+    permissions:
+      contents: read
     runs-on: ${{ matrix.runner }}
     env:
-      HAS_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_ID != '' && secrets.APPLE_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+      HAS_APPLE_CERTIFICATE: ${{ vars.APPLE_SIGNING_IDENTITY != '' && secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_ID != '' && secrets.APPLE_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
       HAS_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
-      WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-      RUPORA_UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY_BASE64 }}
     strategy:
       fail-fast: false
       matrix:
@@ -45,6 +88,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -59,68 +104,334 @@ jobs:
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
-      - name: Install release tooling
+      - name: Install pinned release tooling
+        shell: pwsh
         run: |
-          cargo install cargo-packager --locked --version 0.11.8
-          cargo install cargo-cyclonedx --locked --version 0.5.9
+          cargo install cargo-packager --locked --version '=0.11.8'
+          if ($LASTEXITCODE -ne 0) { throw "cargo-packager installation failed" }
+          cargo install cargo-cyclonedx --locked --version '=0.5.9'
+          if ($LASTEXITCODE -ne 0) { throw "cargo-cyclonedx installation failed" }
+          if ((cargo-packager --version) -ne "cargo-packager 0.11.8") {
+            throw "Unexpected cargo-packager version: $(cargo-packager --version)"
+          }
+          if ((cargo cyclonedx --version) -ne "cargo-cyclonedx-cyclonedx 0.5.9") {
+            throw "Unexpected cargo-cyclonedx version: $(cargo cyclonedx --version)"
+          }
 
-      - name: Verify native target and update signing configuration
+      - name: Verify native target and update verification key
         shell: pwsh
         env:
-          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY_BASE64 }}
+          RUPORA_UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY_BASE64 }}
         run: |
           $hostTriple = ((rustc -vV | Select-String "^host:").Line -split ":", 2)[1].Trim()
           if ($hostTriple -ne "${{ matrix.target }}") {
             throw "Runner host $hostTriple does not match release target ${{ matrix.target }}"
           }
-          if (-not $env:UPDATE_SIGNING_KEY -or -not $env:RUPORA_UPDATE_PUBLIC_KEY) {
-            throw "UPDATE_SIGNING_KEY_BASE64 secret and UPDATE_PUBLIC_KEY_BASE64 variable are required"
+          if (-not $env:RUPORA_UPDATE_PUBLIC_KEY) {
+            throw "UPDATE_PUBLIC_KEY_BASE64 variable is required"
           }
 
-      - name: Build platform package
-        if: runner.os != 'macOS'
+      - name: Build release binary without signing secrets
+        shell: pwsh
+        env:
+          RUPORA_UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY_BASE64 }}
+        run: |
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "Release binary build failed" }
+          $binary = if ($env:RUNNER_OS -eq "Windows") {
+            "target/release/rupora.exe"
+          } else {
+            "target/release/rupora"
+          }
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+            throw "Release binary was not produced at $binary"
+          }
+
+      - name: Cache verified AppImage build tools
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          XDG_CACHE_HOME: ${{ runner.temp }}/rupora-xdg-cache
+          APPRUN_X86_64_SHA256: ${{ vars.APPIMAGE_APPRUN_X86_64_SHA256 }}
+          LINUXDEPLOY_X86_64_SHA256: ${{ vars.APPIMAGE_LINUXDEPLOY_X86_64_SHA256 }}
+          APPIMAGE_PLUGIN_X86_64_SHA256: ${{ vars.APPIMAGE_PLUGIN_X86_64_SHA256 }}
+          APPRUN_AARCH64_SHA256: ${{ vars.APPIMAGE_APPRUN_AARCH64_SHA256 }}
+          LINUXDEPLOY_AARCH64_SHA256: ${{ vars.APPIMAGE_LINUXDEPLOY_AARCH64_SHA256 }}
+          APPIMAGE_PLUGIN_AARCH64_SHA256: ${{ vars.APPIMAGE_PLUGIN_AARCH64_SHA256 }}
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TARGET" in
+            x86_64-unknown-linux-gnu)
+              arch="x86_64"
+              apprun_sha="$APPRUN_X86_64_SHA256"
+              linuxdeploy_sha="$LINUXDEPLOY_X86_64_SHA256"
+              plugin_sha="$APPIMAGE_PLUGIN_X86_64_SHA256"
+              ;;
+            aarch64-unknown-linux-gnu)
+              arch="aarch64"
+              apprun_sha="$APPRUN_AARCH64_SHA256"
+              linuxdeploy_sha="$LINUXDEPLOY_AARCH64_SHA256"
+              plugin_sha="$APPIMAGE_PLUGIN_AARCH64_SHA256"
+              ;;
+            *)
+              echo "Unsupported AppImage target: $RELEASE_TARGET" >&2
+              exit 1
+              ;;
+          esac
+
+          require_sha256() {
+            local variable_name="$1"
+            local value="$2"
+            if [[ ! "$value" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              echo "$variable_name must be a 64-character SHA-256 repository variable" >&2
+              exit 1
+            fi
+          }
+          require_sha256 "APPIMAGE_APPRUN_${arch^^}_SHA256" "$apprun_sha"
+          require_sha256 "APPIMAGE_LINUXDEPLOY_${arch^^}_SHA256" "$linuxdeploy_sha"
+          require_sha256 "APPIMAGE_PLUGIN_${arch^^}_SHA256" "$plugin_sha"
+
+          tool_dir="$XDG_CACHE_HOME/.cargo-packager/AppImage"
+          mkdir -p -- "$tool_dir"
+          umask 077
+          download_verified() {
+            local url="$1"
+            local output_name="$2"
+            local expected_sha="${3,,}"
+            local temporary_file="$tool_dir/.${output_name}.download"
+            curl --fail --location --silent --show-error \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              --output "$temporary_file" "$url"
+            local actual_sha
+            actual_sha="$(sha256sum "$temporary_file" | cut -d ' ' -f 1)"
+            if [[ "$actual_sha" != "$expected_sha" ]]; then
+              rm -f -- "$temporary_file"
+              echo "SHA-256 mismatch for $output_name" >&2
+              exit 1
+            fi
+            install -m 0755 -- "$temporary_file" "$tool_dir/$output_name"
+            rm -f -- "$temporary_file"
+          }
+
+          download_verified \
+            "https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-$arch" \
+            "AppRun-$arch" "$apprun_sha"
+          download_verified \
+            "https://github.com/tauri-apps/binary-releases/releases/download/linuxdeploy/linuxdeploy-$arch.AppImage" \
+            "linuxdeploy-$arch.AppImage" "$linuxdeploy_sha"
+          download_verified \
+            "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-$arch.AppImage" \
+            "linuxdeploy-plugin-appimage.AppImage" "$plugin_sha"
+
+      - name: Build Linux packages
+        if: runner.os == 'Linux'
+        env:
+          RUPORA_UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY_BASE64 }}
+          XDG_CACHE_HOME: ${{ runner.temp }}/rupora-xdg-cache
         run: cargo packager --release
+
+      - name: Import Windows signing certificate
+        id: windows_certificate
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERTIFICATE == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $certificatePath = Join-Path $env:RUNNER_TEMP "rupora-signing.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64)
+          )
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $imported = @(Import-PfxCertificate `
+            -FilePath $certificatePath `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password $password)
+          $signingCertificates = @($imported | Where-Object { $_.HasPrivateKey })
+          if ($signingCertificates.Count -ne 1) {
+            throw "Expected exactly one private-key signing certificate in the PFX"
+          }
+          $thumbprint = $signingCertificates[0].Thumbprint.Replace(" ", "").ToUpperInvariant()
+          if ($thumbprint -notmatch '^[0-9A-F]{40}$') {
+            throw "Imported signing certificate has an invalid SHA-1 thumbprint"
+          }
+          [IO.File]::WriteAllLines(
+            (Join-Path $env:RUNNER_TEMP "rupora-imported-certificates.txt"),
+            @($imported | ForEach-Object { $_.Thumbprint.Replace(" ", "").ToUpperInvariant() }),
+            [Text.UTF8Encoding]::new($false)
+          )
+          "thumbprint=$thumbprint" >> $env:GITHUB_OUTPUT
+
+      - name: Build Authenticode-signed Windows package inside cargo-packager
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERTIFICATE == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ steps.windows_certificate.outputs.thumbprint }}
+        run: |
+          $manifest = Join-Path $PWD "Cargo.toml"
+          $backup = Join-Path $env:RUNNER_TEMP "Cargo.toml.before-windows-signing"
+          Copy-Item -LiteralPath $manifest -Destination $backup
+          try {
+            $original = [IO.File]::ReadAllText($manifest)
+            $withoutBuildHook = [Text.RegularExpressions.Regex]::Replace(
+              $original,
+              '(?m)^before-packaging-command = "cargo build --release --locked"\r?\n',
+              ''
+            )
+            if ($withoutBuildHook -ceq $original) {
+              throw "Could not remove cargo-packager's build hook before injecting signing identity"
+            }
+            $windowsConfig = @"
+          [package.metadata.packager.windows]
+          digest-algorithm = "sha256"
+          certificate-thumbprint = "$env:WINDOWS_CERTIFICATE_THUMBPRINT"
+          timestamp-url = "https://timestamp.digicert.com"
+          tsp = true
+          "@
+            [IO.File]::WriteAllText(
+              $manifest,
+              $withoutBuildHook + $windowsConfig,
+              [Text.UTF8Encoding]::new($false)
+            )
+            cargo packager --release
+            if ($LASTEXITCODE -ne 0) { throw "Signed Windows packaging failed" }
+
+            $mainBinary = Get-Item "target/release/rupora.exe" -ErrorAction Stop
+            $installers = @(Get-ChildItem "target/release" -File | Where-Object {
+              $_.Extension -in ".exe", ".msi" -and $_.FullName -cne $mainBinary.FullName
+            })
+            if ($installers.Count -eq 0) { throw "No Windows installer was produced" }
+            foreach ($file in @($mainBinary) + $installers) {
+              $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+              if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid) {
+                throw "Invalid Authenticode signature on $($file.Name): $($signature.Status)"
+              }
+              $actualThumbprint = $signature.SignerCertificate.Thumbprint.Replace(" ", "").ToUpperInvariant()
+              if ($actualThumbprint -cne $env:WINDOWS_CERTIFICATE_THUMBPRINT) {
+                throw "Unexpected signer on $($file.Name)"
+              }
+            }
+          } finally {
+            Copy-Item -LiteralPath $backup -Destination $manifest -Force
+          }
+
+      - name: Build unsigned Windows developer package
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERTIFICATE != 'true'
+        shell: pwsh
+        env:
+          RUPORA_UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY_BASE64 }}
+        run: |
+          Write-Warning "Windows signing secrets are not configured; producing an unsigned developer package"
+          cargo packager --release
+          if ($LASTEXITCODE -ne 0) { throw "Unsigned Windows packaging failed" }
+
+      - name: Remove Windows signing certificate
+        if: always() && runner.os == 'Windows' && env.HAS_WINDOWS_CERTIFICATE == 'true'
+        shell: pwsh
+        run: |
+          $inventory = Join-Path $env:RUNNER_TEMP "rupora-imported-certificates.txt"
+          if (Test-Path -LiteralPath $inventory -PathType Leaf) {
+            foreach ($thumbprint in Get-Content -LiteralPath $inventory) {
+              if ($thumbprint -match '^[0-9A-F]{40}$') {
+                Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" `
+                  -Force -ErrorAction SilentlyContinue
+              }
+            }
+          }
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP "rupora-signing.pfx") `
+            -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $inventory -Force -ErrorAction SilentlyContinue
 
       - name: Build signed and notarized macOS package
         if: runner.os == 'macOS' && env.HAS_APPLE_CERTIFICATE == 'true'
+        shell: pwsh
         env:
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: cargo packager --release
+        run: |
+          if ($env:APPLE_SIGNING_IDENTITY.IndexOfAny([char[]]@("`r", "`n", '"')) -ge 0) {
+            throw "APPLE_SIGNING_IDENTITY contains characters that cannot be encoded safely"
+          }
+          $manifest = Join-Path $PWD "Cargo.toml"
+          $backup = Join-Path $env:RUNNER_TEMP "Cargo.toml.before-apple-signing"
+          Copy-Item -LiteralPath $manifest -Destination $backup
+          try {
+            $original = [IO.File]::ReadAllText($manifest)
+            $withoutBuildHook = [Text.RegularExpressions.Regex]::Replace(
+              $original,
+              '(?m)^before-packaging-command = "cargo build --release --locked"\r?\n',
+              ''
+            )
+            if ($withoutBuildHook -ceq $original) {
+              throw "Could not remove cargo-packager's build hook before injecting signing identity"
+            }
+            $macConfig = @"
+          [package.metadata.packager.macos]
+          signing-identity = "$env:APPLE_SIGNING_IDENTITY"
+          "@
+            [IO.File]::WriteAllText(
+              $manifest,
+              $withoutBuildHook + $macConfig,
+              [Text.UTF8Encoding]::new($false)
+            )
+            cargo packager --release
+            if ($LASTEXITCODE -ne 0) { throw "Signed macOS packaging failed" }
+
+            $apps = @(Get-ChildItem "target/release" -Directory -Filter "*.app")
+            $diskImages = @(Get-ChildItem "target/release" -File -Filter "*.dmg")
+            if ($apps.Count -ne 1 -or $diskImages.Count -ne 1) {
+              throw "Expected exactly one macOS app bundle and one DMG"
+            }
+            $app = $apps[0].FullName
+            $diskImage = $diskImages[0].FullName
+
+            $notaryJson = & xcrun notarytool submit $diskImage `
+              --apple-id $env:APPLE_ID `
+              --password $env:APPLE_PASSWORD `
+              --team-id $env:APPLE_TEAM_ID `
+              --wait --output-format json
+            if ($LASTEXITCODE -ne 0) { throw "DMG notarization command failed" }
+            $notary = ($notaryJson -join "`n") | ConvertFrom-Json
+            if ($notary.status -cne "Accepted") {
+              throw "DMG notarization was not accepted: $($notary.status)"
+            }
+            & xcrun stapler staple -v $diskImage
+            if ($LASTEXITCODE -ne 0) { throw "Could not staple the notarization ticket to the DMG" }
+
+            & codesign --verify --deep --strict --verbose=2 $app
+            if ($LASTEXITCODE -ne 0) { throw "App bundle codesign verification failed" }
+            $details = (& codesign --display --verbose=4 $app 2>&1) -join "`n"
+            if (-not $details.Contains("Authority=$env:APPLE_SIGNING_IDENTITY")) {
+              throw "App bundle was not signed by APPLE_SIGNING_IDENTITY"
+            }
+            & spctl --assess --type execute --verbose=4 $app
+            if ($LASTEXITCODE -ne 0) { throw "App bundle Gatekeeper assessment failed" }
+            & xcrun stapler validate -v $app
+            if ($LASTEXITCODE -ne 0) { throw "App bundle notarization ticket is invalid" }
+
+            & codesign --verify --strict --verbose=2 $diskImage
+            if ($LASTEXITCODE -ne 0) { throw "DMG codesign verification failed" }
+            & spctl --assess --type open --context context:primary-signature --verbose=4 $diskImage
+            if ($LASTEXITCODE -ne 0) { throw "DMG Gatekeeper assessment failed" }
+            & xcrun stapler validate -v $diskImage
+            if ($LASTEXITCODE -ne 0) { throw "DMG notarization ticket is invalid" }
+          } finally {
+            Copy-Item -LiteralPath $backup -Destination $manifest -Force
+          }
 
       - name: Build attested macOS package without Apple signing
         if: runner.os == 'macOS' && env.HAS_APPLE_CERTIFICATE != 'true'
+        env:
+          RUPORA_UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY_BASE64 }}
         run: |
           echo "::warning::Apple signing secrets are not configured; producing an unsigned developer package"
           cargo packager --release
-
-      - name: Sign Windows installers
-        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERTIFICATE == 'true'
-        shell: pwsh
-        run: |
-          $certificatePath = Join-Path $env:RUNNER_TEMP "rupora-signing.pfx"
-          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-          if (-not $signTool) { throw "signtool.exe was not found" }
-          [IO.File]::WriteAllBytes(
-            $certificatePath,
-            [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64)
-          )
-          Get-ChildItem target/release -File |
-            Where-Object { $_.Extension -in ".exe", ".msi" } |
-            ForEach-Object {
-              & $signTool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
-                /f $certificatePath /p $env:WINDOWS_CERTIFICATE_PASSWORD $_.FullName
-              if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed" }
-            }
-
-      - name: Report unsigned Windows developer package
-        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERTIFICATE != 'true'
-        run: echo "::warning::Windows signing secrets are not configured; producing an unsigned developer package"
 
       - name: Generate CycloneDX SBOM
         run: cargo cyclonedx --format json
@@ -133,9 +444,12 @@ jobs:
           $staging = "target/release-artifacts"
           New-Item -ItemType Directory -Force $staging | Out-Null
           $extensions = ".exe", ".msi", ".dmg", ".deb", ".AppImage"
-          $packages = Get-ChildItem target/release -File |
-            Where-Object { $_.Extension -in $extensions }
-          if (-not $packages) { throw "No release packages were produced" }
+          $packages = @(Get-ChildItem target/release -File |
+            Where-Object {
+              $_.Extension -in $extensions -and
+              -not ($env:RUNNER_OS -eq "Windows" -and $_.Name -ieq "rupora.exe")
+            })
+          if ($packages.Count -eq 0) { throw "No release packages were produced" }
           $packages | ForEach-Object {
             $stagedName = "$($_.BaseName)-$env:ARTIFACT_NAME$($_.Extension)"
             Copy-Item $_.FullName (Join-Path $staging $stagedName)
@@ -146,51 +460,242 @@ jobs:
           if (-not $sbom) { throw "CycloneDX SBOM was not produced" }
           Copy-Item $sbom.FullName (Join-Path $staging "rupora-$env:ARTIFACT_NAME.cdx.json")
 
-      - name: Generate signed architecture update manifest
-        shell: pwsh
-        env:
-          RUPORA_UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY_BASE64 }}
-        run: |
-          $manifest = "target/release-artifacts/rupora-update-${{ matrix.target }}.json"
-          cargo run --release --locked --example release_manifest -- `
-            "${{ github.ref_name }}" `
-            "${{ matrix.target }}" `
-            "target/release-artifacts" `
-            $manifest
-
-      - name: Generate SHA-256 checksums
-        shell: pwsh
-        env:
-          ARTIFACT_NAME: ${{ matrix.artifact }}
-        run: |
-          $staging = "target/release-artifacts"
-          $checksumPath = Join-Path $staging "SHA256SUMS-$env:ARTIFACT_NAME.txt"
-          $checksumLines = Get-ChildItem $staging -File |
-            Where-Object { $_.Name -ne (Split-Path $checksumPath -Leaf) } |
-            Sort-Object Name |
-            ForEach-Object {
-              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-              "$hash *$($_.Name)"
-            }
-          [IO.File]::WriteAllLines(
-            $checksumPath,
-            $checksumLines,
-            (New-Object Text.UTF8Encoding($false))
-          )
-
-      - name: Upload workflow artifact
+      - name: Upload architecture artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rupora-${{ matrix.artifact }}
           path: target/release-artifacts/*
           if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    name: Assemble release
+    needs: [validate, package]
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.92.0
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Build manifest signer without secrets
+        run: cargo build --release --locked --example release_manifest
+
+      - name: Download all architecture artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: rupora-*
+          path: target/release-inputs
+
+      - name: Generate signed update manifests
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RUPORA_UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY_BASE64 }}
+          RUPORA_EXPECTED_SIGNING_PUBLIC_KEY: ${{ vars.UPDATE_SIGNING_PUBLIC_KEY_BASE64 || vars.UPDATE_PUBLIC_KEY_BASE64 }}
+        run: |
+          if (-not $env:RUPORA_UPDATE_SIGNING_KEY -or
+              -not $env:RUPORA_EXPECTED_SIGNING_PUBLIC_KEY) {
+            throw "UPDATE_SIGNING_KEY_BASE64 and a signing public-key variable are required"
+          }
+          $platforms = [ordered]@{
+            "windows-x86_64" = "x86_64-pc-windows-msvc"
+            "windows-aarch64" = "aarch64-pc-windows-msvc"
+            "linux-x86_64" = "x86_64-unknown-linux-gnu"
+            "linux-aarch64" = "aarch64-unknown-linux-gnu"
+            "macos-x86_64" = "x86_64-apple-darwin"
+            "macos-aarch64" = "aarch64-apple-darwin"
+          }
+          $expectedDirectories = @($platforms.Keys | ForEach-Object { "rupora-$_" })
+          $actualDirectories = @(Get-ChildItem "target/release-inputs" -Directory |
+            Select-Object -ExpandProperty Name)
+          if ($actualDirectories.Count -ne $expectedDirectories.Count -or
+              @($actualDirectories | Where-Object { $_ -notin $expectedDirectories }).Count -ne 0) {
+            throw "Unexpected architecture artifact set: $($actualDirectories -join ', ')"
+          }
+          $signer = Join-Path $PWD "target/release/examples/release_manifest"
+          if (-not (Test-Path -LiteralPath $signer -PathType Leaf)) {
+            throw "Release manifest signer was not built"
+          }
+          foreach ($platform in $platforms.GetEnumerator()) {
+            $source = "target/release-inputs/rupora-$($platform.Key)"
+            if (-not (Test-Path -LiteralPath $source -PathType Container)) {
+              throw "Missing architecture artifact rupora-$($platform.Key)"
+            }
+            $manifest = Join-Path $source "rupora-update-$($platform.Value).json"
+            & $signer $env:RELEASE_VERSION $platform.Value $source $manifest
+            if ($LASTEXITCODE -ne 0) {
+              throw "Manifest signing failed for $($platform.Value)"
+            }
+          }
+
+      - name: Merge artifacts and generate checksums
+        shell: pwsh
+        run: |
+          $platforms = @(
+            "windows-x86_64",
+            "windows-aarch64",
+            "linux-x86_64",
+            "linux-aarch64",
+            "macos-x86_64",
+            "macos-aarch64"
+          )
+          $release = "target/release-assets"
+          New-Item -ItemType Directory -Force $release | Out-Null
+          foreach ($platform in $platforms) {
+            $source = "target/release-inputs/rupora-$platform"
+            $files = @(Get-ChildItem -LiteralPath $source -File)
+            $packages = @($files | Where-Object {
+              $_.Extension -in ".exe", ".msi", ".dmg", ".deb", ".AppImage"
+            })
+            if ($packages.Count -eq 0) { throw "No package found for $platform" }
+            if (-not ($files.Name -contains "rupora-$platform.cdx.json")) {
+              throw "Missing SBOM for $platform"
+            }
+            if (@($files | Where-Object { $_.Name -like "rupora-update-*.json" }).Count -ne 1) {
+              throw "Expected one update manifest for $platform"
+            }
+
+            foreach ($file in $files) {
+              $destination = Join-Path $release $file.Name
+              if (Test-Path -LiteralPath $destination) {
+                throw "Duplicate release asset name: $($file.Name)"
+              }
+              Copy-Item -LiteralPath $file.FullName -Destination $destination
+            }
+
+            $checksumPath = Join-Path $release "SHA256SUMS-$platform.txt"
+            $checksumLines = $files |
+              Sort-Object Name |
+              ForEach-Object {
+                $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                "$hash *$($_.Name)"
+              }
+            [IO.File]::WriteAllLines(
+              $checksumPath,
+              $checksumLines,
+              (New-Object Text.UTF8Encoding($false))
+            )
+          }
+
+      - name: Upload complete release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-assets
+          path: target/release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release atomically
+    needs: [validate, assemble]
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download complete release artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Verify release checksums and inventory
+        shell: pwsh
+        run: |
+          $checksumFiles = @(Get-ChildItem release-assets/SHA256SUMS-*.txt -File)
+          if ($checksumFiles.Count -ne 6) {
+            throw "Expected 6 checksum files, found $($checksumFiles.Count)"
+          }
+          $covered = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+          foreach ($checksumFile in $checksumFiles) {
+            foreach ($line in Get-Content -LiteralPath $checksumFile.FullName) {
+              if ($line -notmatch '^([0-9a-f]{64}) \*([A-Za-z0-9._-]+)$') {
+                throw "Malformed checksum line in $($checksumFile.Name): $line"
+              }
+              $expected = $Matches[1]
+              $name = $Matches[2]
+              if (-not $covered.Add($name)) { throw "Asset is listed more than once: $name" }
+              $path = Join-Path "release-assets" $name
+              if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "Checksum references missing asset: $name"
+              }
+              $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($actual -cne $expected) { throw "Checksum mismatch for $name" }
+            }
+          }
+          $assets = @(Get-ChildItem release-assets -File |
+            Where-Object { $_.Name -notlike "SHA256SUMS-*.txt" })
+          if ($assets.Count -eq 0) { throw "Release contains no assets" }
+          foreach ($asset in $assets) {
+            if (-not $covered.Contains($asset.Name)) {
+              throw "Release asset is not covered by a checksum: $($asset.Name)"
+            }
+          }
+
+      - name: Refuse to mutate an existing published release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $encodedTag = [Uri]::EscapeDataString($env:RELEASE_TAG)
+          $response = & gh api `
+            -H "Accept: application/vnd.github+json" `
+            -H "X-GitHub-Api-Version: 2022-11-28" `
+            "/repos/$env:GITHUB_REPOSITORY/releases/tags/$encodedTag" 2>&1
+          $status = $LASTEXITCODE
+          if ($status -eq 0) {
+            $release = ($response -join "`n") | ConvertFrom-Json
+            if (-not $release.draft) {
+              throw "Release $env:RELEASE_TAG is already published; refusing to replace its assets"
+            }
+          } elseif (($response -join "`n") -notmatch 'HTTP 404') {
+            throw "Could not check existing release: $($response -join "`n")"
+          }
 
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
         with:
-          subject-path: target/release-artifacts/*
+          subject-path: release-assets/*
 
-      - name: Attach packages to GitHub release
+      - name: Upload assets to a draft release
+        id: draft
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: target/release-artifacts/*
+          token: ${{ github.token }}
+          files: release-assets/*
+          draft: true
+          prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+      - name: Publish the complete draft
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+        run: |
+          if (-not $env:RELEASE_ID) { throw "Draft release ID is missing" }
+          $makeLatest = if ($env:PRERELEASE -eq "true") { "false" } else { "true" }
+          $body = @{
+            draft = $false
+            prerelease = ($env:PRERELEASE -eq "true")
+            make_latest = $makeLatest
+          } | ConvertTo-Json -Compress
+          $body | gh api `
+            --method PATCH `
+            -H "Accept: application/vnd.github+json" `
+            -H "X-GitHub-Api-Version: 2022-11-28" `
+            "/repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID" `
+            --input - | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Could not publish the draft release" }
