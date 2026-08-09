@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -9,7 +9,9 @@ use sha2::{Digest as _, Sha256};
 pub const RELEASES_URL: &str = "https://github.com/qinyin233/rupora/releases";
 const RELEASES_API: &str = "https://api.github.com/repos/qinyin233/rupora/releases?per_page=20";
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+const MAX_RELEASES_API_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_UPDATE_ARTIFACTS: usize = 16;
+const MAX_UPDATE_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,6 +106,22 @@ pub fn verify_manifest(
     }
     let manifest: SignedUpdateManifest = serde_json::from_str(manifest_json)
         .map_err(|error| format!("invalid signed update manifest: {error}"))?;
+    let key = VerifyingKey::from_bytes(public_key)
+        .map_err(|error| format!("invalid update verification key: {error}"))?;
+    if key.is_weak() {
+        return Err("weak update verification key is not allowed".to_owned());
+    }
+    let signature_bytes = BASE64
+        .decode(manifest.signature.as_bytes())
+        .map_err(|error| format!("invalid update signature encoding: {error}"))?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|error| format!("invalid update signature: {error}"))?;
+    let message = serde_json::to_vec(&manifest.payload)
+        .map_err(|error| format!("cannot serialize update payload: {error}"))?;
+    key.verify_strict(&message, &signature)
+        .map_err(|_| "update manifest signature verification failed".to_owned())?;
+
+    // Interpret release-controlled fields only after authenticating the exact payload.
     validate_payload(&manifest.payload)?;
     if manifest.payload.target != expected_target {
         return Err(format!(
@@ -117,18 +135,6 @@ pub fn verify_manifest(
             "update version mismatch: expected {expected_version}, got {version}"
         ));
     }
-
-    let key = VerifyingKey::from_bytes(public_key)
-        .map_err(|error| format!("invalid update verification key: {error}"))?;
-    let signature_bytes = BASE64
-        .decode(manifest.signature.as_bytes())
-        .map_err(|error| format!("invalid update signature encoding: {error}"))?;
-    let signature = Signature::from_slice(&signature_bytes)
-        .map_err(|error| format!("invalid update signature: {error}"))?;
-    let message = serde_json::to_vec(&manifest.payload)
-        .map_err(|error| format!("cannot serialize update payload: {error}"))?;
-    key.verify(&message, &signature)
-        .map_err(|_| "update manifest signature verification failed".to_owned())?;
     Ok(manifest.payload)
 }
 
@@ -176,9 +182,16 @@ pub fn check_for_update(current_version: &str) -> Result<UpdateStatus, String> {
         .header("Accept", "application/vnd.github+json")
         .call()
         .map_err(|error| format!("update request failed: {error}"))?;
-    let releases: Vec<GitHubRelease> = response
+    let releases_json = response
         .body_mut()
-        .read_json()
+        .with_config()
+        .limit(MAX_RELEASES_API_BYTES + 1)
+        .read_to_string()
+        .map_err(|error| format!("invalid update response: {error}"))?;
+    if releases_json.len() as u64 > MAX_RELEASES_API_BYTES {
+        return Err("update response exceeds the size limit".to_owned());
+    }
+    let releases: Vec<GitHubRelease> = serde_json::from_str(&releases_json)
         .map_err(|error| format!("invalid update response: {error}"))?;
     let follows_prereleases = !current.pre.is_empty();
     let release = releases
@@ -260,7 +273,11 @@ fn validate_payload(payload: &UpdatePayload) -> Result<(), String> {
     }
     parse_version(&payload.version)?;
     if payload.target.is_empty()
-        || payload.target.contains(['\r', '\n'])
+        || payload.target.len() > 128
+        || !payload
+            .target
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
         || payload.artifacts.is_empty()
         || payload.artifacts.len() > MAX_UPDATE_ARTIFACTS
     {
@@ -268,9 +285,9 @@ fn validate_payload(payload: &UpdatePayload) -> Result<(), String> {
     }
     let mut previous_name = None;
     for artifact in &payload.artifacts {
-        if artifact.name.is_empty()
-            || artifact.name.contains(['/', '\\', '\r', '\n'])
+        if !is_safe_artifact_name(&artifact.name)
             || !artifact.url.starts_with("https://")
+            || artifact.url.len() > 2_048
             || artifact.sha256.len() != 64
             || !artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
             || artifact
@@ -278,6 +295,7 @@ fn validate_payload(payload: &UpdatePayload) -> Result<(), String> {
                 .bytes()
                 .any(|byte| byte.is_ascii_uppercase())
             || artifact.size == 0
+            || artifact.size > MAX_UPDATE_ARTIFACT_BYTES
         {
             return Err(format!("invalid update artifact {}", artifact.name));
         }
@@ -287,6 +305,15 @@ fn validate_payload(payload: &UpdatePayload) -> Result<(), String> {
         previous_name = Some(artifact.name.as_str());
     }
     Ok(())
+}
+
+fn is_safe_artifact_name(name: &str) -> bool {
+    !matches!(name, "" | "." | "..")
+        && name.len() <= 200
+        && !name.ends_with(['.', ' '])
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn decode_key(value: &str, kind: &str) -> Result<[u8; 32], String> {
@@ -394,6 +421,40 @@ mod tests {
             .contains("target mismatch")
         );
         assert!(verify_artifact(b"changed", &manifest.payload.artifacts[0]).is_err());
+    }
+
+    #[test]
+    fn rejects_weak_update_verification_keys() {
+        let (payload, secret) = signed_payload("2.1.0");
+        let manifest = sign_manifest(payload, &secret).unwrap();
+        let json = serde_json::to_string(&manifest).unwrap();
+        let mut weak_key = [0u8; 32];
+        weak_key[0] = 1;
+
+        let error = verify_manifest(
+            &json,
+            &weak_key,
+            "test-target",
+            &Version::parse("2.1.0").unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("weak"));
+    }
+
+    #[test]
+    fn rejects_unsafe_or_unbounded_update_artifacts() {
+        for name in ["..", ".", "../escape.exe", "trailing.", "line\nbreak"] {
+            let (mut payload, secret) = signed_payload("2.1.0");
+            payload.artifacts[0].name = name.to_owned();
+            assert!(
+                sign_manifest(payload, &secret).is_err(),
+                "accepted {name:?}"
+            );
+        }
+
+        let (mut payload, secret) = signed_payload("2.1.0");
+        payload.artifacts[0].size = MAX_UPDATE_ARTIFACT_BYTES + 1;
+        assert!(sign_manifest(payload, &secret).is_err());
     }
 
     #[test]

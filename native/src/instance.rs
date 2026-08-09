@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
@@ -34,7 +35,24 @@ pub struct InstanceCoordinator {
 #[derive(Serialize, Deserialize)]
 struct WireRequest {
     version: u32,
-    paths: Vec<PathBuf>,
+    paths: Vec<WirePath>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum WirePath {
+    Legacy(PathBuf),
+    Native {
+        format: NativePathFormat,
+        data: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NativePathFormat {
+    UnixBytes,
+    WindowsUtf16Le,
 }
 
 impl InstanceCoordinator {
@@ -130,6 +148,7 @@ impl InstanceCoordinator {
                 request
                     .paths
                     .into_iter()
+                    .filter_map(|path| path.decode().ok())
                     .take(MAX_PATHS_PER_REQUEST.saturating_sub(paths.len())),
             );
             if paths.len() == MAX_PATHS_PER_REQUEST {
@@ -149,7 +168,10 @@ fn is_lock_contended(error: &std::io::Error) -> bool {
 }
 
 fn forward_request(path: &Path, paths: &[PathBuf]) -> Result<(), String> {
-    let paths = absolute_forwarded_paths(paths)?;
+    let paths = absolute_forwarded_paths(paths)?
+        .into_iter()
+        .map(WirePath::encode)
+        .collect::<Result<Vec<_>, _>>()?;
     let request = WireRequest {
         version: REQUEST_VERSION,
         paths,
@@ -202,6 +224,88 @@ fn forward_request(path: &Path, paths: &[PathBuf]) -> Result<(), String> {
         .map_err(|error| format!("cannot forward instance request: {error}"))?;
     FileExt::unlock(&inbox).ok();
     Ok(())
+}
+
+impl WirePath {
+    fn encode(path: PathBuf) -> Result<Self, String> {
+        if path.to_str().is_some() {
+            return Ok(Self::Legacy(path));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            Ok(Self::Native {
+                format: NativePathFormat::UnixBytes,
+                data: BASE64.encode(path.as_os_str().as_bytes()),
+            })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt as _;
+            let bytes = path
+                .as_os_str()
+                .encode_wide()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            Ok(Self::Native {
+                format: NativePathFormat::WindowsUtf16Le,
+                data: BASE64.encode(bytes),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err("current platform cannot forward a non-UTF-8 path".to_owned())
+        }
+    }
+
+    fn decode(self) -> Result<PathBuf, String> {
+        match self {
+            Self::Legacy(path) => Ok(path),
+            Self::Native {
+                format: NativePathFormat::UnixBytes,
+                data,
+            } => {
+                #[cfg(unix)]
+                {
+                    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+                    let bytes = BASE64
+                        .decode(data)
+                        .map_err(|error| format!("invalid Unix path encoding: {error}"))?;
+                    Ok(PathBuf::from(OsString::from_vec(bytes)))
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = data;
+                    Err("Unix path cannot be opened on this platform".to_owned())
+                }
+            }
+            Self::Native {
+                format: NativePathFormat::WindowsUtf16Le,
+                data,
+            } => {
+                #[cfg(windows)]
+                {
+                    use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
+                    let bytes = BASE64
+                        .decode(data)
+                        .map_err(|error| format!("invalid Windows path encoding: {error}"))?;
+                    if !bytes.len().is_multiple_of(2) {
+                        return Err("invalid Windows UTF-16 path length".to_owned());
+                    }
+                    let wide = bytes
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .collect::<Vec<_>>();
+                    Ok(PathBuf::from(OsString::from_wide(&wide)))
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = data;
+                    Err("Windows path cannot be opened on this platform".to_owned())
+                }
+            }
+        }
+    }
 }
 
 fn absolute_forwarded_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
@@ -282,7 +386,7 @@ mod tests {
         let expected = directory.path().join("pending.md");
         let mut encoded = serde_json::to_vec(&WireRequest {
             version: REQUEST_VERSION,
-            paths: vec![expected.clone()],
+            paths: vec![WirePath::encode(expected.clone()).unwrap()],
         })
         .expect("serialize request");
         encoded.push(b'\n');
@@ -349,5 +453,41 @@ mod tests {
 
         assert!(error.contains("safety limit"));
         assert_eq!(fs::read(inbox_path).expect("read inbox"), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forwards_non_utf8_unix_paths() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut primary = match InstanceCoordinator::acquire_at(directory.path(), &[]).unwrap() {
+            InstanceRole::Primary(primary) => primary,
+            InstanceRole::Secondary => panic!("first instance must be primary"),
+        };
+        let relative = PathBuf::from(OsString::from_vec(b"draft-\xff.md".to_vec()));
+        assert!(matches!(
+            InstanceCoordinator::acquire_at(directory.path(), std::slice::from_ref(&relative))
+                .unwrap(),
+            InstanceRole::Secondary
+        ));
+        primary.last_poll = Instant::now() - POLL_INTERVAL;
+        let request = primary.poll().unwrap().unwrap();
+        assert_eq!(
+            request.paths,
+            vec![std::env::current_dir().unwrap().join(relative)]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wire_paths_round_trip_unpaired_utf16() {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
+
+        let path = PathBuf::from(OsString::from_wide(&[b'x' as u16, 0xd800]));
+        let encoded = WirePath::encode(path.clone()).unwrap();
+        let json = serde_json::to_vec(&encoded).unwrap();
+        let decoded: WirePath = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.decode().unwrap(), path);
     }
 }

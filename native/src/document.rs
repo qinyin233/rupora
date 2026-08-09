@@ -3,7 +3,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
-    io::Write,
+    io::{Read, Write},
     ops::Range,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -149,23 +149,15 @@ impl Document {
     }
 
     fn open_with_lock(path: &Path, lock: Option<DocumentLock>) -> Result<Self, String> {
-        let metadata =
-            fs::metadata(path).map_err(|error| format!("无法检查 {}：{error}", path.display()))?;
-        if metadata.len() > MAX_DOCUMENT_BYTES {
-            return Err(format!(
-                "文档超过 {} MiB 安全上限：{}",
-                MAX_DOCUMENT_BYTES / 1024 / 1024,
-                path.display()
-            ));
-        }
-        let bytes =
-            fs::read(path).map_err(|error| format!("无法读取 {}：{error}", path.display()))?;
+        let bounded = read_regular_file_bounded(path, MAX_DOCUMENT_BYTES)?
+            .ok_or_else(|| format!("文档不存在：{}", path.display()))?;
+        let bytes = bounded.bytes;
         let decoded = decode_bytes(&bytes)
             .map_err(|error| format!("无法安全解码 {}：{error}", path.display()))?;
         let line_ending = detect_line_ending(&decoded.text);
         let content = normalize_line_endings(&decoded.text);
         let block_index = BlockIndex::new(&content);
-        let file_fingerprint = fingerprint_from_bytes(path, &bytes);
+        let file_fingerprint = fingerprint_from_metadata(&bounded.metadata, &bytes);
         Ok(Self {
             id: next_document_id(),
             path: Some(path.to_path_buf()),
@@ -272,28 +264,29 @@ impl Document {
                     && now.duration_since(previous.created_at) <= TYPING_COALESCE_WINDOW
             });
 
+        let mut coalesced = false;
         if can_coalesce {
-            let mut original_before = before;
+            let mut original_before = before.clone();
             let reversed = self
                 .undo_history
                 .last()
                 .expect("coalescing requires an existing transaction")
                 .patch
                 .apply_reverse(&mut original_before);
-            debug_assert!(
-                reversed,
-                "coalesced transaction must match its prior result"
-            );
-            let patch = TextPatch::between(&original_before, &self.content);
-            let previous = self
-                .undo_history
-                .last_mut()
-                .expect("coalescing requires an existing transaction");
-            previous.patch = patch;
-            previous.selection_after = selection_after;
-            previous.created_at = now;
-            previous.after_hash = after_hash;
-        } else {
+            if reversed {
+                let patch = TextPatch::between(&original_before, &self.content);
+                let previous = self
+                    .undo_history
+                    .last_mut()
+                    .expect("coalescing requires an existing transaction");
+                previous.patch = patch;
+                previous.selection_after = selection_after.clone();
+                previous.created_at = now;
+                previous.after_hash = after_hash;
+                coalesced = true;
+            }
+        }
+        if !coalesced {
             let patch = TextPatch::between(&before, &self.content);
             self.undo_history.push(EditTransaction {
                 patch,
@@ -411,6 +404,7 @@ impl Document {
     }
 
     pub fn relink_external(&mut self, path: PathBuf) -> Result<usize, String> {
+        let path = canonical_document_path(&path)?;
         let new_lock = DocumentLock::acquire(&path)?;
         let external = Self::open_unlocked(&path)?;
         let before = self.content.clone();
@@ -443,7 +437,7 @@ impl Document {
         let content = self.line_ending.apply(&self.content);
         let bytes = encode_text(&content, &self.encoding)?;
         ensure_document_size(bytes.len())?;
-        write_atomically(path, &bytes)?;
+        write_atomically(path, &bytes, true)?;
         self.file_fingerprint = Some(fingerprint_from_bytes(path, &bytes));
         self.saved_content.clone_from(&self.content);
         self.dirty = false;
@@ -454,11 +448,7 @@ impl Document {
         if path.exists() && !overwrite_existing {
             return Err(format!("目标文件已存在：{}", path.display()));
         }
-        let path = if path.exists() {
-            canonical_document_path(&path)?
-        } else {
-            path
-        };
+        let path = canonical_save_target(&path)?;
         if self
             .path
             .as_deref()
@@ -468,18 +458,17 @@ impl Document {
         }
 
         let new_lock = DocumentLock::acquire(&path)?;
-        let previous_path = self.path.replace(path);
-        let previous_fingerprint = self.file_fingerprint.take();
-        let previous_lock = self.lock.replace(new_lock);
-        match self.save(true) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.path = previous_path;
-                self.file_fingerprint = previous_fingerprint;
-                self.lock = previous_lock;
-                Err(error)
-            }
-        }
+        let content = self.line_ending.apply(&self.content);
+        let bytes = encode_text(&content, &self.encoding)?;
+        ensure_document_size(bytes.len())?;
+        write_atomically(&path, &bytes, overwrite_existing)?;
+
+        self.path = Some(path.clone());
+        self.lock = Some(new_lock);
+        self.file_fingerprint = Some(fingerprint_from_bytes(&path, &bytes));
+        self.saved_content.clone_from(&self.content);
+        self.dirty = false;
+        Ok(())
     }
 
     pub fn reload(&mut self) -> Result<(), String> {
@@ -590,7 +579,9 @@ struct DocumentLock {
 
 impl DocumentLock {
     fn acquire(path: &Path) -> Result<Self, String> {
-        let lock_directory = std::env::temp_dir().join("rupora-document-locks");
+        let lock_directory = eframe::storage_dir("RUPORA")
+            .map(|directory| directory.join("document-locks"))
+            .unwrap_or_else(|| std::env::temp_dir().join("rupora-document-locks"));
         fs::create_dir_all(&lock_directory)
             .map_err(|error| format!("无法创建文档锁目录 {}：{error}", lock_directory.display()))?;
         let lock_path = document_lock_path(&lock_directory, path);
@@ -616,6 +607,20 @@ fn canonical_document_path(path: &Path) -> Result<PathBuf, String> {
         .canonicalize()
         .map_err(|error| format!("无法解析文档路径 {}：{error}", path.display()))?;
     Ok(normalize_windows_verbatim_path(canonical))
+}
+
+fn canonical_save_target(path: &Path) -> Result<PathBuf, String> {
+    if path.exists() {
+        return canonical_document_path(path);
+    }
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("保存路径缺少文件名：{}", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(canonical_document_path(parent)?.join(file_name))
 }
 
 #[cfg(windows)]
@@ -902,12 +907,73 @@ fn normalize_line_endings(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn fingerprint(path: &Path) -> Result<Option<FileFingerprint>, String> {
-    if !path.exists() {
-        return Ok(None);
+struct BoundedFile {
+    bytes: Vec<u8>,
+    metadata: fs::Metadata,
+}
+
+fn read_regular_file_bounded(path: &Path, limit: u64) -> Result<Option<BoundedFile>, String> {
+    let mut file = match open_readonly_bounded(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("无法打开 {}：{error}", path.display())),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("无法检查 {}：{error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("文档不是普通文件：{}", path.display()));
     }
-    let bytes = fs::read(path).map_err(|error| format!("无法检查 {}：{error}", path.display()))?;
-    Ok(Some(fingerprint_from_bytes(path, &bytes)))
+    if metadata.len() > limit {
+        return Err(format!(
+            "文档超过 {} MiB 安全上限：{}",
+            limit / 1024 / 1024,
+            path.display()
+        ));
+    }
+
+    let capacity = usize::try_from(metadata.len().min(limit)).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(capacity);
+    Read::by_ref(&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("无法读取 {}：{error}", path.display()))?;
+    if bytes.len() as u64 > limit {
+        return Err(format!(
+            "文档读取期间增长并超过 {} MiB 安全上限：{}",
+            limit / 1024 / 1024,
+            path.display()
+        ));
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("无法复核 {}：{error}", path.display()))?;
+    Ok(Some(BoundedFile { bytes, metadata }))
+}
+
+#[cfg(unix)]
+fn open_readonly_bounded(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_readonly_bounded(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+fn fingerprint(path: &Path) -> Result<Option<FileFingerprint>, String> {
+    let Some(bounded) = read_regular_file_bounded(path, MAX_DOCUMENT_BYTES)? else {
+        return Ok(None);
+    };
+    Ok(Some(fingerprint_from_metadata(
+        &bounded.metadata,
+        &bounded.bytes,
+    )))
 }
 
 fn fingerprint_from_bytes(path: &Path, bytes: &[u8]) -> FileFingerprint {
@@ -923,13 +989,23 @@ fn fingerprint_from_bytes(path: &Path, bytes: &[u8]) -> FileFingerprint {
     }
 }
 
+fn fingerprint_from_metadata(metadata: &fs::Metadata, bytes: &[u8]) -> FileFingerprint {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    FileFingerprint {
+        modified: metadata.modified().ok(),
+        length: bytes.len() as u64,
+        content_hash: hasher.finish(),
+    }
+}
+
 fn text_hash(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
 }
 
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn write_atomically(path: &Path, bytes: &[u8], overwrite_existing: bool) -> Result<(), String> {
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -952,25 +1028,61 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if FAIL_BEFORE_ATOMIC_PERSIST.with(|failure| failure.replace(false)) {
         return Err("测试注入：临时文件同步后、原子替换前失败".to_owned());
     }
-    temporary
-        .persist(path)
-        .map_err(|error| format!("无法替换 {}：{}", path.display(), error.error))?;
+    #[cfg(test)]
+    if CREATE_TARGET_BEFORE_ATOMIC_PERSIST.with(|create| create.replace(false)) {
+        fs::write(path, b"concurrent creator")
+            .map_err(|error| format!("测试无法创建并发目标 {}：{error}", path.display()))?;
+    }
+    if overwrite_existing {
+        temporary
+            .persist(path)
+            .map_err(|error| format!("无法替换 {}：{}", path.display(), error.error))?;
+    } else {
+        temporary.persist_noclobber(path).map_err(|error| {
+            format!(
+                "目标文件已存在或无法创建 {}：{}",
+                path.display(),
+                error.error
+            )
+        })?;
+    }
+    sync_parent_directory(parent)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<(), String> {
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("无法同步目录 {}：{error}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg(test)]
 thread_local! {
     static FAIL_BEFORE_ATOMIC_PERSIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CREATE_TARGET_BEFORE_ATOMIC_PERSIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn trim_history(history: &mut Vec<EditTransaction>) {
-    while history.len() > MAX_HISTORY_ENTRIES
-        || (history.len() > 1
-            && history
-                .iter()
-                .map(EditTransaction::memory_cost)
-                .sum::<usize>()
-                > MAX_HISTORY_BYTES)
+    trim_history_to_budget(history, MAX_HISTORY_ENTRIES, MAX_HISTORY_BYTES);
+}
+
+fn trim_history_to_budget(
+    history: &mut Vec<EditTransaction>,
+    max_entries: usize,
+    max_bytes: usize,
+) {
+    while history.len() > max_entries
+        || history
+            .iter()
+            .map(EditTransaction::memory_cost)
+            .fold(0usize, usize::saturating_add)
+            > max_bytes
     {
         history.remove(0);
     }
@@ -1159,6 +1271,21 @@ mod tests {
     }
 
     #[test]
+    fn save_as_without_overwrite_does_not_clobber_a_concurrent_creator() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("created-concurrently.md");
+        let mut document = Document::untitled(1);
+        document.content = "editor content".to_owned();
+        document.update_after_edit();
+
+        CREATE_TARGET_BEFORE_ATOMIC_PERSIST.with(|create| create.set(true));
+        assert!(document.save_as(target.clone(), false).is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "concurrent creator");
+        assert!(document.path.is_none());
+        assert!(document.dirty);
+    }
+
+    #[test]
     fn injected_atomic_commit_failure_preserves_the_original_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("atomic.md");
@@ -1207,6 +1334,32 @@ mod tests {
 
         assert_eq!(document.redo().unwrap().selection, Some(2..2));
         assert_eq!(document.content, "你好");
+    }
+
+    #[test]
+    fn falls_back_to_a_new_transaction_when_coalescing_state_is_inconsistent() {
+        let mut document = Document::untitled(1);
+        document.content = "a".to_owned();
+        document.record_edit(String::new(), None, None, EditKind::Typing);
+        document.undo_history.last_mut().unwrap().patch.inserted = "wrong".to_owned();
+
+        document.content = "ab".to_owned();
+        document.record_edit("a".to_owned(), None, None, EditKind::Typing);
+
+        assert_eq!(document.undo_history.len(), 2);
+        assert!(document.undo().is_some());
+        assert_eq!(document.content, "a");
+    }
+
+    #[test]
+    fn drops_even_a_single_history_entry_when_it_exceeds_the_budget() {
+        let mut document = Document::untitled(1);
+        document.content = "long edit".to_owned();
+        document.record_edit(String::new(), None, None, EditKind::Other);
+        assert_eq!(document.undo_history.len(), 1);
+
+        trim_history_to_budget(&mut document.undo_history, 10, 1);
+        assert!(document.undo_history.is_empty());
     }
 
     #[test]
@@ -1376,6 +1529,35 @@ mod tests {
         assert!(!document.has_external_changes().unwrap());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn relinking_through_a_symlink_locks_and_saves_the_real_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.md");
+        let target = directory.path().join("target.md");
+        let link = directory.path().join("target-link.md");
+        fs::write(&original, "base").unwrap();
+        fs::write(&target, "base").unwrap();
+        symlink(&target, &link).unwrap();
+        let mut document = Document::open(&original).unwrap();
+
+        document.relink_external(link.clone()).unwrap();
+        assert_eq!(document.path.as_deref(), Some(target.as_path()));
+        assert!(
+            Document::open(&target)
+                .unwrap_err()
+                .contains("另一个 RUPORA")
+        );
+
+        document.content = "updated".to_owned();
+        document.update_after_edit();
+        document.save(true).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "updated");
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+
     #[test]
     fn rejects_documents_above_the_resource_limit_before_reading() {
         let directory = tempfile::tempdir().unwrap();
@@ -1383,6 +1565,29 @@ mod tests {
         let file = fs::File::create(&path).unwrap();
         file.set_len(MAX_DOCUMENT_BYTES + 1).unwrap();
         assert!(Document::open(path).unwrap_err().contains("安全上限"));
+    }
+
+    #[test]
+    fn rejects_non_regular_documents_and_external_replacements() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(Document::open(directory.path()).is_err());
+
+        let path = directory.path().join("replaced.md");
+        fs::write(&path, "content").unwrap();
+        let document = Document::open(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(document.has_external_changes().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_character_devices_without_reading_them() {
+        assert!(
+            Document::open("/dev/null")
+                .unwrap_err()
+                .contains("普通文件")
+        );
     }
 
     #[test]

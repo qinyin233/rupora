@@ -81,6 +81,7 @@ pub struct RuporaApp {
     status: String,
     preview_cache: CommonMarkCache,
     allow_close: bool,
+    discard_recovery_on_exit: bool,
     recovery_store: RecoveryStore,
     last_recovery_write: Instant,
     recovery_error_reported: bool,
@@ -169,6 +170,7 @@ impl RuporaApp {
             status: "纯 Rust 原生内核已就绪".to_owned(),
             preview_cache: CommonMarkCache::default(),
             allow_close: false,
+            discard_recovery_on_exit: false,
             recovery_store,
             last_recovery_write: Instant::now(),
             recovery_error_reported: false,
@@ -220,6 +222,7 @@ impl RuporaApp {
                         base_content,
                         encoding,
                         line_ending,
+                        ..
                     } = entry;
                     let outcome = Document::recover(
                         path,
@@ -544,12 +547,16 @@ impl RuporaApp {
                 return;
             }
         };
-        let output = export::embed_local_images(&output, &images);
-        match fs::write(&path, output) {
-            Ok(()) => self.status = format!("已导出 HTML：{}", path.display()),
+        let output = match export::embed_local_images(&output, &images) {
+            Ok(output) => output,
             Err(error) => {
-                self.show_error("导出失败", &format!("无法写入 {}：{error}", path.display()))
+                self.show_error("导出失败", &error);
+                return;
             }
+        };
+        match export::write_html(&path, &output) {
+            Ok(()) => self.status = format!("已导出 HTML：{}", path.display()),
+            Err(error) => self.show_error("导出失败", &error),
         }
     }
 
@@ -2976,6 +2983,7 @@ impl RuporaApp {
             .show();
         if result == MessageDialogResult::Yes {
             self.allow_close = true;
+            self.discard_recovery_on_exit = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
     }
@@ -3031,7 +3039,11 @@ impl eframe::App for RuporaApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let _ = self.recovery_store.clear();
+        if self.discard_recovery_on_exit || self.documents.iter().all(|document| !document.dirty) {
+            let _ = self.recovery_store.clear();
+        } else {
+            let _ = self.recovery_store.save(&self.documents);
+        }
         diagnostics::append_event("INFO", "RUPORA exited normally").ok();
     }
 }

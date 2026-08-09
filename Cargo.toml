@@ -61,6 +61,7 @@ egui_commonmark = { version = "0.24.0", features = [
 encoding_rs = "0.8.35"
 fs2 = "0.4.3"
 image = { version = "0.25.9", default-features = false, features = ["jpeg", "png"] }
+libc = "0.2.177"
 mermaid-svg = "0.7.0"
 open = "5.4.0"
 pathdiff = "0.2.3"
