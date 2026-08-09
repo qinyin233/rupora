@@ -8,6 +8,7 @@ use std::{
 use pulldown_cmark::{
     CodeBlockKind, CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd, html,
 };
+use sha2::{Digest as _, Sha256};
 
 const MAX_MATH_BYTES: usize = 16 * 1024;
 const MAX_MERMAID_BYTES: usize = 256 * 1024;
@@ -18,6 +19,12 @@ const MAX_GENERATED_SVG_PIXELS: f64 = 16.0 * 1024.0 * 1024.0;
 const MAX_GENERATED_SVG_ASPECT_RATIO: f32 = 512.0;
 const MAX_GENERATED_BLOCKS: usize = 128;
 const MAX_GENERATED_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TOC_BYTES: usize = 1024 * 1024;
+const MAX_TOC_EXPANSION_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BLOCK_MATCH_CANDIDATES: usize = 16 * 1024;
+const MAX_SIMILARITY_CHARS_PER_SIDE: usize = 256;
+const TOC_LIMIT_MARKDOWN: &str = "> Table of contents omitted: output budget exceeded.\n";
+const TOC_TRUNCATED_MARKDOWN: &str = "> Table of contents truncated: output budget exceeded.\n";
 const GENERATED_LIMIT_HTML: &str = "<span class=\"diagram-error\">生成内容超过文档资源预算</span>";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -187,11 +194,19 @@ pub fn parser_options() -> Options {
 pub fn analyze(source: &str) -> MarkdownAnalysis {
     let mut headings = Vec::new();
     let mut current_heading: Option<(HeadingLevel, usize, String)> = None;
+    let mut line_scan_offset = 0usize;
+    let mut line_at_scan_offset = 1usize;
 
     for (event, range) in Parser::new_ext(source, parser_options()).into_offset_iter() {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
-                current_heading = Some((level, range.start, String::new()));
+                debug_assert!(range.start >= line_scan_offset);
+                line_at_scan_offset += source.as_bytes()[line_scan_offset..range.start]
+                    .iter()
+                    .filter(|byte| **byte == b'\n')
+                    .count();
+                line_scan_offset = range.start;
+                current_heading = Some((level, line_at_scan_offset, String::new()));
             }
             Event::Text(text) | Event::Code(text) if current_heading.is_some() => {
                 if let Some((_, _, heading_text)) = current_heading.as_mut() {
@@ -204,15 +219,11 @@ pub fn analyze(source: &str) -> MarkdownAnalysis {
                 }
             }
             Event::End(TagEnd::Heading(_)) => {
-                if let Some((level, offset, text)) = current_heading.take() {
+                if let Some((level, line, text)) = current_heading.take() {
                     headings.push(Heading {
                         level: heading_level(level),
                         text,
-                        line: source[..offset]
-                            .bytes()
-                            .filter(|byte| *byte == b'\n')
-                            .count()
-                            + 1,
+                        line,
                     });
                 }
             }
@@ -554,24 +565,58 @@ fn match_changed_gap(
         return;
     }
 
-    let mut candidates = old_indices
-        .iter()
-        .flat_map(|old_index| {
-            new_indices.iter().map(move |new_index| {
-                let old = &old_source[old_blocks[*old_index].range.clone()];
-                let new = &new_source[new_ranges[*new_index].clone()];
-                (
-                    similarity_score(old, new),
-                    old_index.abs_diff(*new_index),
-                    *old_index,
-                    *new_index,
-                )
-            })
-        })
-        .filter(|(score, _, _, _)| *score > 0)
-        .collect::<Vec<_>>();
-    candidates
-        .sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    if old_indices.len().min(new_indices.len()) > MAX_BLOCK_MATCH_CANDIDATES {
+        match_changed_gap_positionally(
+            old_source,
+            old_blocks,
+            &old_indices,
+            new_source,
+            new_ranges,
+            &new_indices,
+            old_used,
+            assigned,
+        );
+        return;
+    }
+
+    let mut candidates = Vec::new();
+    if old_indices
+        .len()
+        .checked_mul(new_indices.len())
+        .is_some_and(|count| count <= MAX_BLOCK_MATCH_CANDIDATES)
+    {
+        for &old_index in &old_indices {
+            for &new_index in &new_indices {
+                push_block_match_candidate(
+                    old_source,
+                    old_blocks,
+                    old_index,
+                    new_source,
+                    new_ranges,
+                    new_index,
+                    &mut candidates,
+                );
+            }
+        }
+    } else {
+        collect_bounded_block_match_candidates(
+            old_source,
+            old_blocks,
+            &old_indices,
+            new_source,
+            new_ranges,
+            &new_indices,
+            &mut candidates,
+        );
+    }
+    candidates.sort_unstable_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
 
     for (_, _, old_index, new_index) in candidates {
         if !old_used[old_index] && assigned[new_index].is_none() {
@@ -581,16 +626,151 @@ fn match_changed_gap(
     }
 }
 
+type BlockMatchCandidate = (usize, usize, usize, usize);
+
+#[allow(clippy::too_many_arguments)]
+fn push_block_match_candidate(
+    old_source: &str,
+    old_blocks: &[MarkdownBlock],
+    old_index: usize,
+    new_source: &str,
+    new_ranges: &[Range<usize>],
+    new_index: usize,
+    candidates: &mut Vec<BlockMatchCandidate>,
+) {
+    let old = &old_source[old_blocks[old_index].range.clone()];
+    let new = &new_source[new_ranges[new_index].clone()];
+    let score = similarity_score(old, new);
+    if score > 0 {
+        candidates.push((score, old_index.abs_diff(new_index), old_index, new_index));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_bounded_block_match_candidates(
+    old_source: &str,
+    old_blocks: &[MarkdownBlock],
+    old_indices: &[usize],
+    new_source: &str,
+    new_ranges: &[Range<usize>],
+    new_indices: &[usize],
+    candidates: &mut Vec<BlockMatchCandidate>,
+) {
+    let smaller_len = old_indices.len().min(new_indices.len());
+    let slots_per_item = (MAX_BLOCK_MATCH_CANDIDATES / smaller_len).max(1);
+    let center_count = if slots_per_item >= 3 { 3 } else { 1 };
+    let window_len = (slots_per_item / center_count).max(1);
+
+    if old_indices.len() <= new_indices.len() {
+        for (old_position, &old_index) in old_indices.iter().enumerate() {
+            let centers = alignment_centers(old_position, old_indices.len(), new_indices.len());
+            for &center in centers.iter().take(center_count) {
+                for new_position in centered_window(center, new_indices.len(), window_len) {
+                    push_block_match_candidate(
+                        old_source,
+                        old_blocks,
+                        old_index,
+                        new_source,
+                        new_ranges,
+                        new_indices[new_position],
+                        candidates,
+                    );
+                }
+            }
+        }
+    } else {
+        for (new_position, &new_index) in new_indices.iter().enumerate() {
+            let centers = alignment_centers(new_position, new_indices.len(), old_indices.len());
+            for &center in centers.iter().take(center_count) {
+                for old_position in centered_window(center, old_indices.len(), window_len) {
+                    push_block_match_candidate(
+                        old_source,
+                        old_blocks,
+                        old_indices[old_position],
+                        new_source,
+                        new_ranges,
+                        new_index,
+                        candidates,
+                    );
+                }
+            }
+        }
+    }
+
+    debug_assert!(candidates.len() <= MAX_BLOCK_MATCH_CANDIDATES);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn match_changed_gap_positionally(
+    old_source: &str,
+    old_blocks: &[MarkdownBlock],
+    old_indices: &[usize],
+    new_source: &str,
+    new_ranges: &[Range<usize>],
+    new_indices: &[usize],
+    old_used: &mut [bool],
+    assigned: &mut [Option<BlockId>],
+) {
+    if old_indices.len() <= new_indices.len() {
+        for (position, &old_index) in old_indices.iter().enumerate() {
+            let new_position = scaled_position(position, old_indices.len(), new_indices.len());
+            let new_index = new_indices[new_position];
+            let old = &old_source[old_blocks[old_index].range.clone()];
+            let new = &new_source[new_ranges[new_index].clone()];
+            if similarity_score(old, new) > 0 {
+                assigned[new_index] = Some(old_blocks[old_index].id);
+                old_used[old_index] = true;
+            }
+        }
+    } else {
+        for (position, &new_index) in new_indices.iter().enumerate() {
+            let old_position = scaled_position(position, new_indices.len(), old_indices.len());
+            let old_index = old_indices[old_position];
+            let old = &old_source[old_blocks[old_index].range.clone()];
+            let new = &new_source[new_ranges[new_index].clone()];
+            if similarity_score(old, new) > 0 {
+                assigned[new_index] = Some(old_blocks[old_index].id);
+                old_used[old_index] = true;
+            }
+        }
+    }
+}
+
+fn alignment_centers(position: usize, smaller_len: usize, larger_len: usize) -> [usize; 3] {
+    [
+        scaled_position(position, smaller_len, larger_len),
+        position,
+        larger_len - smaller_len + position,
+    ]
+}
+
+fn scaled_position(position: usize, from_len: usize, to_len: usize) -> usize {
+    if from_len <= 1 {
+        return 0;
+    }
+    ((position as u128 * (to_len - 1) as u128) / (from_len - 1) as u128) as usize
+}
+
+fn centered_window(center: usize, total_len: usize, requested_len: usize) -> Range<usize> {
+    let window_len = requested_len.min(total_len);
+    let start = center
+        .saturating_sub(window_len / 2)
+        .min(total_len - window_len);
+    start..start + window_len
+}
+
 fn similarity_score(left: &str, right: &str) -> usize {
     let prefix = left
         .chars()
         .zip(right.chars())
+        .take(MAX_SIMILARITY_CHARS_PER_SIDE)
         .take_while(|(left, right)| left == right)
         .count();
     let suffix = left
         .chars()
         .rev()
         .zip(right.chars().rev())
+        .take(MAX_SIMILARITY_CHARS_PER_SIDE)
         .take_while(|(left, right)| left == right)
         .count();
     prefix + suffix
@@ -605,7 +785,11 @@ fn expand_front_matter_and_toc(source: &str) -> String {
     };
     let anchors = heading_anchors(body);
     let toc = render_toc_markdown(&anchors);
-    let mut output = String::new();
+    let mut output = String::with_capacity(
+        source
+            .len()
+            .saturating_add(toc.len().min(MAX_TOC_EXPANSION_BYTES)),
+    );
 
     if let Some(front_matter) = front_matter {
         output.push_str("> **文档元数据**\n");
@@ -620,15 +804,28 @@ fn expand_front_matter_and_toc(source: &str) -> String {
     }
 
     let mut in_fence = false;
+    let mut toc_expansion_bytes = 0usize;
+    let mut toc_limit_reported = false;
     for line in body.split_inclusive('\n') {
         let trimmed = line.trim();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_fence = !in_fence;
         }
         if !in_fence && trimmed.eq_ignore_ascii_case("[TOC]") {
-            output.push_str(&toc);
-            if line.ends_with('\n') && !toc.ends_with('\n') {
-                output.push('\n');
+            if toc_expansion_bytes
+                .checked_add(toc.len())
+                .is_some_and(|bytes| bytes <= MAX_TOC_EXPANSION_BYTES)
+            {
+                output.push_str(&toc);
+                toc_expansion_bytes += toc.len();
+                if line.ends_with('\n') && !toc.ends_with('\n') {
+                    output.push('\n');
+                }
+            } else if !toc_limit_reported {
+                output.push_str(TOC_LIMIT_MARKDOWN);
+                toc_limit_reported = true;
+            } else {
+                output.push_str(line);
             }
         } else {
             output.push_str(line);
@@ -649,19 +846,42 @@ fn render_toc_markdown(anchors: &[HeadingAnchor]) -> String {
         .map(|anchor| anchor.heading.level)
         .min()
         .unwrap_or(1);
-    let mut output = String::new();
+    let mut output = String::with_capacity(MAX_TOC_BYTES.min(anchors.len().saturating_mul(64)));
     for anchor in anchors {
         let indent = anchor.heading.level.saturating_sub(minimum_level) as usize;
-        output.push_str(&"  ".repeat(indent));
+        let escaped_text_bytes = anchor
+            .heading
+            .text
+            .chars()
+            .map(|character| {
+                character.len_utf8() + usize::from(matches!(character, '\\' | '[' | ']'))
+            })
+            .fold(0usize, usize::saturating_add);
+        let entry_bytes = indent
+            .saturating_mul(2)
+            .saturating_add(8)
+            .saturating_add(escaped_text_bytes)
+            .saturating_add(anchor.id.len());
+        if output
+            .len()
+            .saturating_add(entry_bytes)
+            .saturating_add(TOC_TRUNCATED_MARKDOWN.len())
+            > MAX_TOC_BYTES
+        {
+            output.push_str(TOC_TRUNCATED_MARKDOWN);
+            break;
+        }
+
+        for _ in 0..indent {
+            output.push_str("  ");
+        }
         output.push_str("- [");
-        output.push_str(
-            &anchor
-                .heading
-                .text
-                .replace('\\', "\\\\")
-                .replace('[', "\\[")
-                .replace(']', "\\]"),
-        );
+        for character in anchor.heading.text.chars() {
+            if matches!(character, '\\' | '[' | ']') {
+                output.push('\\');
+            }
+            output.push(character);
+        }
         output.push_str("](#");
         output.push_str(&anchor.id);
         output.push_str(")\n");
@@ -832,13 +1052,11 @@ fn render_html_with_generated(source: &str, dark: bool) -> (String, String, Vec<
 }
 
 fn generated_html_token_prefix(source: &str) -> String {
-    for salt in 0usize.. {
-        let prefix = format!("RUPORA_GENERATED_BLOCK_{salt}_B5C4718D_");
-        if !source.contains(&prefix) {
-            return prefix;
-        }
-    }
-    unreachable!("usize salt space cannot be exhausted")
+    let mut hasher = Sha256::new();
+    hasher.update(b"rupora-generated-html-token-v2\0");
+    hasher.update(source.len().to_le_bytes());
+    hasher.update(source.as_bytes());
+    format!("RUPORA_GENERATED_BLOCK_{:x}_", hasher.finalize())
 }
 
 fn push_generated_html(
@@ -1082,6 +1300,19 @@ mod tests {
     }
 
     #[test]
+    fn computes_many_heading_lines_in_source_order() {
+        let source = (0..8_192)
+            .map(|index| format!("# Heading {index}\n\n"))
+            .collect::<String>();
+
+        let analysis = analyze(&source);
+
+        assert_eq!(analysis.headings.len(), 8_192);
+        assert_eq!(analysis.headings[4_096].line, 8_193);
+        assert_eq!(analysis.headings.last().unwrap().line, 16_383);
+    }
+
+    #[test]
     fn renders_gfm_table_and_task_list() {
         let html = render_html_fragment("| a | b |\n|---|---|\n| 1 | 2 |\n\n- [x] done");
         assert!(html.contains("<table>"));
@@ -1125,6 +1356,37 @@ mod tests {
         let html = render_html_fragment(source);
         assert!(html.contains("href=\"#same-1\""));
         assert!(html.contains("<h2 id=\"same-1\">Same</h2>"));
+    }
+
+    #[test]
+    fn bounds_large_tables_of_contents_and_repeated_expansions() {
+        let anchors = (0..20_000)
+            .map(|index| HeadingAnchor {
+                heading: Heading {
+                    level: 2,
+                    text: format!("A deliberately long heading used for budget testing {index}"),
+                    line: index + 1,
+                },
+                id: format!("budget-heading-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let toc = render_toc_markdown(&anchors);
+        assert!(toc.len() <= MAX_TOC_BYTES);
+        assert!(toc.contains(TOC_TRUNCATED_MARKDOWN.trim()));
+
+        let mut source = "[TOC]\n".repeat(256);
+        for index in 0..1_024 {
+            source.push_str(&format!("# Repeated table heading number {index}\n\n"));
+        }
+        let expanded = expand_front_matter_and_toc(&source);
+        assert!(expanded.contains(TOC_LIMIT_MARKDOWN.trim()));
+        assert!(
+            expanded.len()
+                <= source
+                    .len()
+                    .saturating_add(MAX_TOC_EXPANSION_BYTES)
+                    .saturating_add(TOC_LIMIT_MARKDOWN.len())
+        );
     }
 
     #[test]
@@ -1324,5 +1586,45 @@ mod tests {
         assert_eq!(index.blocks()[2].id, omega);
         assert_ne!(index.blocks()[1].id, alpha);
         assert_ne!(index.blocks()[1].id, omega);
+    }
+
+    #[test]
+    fn large_changed_gaps_preserve_ids_without_cartesian_candidates() {
+        const BLOCK_COUNT: usize = 4_096;
+        let original = (0..BLOCK_COUNT)
+            .map(|index| format!("identity-{index:08}-before"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut index = BlockIndex::new(&original);
+        let original_ids = index
+            .blocks()
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>();
+
+        let mut changed_blocks = Vec::with_capacity(BLOCK_COUNT + 1);
+        changed_blocks.push("entirely-new-leading-block".to_owned());
+        changed_blocks.extend((0..BLOCK_COUNT).map(|block| format!("identity-{block:08}-after")));
+        index.update(&changed_blocks.join("\n\n"));
+
+        let changed_ids = index
+            .blocks()
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>();
+        assert_eq!(changed_ids.len(), BLOCK_COUNT + 1);
+        assert!(!original_ids.contains(&changed_ids[0]));
+        assert_eq!(&changed_ids[1..], original_ids);
+    }
+
+    #[test]
+    fn similarity_scoring_has_a_fixed_comparison_budget() {
+        let common = "x".repeat(100_000);
+        let left = format!("{common}left{common}");
+        let right = format!("{common}right{common}");
+        assert_eq!(
+            similarity_score(&left, &right),
+            MAX_SIMILARITY_CHARS_PER_SIDE * 2
+        );
     }
 }
