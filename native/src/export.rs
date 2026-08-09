@@ -9,8 +9,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::{ImageFormat, ImageReader};
 use printpdf::{
-    Base64OrRaw, GeneratePdfOptions, PdfDocument, PdfParseErrorSeverity, PdfSaveOptions,
-    PdfToSvgOptions, PdfWarnMsg,
+    Base64OrRaw, GeneratePdfOptions, PdfDocument, PdfParseErrorSeverity, PdfParseOptions,
+    PdfSaveOptions, PdfToSvgOptions, PdfWarnMsg,
 };
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
@@ -53,7 +53,27 @@ pub fn render_pdf_with_images(html: &str, images: &LocalImages) -> Result<Vec<u8
 }
 
 pub fn render_pdf_svg_pages(html: &str) -> Result<Vec<String>, String> {
-    let document = create_pdf_document(html, &LocalImages::new())?;
+    // Render the serialized PDF rather than the in-memory document. printpdf's
+    // in-memory SVG path embeds each complete source font, which can turn a
+    // small CJK page into hundreds of MiB when the platform font is a large TTC.
+    // The PDF serializer subsets those fonts first, so parsing the bounded PDF
+    // back also makes this visual-regression helper exercise the real artifact.
+    let pdf = render_pdf(html)?;
+    let mut parse_warnings = Vec::new();
+    let document = PdfDocument::parse(
+        &pdf,
+        &PdfParseOptions {
+            fail_on_error: true,
+        },
+        &mut parse_warnings,
+    )
+    .map_err(|error| format!("无法重新读取生成的 PDF：{error}"))?;
+    reject_pdf_errors("PDF 重新读取", &parse_warnings)?;
+    if document.pages.is_empty() {
+        return Err("重新读取的 PDF 没有任何页面".to_owned());
+    }
+    ensure_pdf_page_count(document.pages.len())?;
+
     let mut warnings = Vec::new();
     let mut pages = Vec::with_capacity(document.pages.len());
     let mut total_svg_bytes = 0usize;
