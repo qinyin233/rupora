@@ -60,11 +60,11 @@ egui_commonmark = { version = "0.24.0", features = [
 ] }
 encoding_rs = "0.8.35"
 fs2 = "0.4.3"
-image = { version = "0.25.9", default-features = false, features = ["png"] }
+image = { version = "0.25.9", default-features = false, features = ["jpeg", "png"] }
 mermaid-svg = "0.7.0"
 open = "5.4.0"
 pathdiff = "0.2.3"
-printpdf = { version = "0.12.5", default-features = false, features = ["html", "svg"] }
+printpdf = { version = "0.12.5", default-features = false, features = ["html", "jpeg", "png", "svg"] }
 pulldown-cmark = "0.13.4"
 ratex-layout = "0.1.14"
 ratex-parser = "0.1.14"

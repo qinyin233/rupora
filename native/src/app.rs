@@ -537,6 +537,14 @@ impl RuporaApp {
 
         let output =
             markdown::render_html_document(&document.content, &document.title(), self.state.dark);
+        let images = match export::load_local_images(&document.content, document.path.as_deref()) {
+            Ok(images) => images,
+            Err(error) => {
+                self.show_error("导出失败", &error);
+                return;
+            }
+        };
+        let output = export::embed_local_images(&output, &images);
         match fs::write(&path, output) {
             Ok(()) => self.status = format!("已导出 HTML：{}", path.display()),
             Err(error) => {
@@ -565,7 +573,14 @@ impl RuporaApp {
         };
         let html =
             markdown::render_html_document(&document.content, &document.title(), self.state.dark);
-        match export::write_pdf(&path, &html) {
+        let images = match export::load_local_images(&document.content, document.path.as_deref()) {
+            Ok(images) => images,
+            Err(error) => {
+                self.show_error("PDF 导出失败", &error);
+                return;
+            }
+        };
+        match export::write_pdf(&path, &html, &images) {
             Ok(()) => self.status = format!("已导出 PDF：{}", path.display()),
             Err(error) => self.show_error("PDF 导出失败", &error),
         }
@@ -578,7 +593,14 @@ impl RuporaApp {
         let document = &self.documents[index];
         let html =
             markdown::render_html_document(&document.content, &document.title(), self.state.dark);
-        match export::print_html(&html) {
+        let images = match export::load_local_images(&document.content, document.path.as_deref()) {
+            Ok(images) => images,
+            Err(error) => {
+                self.show_error("打印失败", &error);
+                return;
+            }
+        };
+        match export::print_html(&html, &images) {
             Ok(path) => self.status = format!("已提交系统打印任务：{}", path.display()),
             Err(error) => self.show_error("打印失败", &error),
         }
@@ -3415,8 +3437,9 @@ mod tests {
                 Arc::from([index as u8]),
             );
         }
-        assert_eq!(cache.len(), 1);
-        assert!(cache.contains_key(&format!("key-{MAX_GENERATED_SVG_CACHE_ENTRIES}")));
+        assert_eq!(cache.len(), MAX_GENERATED_SVG_CACHE_ENTRIES);
+        assert!(cache.contains_key("key-0"));
+        assert!(!cache.contains_key(&format!("key-{MAX_GENERATED_SVG_CACHE_ENTRIES}")));
     }
 
     #[test]
@@ -3434,14 +3457,14 @@ mod tests {
         }
         assert_eq!(cache.len(), 4);
 
-        cache_generated_svg(
+        assert!(!cache_generated_svg(
             &context,
             &mut cache,
             "replacement".to_owned(),
             Arc::from([1]),
-        );
-        assert_eq!(cache.len(), 1);
-        assert!(cache.contains_key("replacement"));
+        ));
+        assert_eq!(cache.len(), 4);
+        assert!(!cache.contains_key("replacement"));
     }
 
     #[test]

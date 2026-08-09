@@ -10,8 +10,15 @@ use pulldown_cmark::{
 };
 
 const MAX_MATH_BYTES: usize = 16 * 1024;
-const MAX_MERMAID_BYTES: usize = 1024 * 1024;
+const MAX_MERMAID_BYTES: usize = 256 * 1024;
+const MAX_MERMAID_LINES: usize = 2_048;
 const MAX_GENERATED_SVG_BYTES: usize = 8 * 1024 * 1024;
+const MAX_GENERATED_SVG_EDGE: f32 = 8_192.0;
+const MAX_GENERATED_SVG_PIXELS: f64 = 16.0 * 1024.0 * 1024.0;
+const MAX_GENERATED_SVG_ASPECT_RATIO: f32 = 512.0;
+const MAX_GENERATED_BLOCKS: usize = 128;
+const MAX_GENERATED_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+const GENERATED_LIMIT_HTML: &str = "<span class=\"diagram-error\">生成内容超过文档资源预算</span>";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MarkdownAnalysis {
@@ -331,9 +338,12 @@ pub fn render_math_svg(source: &str, inline: bool) -> Result<String, String> {
 pub fn render_mermaid_svg(source: &str, dark: bool) -> Result<String, String> {
     if source.len() > MAX_MERMAID_BYTES {
         return Err(format!(
-            "Mermaid 源码超过 {} MiB 渲染上限",
-            MAX_MERMAID_BYTES / 1024 / 1024
+            "Mermaid 源码超过 {} KiB 渲染上限",
+            MAX_MERMAID_BYTES / 1024
         ));
+    }
+    if source.lines().count() > MAX_MERMAID_LINES {
+        return Err(format!("Mermaid 超过 {MAX_MERMAID_LINES} 行渲染上限"));
     }
     let theme = if dark {
         mermaid_svg::Theme::dark()
@@ -345,18 +355,28 @@ pub fn render_mermaid_svg(source: &str, dark: bool) -> Result<String, String> {
 }
 
 pub fn render_html_fragment(source: &str) -> String {
-    let (mut output, generated) = render_html_with_generated(source, false);
+    let (mut output, token_prefix, generated) = render_html_with_generated(source, false);
     output = sanitize_user_html(&output);
-    for (token, svg) in generated {
-        output = output.replace(&token, &svg);
-    }
-    output
+    restore_generated_html(&output, &token_prefix, &generated)
 }
 
 pub fn local_link_destinations(source: &str) -> Vec<String> {
     let mut destinations = Parser::new_ext(source, parser_options())
         .filter_map(|event| match event {
             Event::Start(Tag::Link { dest_url, .. }) => Some(dest_url.into_string()),
+            _ => None,
+        })
+        .filter(|destination| is_local_link(destination))
+        .collect::<Vec<_>>();
+    destinations.sort();
+    destinations.dedup();
+    destinations
+}
+
+pub fn local_image_destinations(source: &str) -> Vec<String> {
+    let mut destinations = Parser::new_ext(source, parser_options())
+        .filter_map(|event| match event {
+            Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.into_string()),
             _ => None,
         })
         .filter(|destination| is_local_link(destination))
@@ -683,11 +703,13 @@ fn yaml_value_text(value: &serde_yaml_ng::Value) -> String {
     }
 }
 
-fn render_html_with_generated(source: &str, dark: bool) -> (String, Vec<(String, String)>) {
+fn render_html_with_generated(source: &str, dark: bool) -> (String, String, Vec<String>) {
     let expanded = expand_front_matter_and_toc(source);
     let anchors = heading_anchors(&expanded);
     let mut heading_index = 0usize;
-    let mut generated = Vec::<(String, String)>::new();
+    let token_prefix = generated_html_token_prefix(&expanded);
+    let mut generated = Vec::<String>::new();
+    let mut generated_bytes = 0usize;
     let mut events = Vec::<Event<'static>>::new();
     let mut parser = Parser::new_ext(&expanded, parser_options()).into_offset_iter();
 
@@ -707,7 +729,12 @@ fn render_html_with_generated(source: &str, dark: bool) -> (String, Vec<(String,
                         _ => {}
                     }
                 }
-                let token = generated_html_token(generated.len());
+                if generated.len() >= MAX_GENERATED_BLOCKS
+                    || generated_bytes >= MAX_GENERATED_DOCUMENT_BYTES
+                {
+                    events.push(Event::Html(CowStr::Borrowed(GENERATED_LIMIT_HTML)));
+                    continue;
+                }
                 let rendered = render_mermaid_svg(&diagram, dark)
                     .and_then(|svg| static_svg_for_html(&svg))
                     .unwrap_or_else(|error| {
@@ -716,11 +743,21 @@ fn render_html_with_generated(source: &str, dark: bool) -> (String, Vec<(String,
                             escape_html(&error)
                         )
                     });
-                generated.push((token.clone(), rendered));
-                events.push(Event::Html(CowStr::Boxed(token.into_boxed_str())));
+                push_generated_html(
+                    &mut events,
+                    &mut generated,
+                    &mut generated_bytes,
+                    &token_prefix,
+                    rendered,
+                );
             }
             Event::InlineMath(math) => {
-                let token = generated_html_token(generated.len());
+                if generated.len() >= MAX_GENERATED_BLOCKS
+                    || generated_bytes >= MAX_GENERATED_DOCUMENT_BYTES
+                {
+                    events.push(Event::Html(CowStr::Borrowed(GENERATED_LIMIT_HTML)));
+                    continue;
+                }
                 let rendered = render_math_svg(&math, true)
                     .and_then(|svg| static_svg_for_html(&svg))
                     .unwrap_or_else(|error| {
@@ -731,11 +768,21 @@ fn render_html_with_generated(source: &str, dark: bool) -> (String, Vec<(String,
                         )
                     });
                 let rendered = format!("<span class=\"math-inline\">{rendered}</span>");
-                generated.push((token.clone(), rendered));
-                events.push(Event::Html(CowStr::Boxed(token.into_boxed_str())));
+                push_generated_html(
+                    &mut events,
+                    &mut generated,
+                    &mut generated_bytes,
+                    &token_prefix,
+                    rendered,
+                );
             }
             Event::DisplayMath(math) => {
-                let token = generated_html_token(generated.len());
+                if generated.len() >= MAX_GENERATED_BLOCKS
+                    || generated_bytes >= MAX_GENERATED_DOCUMENT_BYTES
+                {
+                    events.push(Event::Html(CowStr::Borrowed(GENERATED_LIMIT_HTML)));
+                    continue;
+                }
                 let rendered = render_math_svg(&math, false)
                     .and_then(|svg| static_svg_for_html(&svg))
                     .unwrap_or_else(|error| {
@@ -746,8 +793,13 @@ fn render_html_with_generated(source: &str, dark: bool) -> (String, Vec<(String,
                         )
                     });
                 let rendered = format!("<div class=\"math-display\">{rendered}</div>");
-                generated.push((token.clone(), rendered));
-                events.push(Event::Html(CowStr::Boxed(token.into_boxed_str())));
+                push_generated_html(
+                    &mut events,
+                    &mut generated,
+                    &mut generated_bytes,
+                    &token_prefix,
+                    rendered,
+                );
             }
             Event::Start(Tag::Heading {
                 level,
@@ -776,11 +828,70 @@ fn render_html_with_generated(source: &str, dark: bool) -> (String, Vec<(String,
 
     let mut output = String::new();
     html::push_html(&mut output, events.into_iter());
-    (output, generated)
+    (output, token_prefix, generated)
 }
 
-fn generated_html_token(index: usize) -> String {
-    format!("RUPORA_GENERATED_BLOCK_{index}_B5C4718D")
+fn generated_html_token_prefix(source: &str) -> String {
+    for salt in 0usize.. {
+        let prefix = format!("RUPORA_GENERATED_BLOCK_{salt}_B5C4718D_");
+        if !source.contains(&prefix) {
+            return prefix;
+        }
+    }
+    unreachable!("usize salt space cannot be exhausted")
+}
+
+fn push_generated_html(
+    events: &mut Vec<Event<'static>>,
+    generated: &mut Vec<String>,
+    generated_bytes: &mut usize,
+    token_prefix: &str,
+    rendered: String,
+) {
+    let Some(projected_bytes) = generated_bytes.checked_add(rendered.len()) else {
+        *generated_bytes = MAX_GENERATED_DOCUMENT_BYTES;
+        events.push(Event::Html(CowStr::Borrowed(GENERATED_LIMIT_HTML)));
+        return;
+    };
+    if projected_bytes > MAX_GENERATED_DOCUMENT_BYTES {
+        *generated_bytes = MAX_GENERATED_DOCUMENT_BYTES;
+        events.push(Event::Html(CowStr::Borrowed(GENERATED_LIMIT_HTML)));
+        return;
+    }
+
+    let token = format!("{token_prefix}{}__", generated.len());
+    generated.push(rendered);
+    *generated_bytes = projected_bytes;
+    events.push(Event::Html(CowStr::Boxed(token.into_boxed_str())));
+}
+
+fn restore_generated_html(body: &str, token_prefix: &str, generated: &[String]) -> String {
+    let extra_bytes = generated.iter().map(String::len).sum::<usize>();
+    let mut output = String::with_capacity(body.len().saturating_add(extra_bytes));
+    let mut remaining = body;
+
+    while let Some(start) = remaining.find(token_prefix) {
+        output.push_str(&remaining[..start]);
+        let token_body = &remaining[start + token_prefix.len()..];
+        let Some(end) = token_body.find("__") else {
+            output.push_str(&remaining[start..]);
+            return output;
+        };
+        let Ok(index) = token_body[..end].parse::<usize>() else {
+            output.push_str(token_prefix);
+            remaining = token_body;
+            continue;
+        };
+        let Some(rendered) = generated.get(index) else {
+            output.push_str(token_prefix);
+            remaining = token_body;
+            continue;
+        };
+        output.push_str(rendered);
+        remaining = &token_body[end + 2..];
+    }
+    output.push_str(remaining);
+    output
 }
 
 fn bound_generated_svg(svg: String, kind: &str) -> Result<String, String> {
@@ -790,10 +901,12 @@ fn bound_generated_svg(svg: String, kind: &str) -> Result<String, String> {
             MAX_GENERATED_SVG_BYTES / 1024 / 1024
         ));
     }
+    let tree = parse_generated_svg(&svg)?;
+    validate_generated_svg_size(&tree, kind)?;
     Ok(svg)
 }
 
-fn static_svg_for_html(svg: &str) -> Result<String, String> {
+fn generated_svg_options() -> usvg::Options<'static> {
     static FONT_DATABASE: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
 
     let font_database = FONT_DATABASE.get_or_init(|| {
@@ -811,18 +924,45 @@ fn static_svg_for_html(svg: &str) -> Result<String, String> {
         resolve_data: Box::new(|_, _, _| None),
         resolve_string: Box::new(|_, _| None),
     };
-    let tree = usvg::Tree::from_str(svg, &options)
-        .map_err(|error| format!("无法安全解析生成的 SVG：{error}"))?;
+    options
+}
+
+fn parse_generated_svg(svg: &str) -> Result<usvg::Tree, String> {
+    usvg::Tree::from_str(svg, &generated_svg_options())
+        .map_err(|error| format!("无法安全解析生成的 SVG：{error}"))
+}
+
+fn validate_generated_svg_size(tree: &usvg::Tree, kind: &str) -> Result<(), String> {
+    let size = tree.size();
+    let width = size.width();
+    let height = size.height();
+    let pixels = f64::from(width) * f64::from(height);
+    let aspect_ratio = width.max(height) / width.min(height);
+    if !width.is_finite()
+        || !height.is_finite()
+        || width > MAX_GENERATED_SVG_EDGE
+        || height > MAX_GENERATED_SVG_EDGE
+        || pixels > MAX_GENERATED_SVG_PIXELS
+        || aspect_ratio > MAX_GENERATED_SVG_ASPECT_RATIO
+    {
+        return Err(format!(
+            "{kind} SVG 尺寸 {width:.0}×{height:.0} 超过预览资源上限"
+        ));
+    }
+    Ok(())
+}
+
+fn static_svg_for_html(svg: &str) -> Result<String, String> {
+    let tree = parse_generated_svg(svg)?;
+    validate_generated_svg_size(&tree, "静态")?;
     let static_svg = tree.to_string(&usvg::WriteOptions::default());
     bound_generated_svg(static_svg, "静态")
 }
 
 pub fn render_html_document(source: &str, title: &str, dark: bool) -> String {
-    let (unsafe_body, generated) = render_html_with_generated(source, dark);
-    let mut body = sanitize_user_html(&unsafe_body);
-    for (token, svg) in generated {
-        body = body.replace(&token, &svg);
-    }
+    let (unsafe_body, token_prefix, generated) = render_html_with_generated(source, dark);
+    let sanitized_body = sanitize_user_html(&unsafe_body);
+    let body = restore_generated_html(&sanitized_body, &token_prefix, &generated);
     let (background, foreground, muted, code_background) = if dark {
         ("#111318", "#e8eaf0", "#a8adba", "#20242c")
     } else {
@@ -835,6 +975,7 @@ pub fn render_html_document(source: &str, title: &str, dark: bool) -> String {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'">
   <title>{}</title>
   <style>
     :root {{ color-scheme: {}; }}
@@ -1062,12 +1203,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_generated_svg_with_excessive_geometry() {
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 128 1000000\"><path d=\"M0 0\"/></svg>";
+        let error = bound_generated_svg(svg.to_owned(), "test").unwrap_err();
+        assert!(error.contains("尺寸"));
+    }
+
+    #[test]
+    fn generated_placeholder_text_cannot_expand_user_content() {
+        let marker = "RUPORA_GENERATED_BLOCK_0_B5C4718D_0__";
+        let html = render_html_fragment(&format!("{marker}\n\n$x$"));
+        assert!(html.contains(marker));
+        assert_eq!(html.matches("<svg").count(), 1);
+    }
+
+    #[test]
+    fn caps_generated_blocks_per_document() {
+        let source = std::iter::repeat_n("$x$", MAX_GENERATED_BLOCKS + 2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let html = render_html_fragment(&source);
+        assert!(html.matches("<svg").count() <= MAX_GENERATED_BLOCKS);
+        assert!(html.contains("生成内容超过文档资源预算"));
+    }
+
+    #[test]
     fn collects_only_relative_document_links() {
         let links = local_link_destinations(
             "[local](notes/today.md) [anchor](#part) [web](https://example.com) \
              [mail](mailto:test@example.com) [local anchor](other.md#section)",
         );
         assert_eq!(links, vec!["notes/today.md", "other.md#section"]);
+    }
+
+    #[test]
+    fn collects_only_relative_document_images() {
+        let images = local_image_destinations(
+            "![local](assets/logo.png) ![web](https://example.com/x.png) \
+             ![data](data:image/png;base64,AAAA) ![again](assets/logo.png)",
+        );
+        assert_eq!(images, vec!["assets/logo.png"]);
     }
 
     #[test]

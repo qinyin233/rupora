@@ -23,10 +23,11 @@ pub(crate) fn prepare_native_preview(
         let rendered = if let Some(bytes) = cache.get(&key) {
             Ok(bytes.clone())
         } else {
-            markdown::render_mermaid_svg(&block.source, dark).map(|svg| {
+            markdown::render_mermaid_svg(&block.source, dark).and_then(|svg| {
                 let bytes = Arc::<[u8]>::from(svg.into_bytes());
-                cache_generated_svg(ctx, cache, key.clone(), bytes.clone());
-                bytes
+                cache_generated_svg(ctx, cache, key.clone(), bytes.clone())
+                    .then_some(bytes)
+                    .ok_or_else(|| "图表超过预览缓存资源预算".to_owned())
             })
         };
         let replacement = match rendered {
@@ -61,7 +62,7 @@ pub(crate) fn render_math_widget(
     let rendered = if let Some(bytes) = cache.get(&key) {
         Ok(bytes.clone())
     } else {
-        markdown::render_math_svg(math, inline).map(|mut svg| {
+        markdown::render_math_svg(math, inline).and_then(|mut svg| {
             if dark {
                 svg = svg
                     .replace("rgba(0,0,0,1)", "rgba(232,234,240,1)")
@@ -69,8 +70,9 @@ pub(crate) fn render_math_widget(
                     .replace("rgb(0,0,0)", "rgb(232,234,240)");
             }
             let bytes = Arc::<[u8]>::from(svg.into_bytes());
-            cache_generated_svg(ui.ctx(), cache, key.clone(), bytes.clone());
-            bytes
+            cache_generated_svg(ui.ctx(), cache, key.clone(), bytes.clone())
+                .then_some(bytes)
+                .ok_or_else(|| "公式超过预览缓存资源预算".to_owned())
         })
     };
     match rendered {
@@ -103,13 +105,13 @@ fn generated_svg_key(kind: &str, source: &str, dark: bool) -> String {
 }
 
 pub(crate) fn cache_generated_svg(
-    ctx: &Context,
+    _ctx: &Context,
     cache: &mut HashMap<String, Arc<[u8]>>,
     key: String,
     bytes: Arc<[u8]>,
-) {
+) -> bool {
     if bytes.len() > MAX_GENERATED_SVG_CACHE_BYTES {
-        return;
+        return false;
     }
     let existing_bytes = cache.get(&key).map_or(0, |existing| existing.len());
     let cached_bytes = cache.values().map(|value| value.len()).sum::<usize>();
@@ -119,10 +121,8 @@ pub(crate) fn cache_generated_svg(
     if (cache.len() >= MAX_GENERATED_SVG_CACHE_ENTRIES && !cache.contains_key(&key))
         || projected_bytes > MAX_GENERATED_SVG_CACHE_BYTES
     {
-        for cached_key in cache.keys() {
-            ctx.forget_image(&format!("bytes://rupora/{cached_key}.svg"));
-        }
-        cache.clear();
+        return false;
     }
     cache.insert(key, bytes);
+    true
 }
