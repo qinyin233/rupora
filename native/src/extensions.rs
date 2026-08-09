@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 #[cfg(windows)]
+use std::os::windows::io::AsRawHandle as _;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -228,9 +230,17 @@ fn run_process(service: &ExtensionService, request: &[u8]) -> Result<Vec<u8>, St
             command.env(variable, value);
         }
     }
+    #[cfg(windows)]
+    let process_job =
+        WindowsProcessJob::new().map_err(|error| format!("无法创建扩展进程作业：{error}"))?;
     let mut child = command
         .spawn()
         .map_err(|error| format!("无法启动扩展“{}”：{error}", service.name))?;
+    #[cfg(windows)]
+    if let Err(error) = process_job.assign(&child) {
+        terminate_process_tree(&mut child);
+        return Err(format!("无法约束扩展“{}”的进程树：{error}", service.name));
+    }
     let mut stdin = child
         .stdin
         .take()
@@ -320,6 +330,118 @@ fn configure_process_group(command: &mut Command) {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+#[cfg(windows)]
+struct WindowsProcessJob(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl WindowsProcessJob {
+    fn new() -> std::io::Result<Self> {
+        const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+        const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+
+        let handle = unsafe { create_job_object_w(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let job = Self(handle);
+        let mut limits = JobObjectExtendedLimitInformation::default();
+        limits.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            set_information_job_object(
+                job.0,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                (&raw const limits).cast(),
+                std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+            )
+        };
+        if configured == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(job)
+    }
+
+    fn assign(&self, child: &std::process::Child) -> std::io::Result<()> {
+        let assigned = unsafe { assign_process_to_job_object(self.0, child.as_raw_handle()) };
+        if assigned == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsProcessJob {
+    fn drop(&mut self) {
+        unsafe {
+            close_handle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+#[repr(C)]
+struct JobObjectBasicLimitInformation {
+    per_process_user_time_limit: i64,
+    per_job_user_time_limit: i64,
+    limit_flags: u32,
+    minimum_working_set_size: usize,
+    maximum_working_set_size: usize,
+    active_process_limit: u32,
+    affinity: usize,
+    priority_class: u32,
+    scheduling_class: u32,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+#[repr(C)]
+struct IoCounters {
+    read_operation_count: u64,
+    write_operation_count: u64,
+    other_operation_count: u64,
+    read_transfer_count: u64,
+    write_transfer_count: u64,
+    other_transfer_count: u64,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+#[repr(C)]
+struct JobObjectExtendedLimitInformation {
+    basic_limit_information: JobObjectBasicLimitInformation,
+    io_info: IoCounters,
+    process_memory_limit: usize,
+    job_memory_limit: usize,
+    peak_process_memory_used: usize,
+    peak_job_memory_used: usize,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "CreateJobObjectW"]
+    fn create_job_object_w(
+        job_attributes: *const std::ffi::c_void,
+        name: *const u16,
+    ) -> *mut std::ffi::c_void;
+    #[link_name = "SetInformationJobObject"]
+    fn set_information_job_object(
+        job: *mut std::ffi::c_void,
+        information_class: i32,
+        information: *const std::ffi::c_void,
+        information_length: u32,
+    ) -> i32;
+    #[link_name = "AssignProcessToJobObject"]
+    fn assign_process_to_job_object(
+        job: *mut std::ffi::c_void,
+        process: *mut std::ffi::c_void,
+    ) -> i32;
+    #[link_name = "CloseHandle"]
+    fn close_handle(handle: *mut std::ffi::c_void) -> i32;
 }
 
 #[cfg(unix)]
