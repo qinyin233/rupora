@@ -60,7 +60,7 @@ pub fn render_pdf_svg_pages(html: &str) -> Result<Vec<String>, String> {
     // back also makes this visual-regression helper exercise the real artifact.
     let pdf = render_pdf(html)?;
     let mut parse_warnings = Vec::new();
-    let document = PdfDocument::parse(
+    let mut document = PdfDocument::parse(
         &pdf,
         &PdfParseOptions {
             fail_on_error: true,
@@ -73,6 +73,13 @@ pub fn render_pdf_svg_pages(html: &str) -> Result<Vec<String>, String> {
         return Err("重新读取的 PDF 没有任何页面".to_owned());
     }
     ensure_pdf_page_count(document.pages.len())?;
+    // Parsed PDF font programs are already subsets. printpdf currently marks
+    // them as requiring another subset pass; that second pass fails for valid
+    // PDF subsets that omit optional sfnt tables such as `post`. Treating the
+    // parsed programs as final also keeps the SVG font payload bounded.
+    for font in document.resources.fonts.map.values_mut() {
+        font.meta.requires_subsetting = false;
+    }
 
     let mut warnings = Vec::new();
     let mut pages = Vec::with_capacity(document.pages.len());
