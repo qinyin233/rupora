@@ -1,5 +1,6 @@
 use std::{
     env, fs,
+    io::Read as _,
     path::{Path, PathBuf},
 };
 
@@ -8,6 +9,8 @@ use rupora::updater::{
     derive_verifying_key, sign_manifest,
 };
 use sha2::{Digest as _, Sha256};
+
+const MAX_RELEASE_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let [version, target, artifact_directory, output] =
@@ -19,8 +22,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signing_key = env::var("RUPORA_UPDATE_SIGNING_KEY")
         .map_err(|_| "RUPORA_UPDATE_SIGNING_KEY is not configured".to_owned())
         .and_then(|value| decode_signing_key(&value))?;
-    let expected_public_key = env::var("RUPORA_UPDATE_PUBLIC_KEY")
-        .map_err(|_| "RUPORA_UPDATE_PUBLIC_KEY is not configured".to_owned())
+    let expected_public_key = env::var("RUPORA_EXPECTED_SIGNING_PUBLIC_KEY")
+        .or_else(|_| env::var("RUPORA_UPDATE_PUBLIC_KEY"))
+        .map_err(|_| "RUPORA_EXPECTED_SIGNING_PUBLIC_KEY is not configured".to_owned())
         .and_then(|value| decode_verifying_key(&value))?;
     if derive_verifying_key(&signing_key) != expected_public_key {
         return Err("update signing and verification keys do not match".into());
@@ -44,12 +48,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn collect_artifacts(directory: &Path, tag: &str) -> Result<Vec<UpdateArtifact>, String> {
-    let mut paths = fs::read_dir(directory)
+    let mut paths = Vec::new();
+    for result in fs::read_dir(directory)
         .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && is_package(path))
-        .collect::<Vec<_>>();
+    {
+        let entry =
+            result.map_err(|error| format!("cannot enumerate {}: {error}", directory.display()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
+        let path = entry.path();
+        if file_type.is_file() && is_package(&path) {
+            paths.push(path);
+        }
+    }
     paths.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
     if paths.is_empty() {
         return Err(format!("no packages found in {}", directory.display()));
@@ -69,16 +81,66 @@ fn collect_artifacts(directory: &Path, tag: &str) -> Result<Vec<UpdateArtifact>,
             {
                 return Err(format!("artifact name is not URL-safe: {name}"));
             }
-            let bytes = fs::read(&path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            let (sha256, size) = hash_artifact(&path)?;
             Ok(UpdateArtifact {
                 url: format!("https://github.com/qinyin233/rupora/releases/download/{tag}/{name}"),
                 name,
-                sha256: format!("{:x}", Sha256::digest(&bytes)),
-                size: bytes.len() as u64,
+                sha256,
+                size,
             })
         })
         .collect()
+}
+
+fn hash_artifact(path: &Path) -> Result<(String, u64), String> {
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(format!(
+            "release artifact is not a non-empty regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_RELEASE_ARTIFACT_BYTES {
+        return Err(format!(
+            "release artifact exceeds the {} MiB limit: {}",
+            MAX_RELEASE_ARTIFACT_BYTES / 1024 / 1024,
+            path.display()
+        ));
+    }
+
+    let mut digest = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .filter(|total| *total <= MAX_RELEASE_ARTIFACT_BYTES)
+            .ok_or_else(|| {
+                format!(
+                    "release artifact grew beyond the {} MiB limit: {}",
+                    MAX_RELEASE_ARTIFACT_BYTES / 1024 / 1024,
+                    path.display()
+                )
+            })?;
+        digest.update(&buffer[..read]);
+    }
+    if total != metadata.len() {
+        return Err(format!(
+            "release artifact changed while hashing: {}",
+            path.display()
+        ));
+    }
+    Ok((format!("{:x}", digest.finalize()), total))
 }
 
 fn is_package(path: &Path) -> bool {
@@ -134,5 +196,18 @@ mod tests {
                 .ends_with("/releases/download/v2.1.0/a.msi")
         );
         assert_eq!(artifacts[0].size, 9);
+    }
+
+    #[test]
+    fn rejects_oversized_artifacts_before_reading_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.exe");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_RELEASE_ARTIFACT_BYTES + 1)
+            .unwrap();
+
+        let error = collect_artifacts(directory.path(), "v2.1.0").unwrap_err();
+        assert!(error.contains("exceeds"));
     }
 }
