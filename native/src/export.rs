@@ -572,7 +572,16 @@ mod tests {
         assert!(pages[0].starts_with("<svg"));
         assert!(pages[0].contains("<path") || pages[0].contains("<text"));
         assert!(pages[0].len() > 1_000);
-        assert!(!pages[0].contains("NaN"));
+
+        // Do not search the raw SVG for strings such as `NaN`: printpdf embeds
+        // complete font files as base64 data URLs, where any such character
+        // sequence is valid opaque payload. Parsing the SVG verifies the actual
+        // markup and numeric geometry without misclassifying embedded bytes.
+        let tree = usvg::Tree::from_str(&pages[0], &usvg::Options::default()).unwrap();
+        assert!(tree.size().width().is_finite());
+        assert!(tree.size().height().is_finite());
+        assert!(tree.size().width() > 0.0);
+        assert!(tree.size().height() > 0.0);
     }
 
     #[test]

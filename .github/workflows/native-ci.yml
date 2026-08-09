@@ -20,7 +20,9 @@ jobs:
         os: [windows-latest, ubuntu-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -51,7 +53,9 @@ jobs:
     name: Security and performance gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install Linux build dependencies
         run: |
@@ -67,20 +71,17 @@ jobs:
       - name: Enforce large-document performance budgets
         run: cargo run --release --locked --example perf_guard
 
-      - name: Check advisories, licenses, bans and dependency sources
+      - name: Check RustSec advisories, licenses, bans and dependency sources
         uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
-
-      - name: Audit RustSec vulnerabilities
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
   fuzz-build:
     name: Build fuzz targets
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install Linux build dependencies
         run: |

@@ -32,7 +32,7 @@ RUPORA 2 已完成从 WebView/Vditor 外壳到原生 Rust 编辑器的八个优�
 - Criterion 基准与可执行的大文档性能预算。
 - 单元测试、Proptest 属性测试、保存故障注入。
 - Markdown 与表格双 fuzz 目标，定时 nightly 构建。
-- 严格 Clippy、三平台 CI、RustSec 与 cargo-deny 门禁。
+- 严格 Clippy、三平台 CI，以及包含 RustSec advisory 检查的 cargo-deny 门禁。
 
 ## P5：桌面产品化
 

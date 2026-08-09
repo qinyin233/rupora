@@ -80,7 +80,7 @@ stdin/stdout 发送一次 JSON 请求。正文、路径和全文替换分别受�
 - `build.rs` 在 Windows 可执行文件中嵌入 ICO 和产品元数据。
 - `cargo-packager` 从 Cargo 元数据读取名称、标识符、图标、许可证和文件关联。
 - 三平台 CI 执行格式、单元/属性测试、Clippy 和 release 构建；定时任务编译 fuzz 目标。
-- `cargo-deny` 与 RustSec 阻断漏洞、未知来源和未允许许可证。
+- `cargo-deny` 的 RustSec advisory 检查阻断漏洞，并同时拦截未知来源和未允许许可证。
 - `v2.*` 标签在 Windows、Linux、macOS 的 x86_64/ARM64 原生 runner 上构建安装包，并附加
   SHA-256、CycloneDX SBOM 和 GitHub OIDC 构建来源证明。
 - 更新检查只信任 target 匹配的 Ed25519 签名清单；清单把版本、架构、产物 URL、长度和

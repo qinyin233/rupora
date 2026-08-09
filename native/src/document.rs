@@ -1263,11 +1263,12 @@ mod tests {
         let original_path = directory.path().join("original.md");
         fs::write(&original_path, "content").unwrap();
         let mut document = Document::open(&original_path).unwrap();
+        let opened_path = document.path.clone();
 
         let invalid_target = directory.path().join("target-directory");
         fs::create_dir(&invalid_target).unwrap();
         assert!(document.save_as(invalid_target, true).is_err());
-        assert_eq!(document.path.as_deref(), Some(original_path.as_path()));
+        assert_eq!(document.path, opened_path);
     }
 
     #[test]
@@ -1520,10 +1521,11 @@ mod tests {
 
         fs::rename(&original, &moved).unwrap();
         fs::write(&moved, "local target\nmiddle\nexternal edit\n").unwrap();
+        let canonical_moved = canonical_document_path(&moved).unwrap();
         let conflicts = document.relink_external(moved.clone()).unwrap();
 
         assert_eq!(conflicts, 0);
-        assert_eq!(document.path.as_deref(), Some(moved.as_path()));
+        assert_eq!(document.path.as_deref(), Some(canonical_moved.as_path()));
         assert_eq!(document.content, "local edit\nmiddle\nexternal edit\n");
         assert!(document.dirty);
         assert!(!document.has_external_changes().unwrap());
@@ -1544,7 +1546,8 @@ mod tests {
         let mut document = Document::open(&original).unwrap();
 
         document.relink_external(link.clone()).unwrap();
-        assert_eq!(document.path.as_deref(), Some(target.as_path()));
+        let canonical_target = canonical_document_path(&target).unwrap();
+        assert_eq!(document.path.as_deref(), Some(canonical_target.as_path()));
         assert!(
             Document::open(&target)
                 .unwrap_err()
