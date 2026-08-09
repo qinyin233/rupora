@@ -66,14 +66,11 @@ impl InstanceCoordinator {
             .map_err(|error| format!("cannot open instance lock: {error}"))?;
 
         match lock.try_lock_exclusive() {
-            Ok(()) => {
-                clear_stale_inbox(&inbox_path)?;
-                Ok(InstanceRole::Primary(Self {
-                    _lock: lock,
-                    inbox_path,
-                    last_poll: Instant::now() - POLL_INTERVAL,
-                }))
-            }
+            Ok(()) => Ok(InstanceRole::Primary(Self {
+                _lock: lock,
+                inbox_path,
+                last_poll: Instant::now() - POLL_INTERVAL,
+            })),
             Err(error) if is_lock_contended(&error) => {
                 forward_request(&inbox_path, paths)?;
                 Ok(InstanceRole::Secondary)
@@ -106,9 +103,9 @@ impl InstanceCoordinator {
             return Err("instance request inbox exceeded its safety limit".to_owned());
         }
 
-        let mut contents = String::new();
+        let mut contents = Vec::with_capacity(length as usize);
         inbox
-            .read_to_string(&mut contents)
+            .read_to_end(&mut contents)
             .map_err(|error| format!("cannot read instance inbox: {error}"))?;
         inbox
             .set_len(0)
@@ -116,17 +113,19 @@ impl InstanceCoordinator {
             .map_err(|error| format!("cannot clear instance inbox: {error}"))?;
         FileExt::unlock(&inbox).ok();
 
-        if contents.trim().is_empty() {
-            return Ok(None);
-        }
-
         let mut paths = Vec::new();
-        for line in contents.lines() {
-            let request: WireRequest = serde_json::from_str(line)
-                .map_err(|error| format!("invalid instance request: {error}"))?;
+        let mut found_request = false;
+        for line in contents.split(|byte| *byte == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let Ok(request) = serde_json::from_slice::<WireRequest>(line) else {
+                continue;
+            };
             if request.version != REQUEST_VERSION {
                 continue;
             }
+            found_request = true;
             paths.extend(
                 request
                     .paths
@@ -137,7 +136,7 @@ impl InstanceCoordinator {
                 break;
             }
         }
-        Ok(Some(OpenRequest { paths }))
+        Ok(found_request.then_some(OpenRequest { paths }))
     }
 }
 
@@ -149,19 +148,16 @@ fn is_lock_contended(error: &std::io::Error) -> bool {
     expected.is_some() && error.raw_os_error() == expected
 }
 
-fn clear_stale_inbox(path: &Path) -> Result<(), String> {
-    let inbox = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|error| format!("cannot clear stale instance inbox: {error}"))?;
-    inbox
-        .sync_all()
-        .map_err(|error| format!("cannot sync instance inbox: {error}"))
-}
-
 fn forward_request(path: &Path, paths: &[PathBuf]) -> Result<(), String> {
+    let paths = absolute_forwarded_paths(paths)?;
+    let request = WireRequest {
+        version: REQUEST_VERSION,
+        paths,
+    };
+    let mut encoded = serde_json::to_vec(&request)
+        .map_err(|error| format!("cannot serialize instance request: {error}"))?;
+    encoded.push(b'\n');
+
     let mut inbox = OpenOptions::new()
         .create(true)
         .read(true)
@@ -171,29 +167,60 @@ fn forward_request(path: &Path, paths: &[PathBuf]) -> Result<(), String> {
     inbox
         .lock_exclusive()
         .map_err(|error| format!("cannot lock instance inbox: {error}"))?;
-    if inbox
+    let old_length = inbox
         .metadata()
         .map_err(|error| format!("cannot inspect instance inbox: {error}"))?
-        .len()
-        > MAX_INBOX_BYTES
-    {
+        .len();
+
+    let needs_separator = if old_length == 0 {
+        false
+    } else {
         inbox
-            .set_len(0)
-            .map_err(|error| format!("cannot reset instance inbox: {error}"))?;
+            .seek(SeekFrom::End(-1))
+            .and_then(|_| {
+                let mut last = [0];
+                inbox.read_exact(&mut last).map(|()| last[0] != b'\n')
+            })
+            .map_err(|error| format!("cannot inspect instance inbox ending: {error}"))?
+    };
+
+    let added_length = u64::try_from(encoded.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::from(needs_separator));
+    if old_length.saturating_add(added_length) > MAX_INBOX_BYTES {
+        return Err("instance request inbox exceeded its safety limit".to_owned());
     }
 
-    let request = WireRequest {
-        version: REQUEST_VERSION,
-        paths: paths.iter().take(MAX_PATHS_PER_REQUEST).cloned().collect(),
-    };
-    serde_json::to_writer(&mut inbox, &request)
-        .map_err(|error| format!("cannot serialize instance request: {error}"))?;
+    if needs_separator {
+        inbox
+            .write_all(b"\n")
+            .map_err(|error| format!("cannot separate partial instance request: {error}"))?;
+    }
     inbox
-        .write_all(b"\n")
+        .write_all(&encoded)
         .and_then(|()| inbox.sync_data())
         .map_err(|error| format!("cannot forward instance request: {error}"))?;
     FileExt::unlock(&inbox).ok();
     Ok(())
+}
+
+fn absolute_forwarded_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let paths = paths.iter().take(MAX_PATHS_PER_REQUEST);
+    let current_directory = if paths.clone().any(|path| path.is_relative()) {
+        Some(
+            std::env::current_dir()
+                .map_err(|error| format!("cannot resolve forwarded file paths: {error}"))?,
+        )
+    } else {
+        None
+    };
+
+    Ok(paths
+        .map(|path| match &current_directory {
+            Some(directory) if path.is_relative() => directory.join(path),
+            _ => path.clone(),
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -218,7 +245,15 @@ mod tests {
         primary.last_poll = Instant::now() - POLL_INTERVAL;
         let request = primary.poll().expect("poll request").expect("request");
 
-        assert_eq!(request.paths, expected);
+        let current_directory = std::env::current_dir().expect("current directory");
+        assert_eq!(
+            request.paths,
+            expected
+                .iter()
+                .map(|path| current_directory.join(path))
+                .collect::<Vec<_>>()
+        );
+        assert!(request.paths.iter().all(|path| path.is_absolute()));
     }
 
     #[test]
@@ -238,5 +273,81 @@ mod tests {
             primary.poll().expect("poll request"),
             Some(OpenRequest::default())
         );
+    }
+
+    #[test]
+    fn preserves_requests_that_existed_when_the_primary_started() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let inbox_path = directory.path().join("open-requests.jsonl");
+        let expected = directory.path().join("pending.md");
+        let mut encoded = serde_json::to_vec(&WireRequest {
+            version: REQUEST_VERSION,
+            paths: vec![expected.clone()],
+        })
+        .expect("serialize request");
+        encoded.push(b'\n');
+        fs::write(&inbox_path, encoded).expect("write pending request");
+
+        let mut primary = match InstanceCoordinator::acquire_at(directory.path(), &[])
+            .expect("acquire primary")
+        {
+            InstanceRole::Primary(primary) => primary,
+            InstanceRole::Secondary => panic!("first instance must be primary"),
+        };
+        primary.last_poll = Instant::now() - POLL_INTERVAL;
+
+        assert_eq!(
+            primary.poll().expect("poll pending request"),
+            Some(OpenRequest {
+                paths: vec![expected]
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_and_partial_lines_do_not_poison_later_requests() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let mut primary = match InstanceCoordinator::acquire_at(directory.path(), &[])
+            .expect("acquire primary")
+        {
+            InstanceRole::Primary(primary) => primary,
+            InstanceRole::Secondary => panic!("first instance must be primary"),
+        };
+        fs::write(
+            &primary.inbox_path,
+            b"not JSON\n{\"version\":1,\"paths\":[\"unfinished",
+        )
+        .expect("write damaged inbox");
+
+        let relative = PathBuf::from("forwarded-after-damage.md");
+        assert!(matches!(
+            InstanceCoordinator::acquire_at(directory.path(), std::slice::from_ref(&relative))
+                .expect("forward request after partial line"),
+            InstanceRole::Secondary
+        ));
+        primary.last_poll = Instant::now() - POLL_INTERVAL;
+
+        let request = primary.poll().expect("poll request").expect("request");
+        assert_eq!(
+            request.paths,
+            vec![
+                std::env::current_dir()
+                    .expect("current directory")
+                    .join(relative)
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_a_request_when_existing_and_new_bytes_exceed_the_limit() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let inbox_path = directory.path().join("open-requests.jsonl");
+        let original = vec![b'x'; MAX_INBOX_BYTES as usize - 1];
+        fs::write(&inbox_path, &original).expect("fill inbox");
+
+        let error = forward_request(&inbox_path, &[]).expect_err("inbox must remain bounded");
+
+        assert!(error.contains("safety limit"));
+        assert_eq!(fs::read(inbox_path).expect("read inbox"), original);
     }
 }
