@@ -293,7 +293,7 @@ fn run_process(service: &ExtensionService, request: &[u8]) -> Result<Vec<u8>, St
         .map_err(|error| format!("无法启动扩展“{}”：{error}", service.name))?;
     #[cfg(windows)]
     if let Err(error) = process_job.assign(&child) {
-        terminate_process_tree(&mut child);
+        terminate_unmanaged_process_tree(&mut child);
         return Err(format!("无法约束扩展“{}”的进程树：{error}", service.name));
     }
     let mut stdin = child
@@ -514,6 +514,15 @@ fn terminate_process_tree(child: &mut std::process::Child) {
 
 #[cfg(windows)]
 fn terminate_process_tree(child: &mut std::process::Child) {
+    // The child is already assigned to a kill-on-close Job Object. Terminating
+    // the root directly keeps the configured timeout prompt; dropping the job
+    // as run_process returns then terminates every remaining descendant.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(windows)]
+fn terminate_unmanaged_process_tree(child: &mut std::process::Child) {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let taskkill = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
@@ -668,6 +677,14 @@ const fn default_output_bytes() -> usize {
 mod tests {
     use super::*;
 
+    static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_process_tests() -> std::sync::MutexGuard<'static, ()> {
+        PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn service(permissions: &[ExtensionPermission]) -> ExtensionService {
         ExtensionService {
             name: "test".to_owned(),
@@ -801,8 +818,9 @@ mod tests {
 
     #[test]
     fn executes_a_json_service_without_a_shell_wrapper() {
+        let _guard = lock_process_tests();
         let response = r#"{"protocol":1,"requestId":42,"result":{"message":"ok"}}"#;
-        let extension = platform_service(response, false);
+        let (extension, _fixture) = platform_service(response, false);
 
         let bytes = run_process(&extension, b"{}").unwrap();
         let invocation = validate_response(&extension, 42, &bytes).unwrap();
@@ -811,7 +829,8 @@ mod tests {
 
     #[test]
     fn terminates_a_service_that_exceeds_its_deadline() {
-        let extension = platform_service("", true);
+        let _guard = lock_process_tests();
+        let (extension, _fixture) = platform_service("", true);
         let started = Instant::now();
 
         let error = run_process(&extension, b"{}").unwrap_err();
@@ -822,6 +841,7 @@ mod tests {
 
     #[test]
     fn timeout_terminates_descendant_processes() {
+        let _guard = lock_process_tests();
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("descendant-survived");
         let extension = descendant_service(&marker);
@@ -885,34 +905,41 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn platform_service(response: &str, hangs: bool) -> ExtensionService {
-        let program = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-        let command = if hangs {
-            "$null=[Console]::In.ReadLine(); while ($true) {} ".to_owned()
+    fn platform_service(
+        response: &str,
+        hangs: bool,
+    ) -> (ExtensionService, Option<tempfile::TempPath>) {
+        let mut script = tempfile::Builder::new().suffix(".cmd").tempfile().unwrap();
+        let contents = if hangs {
+            "@echo off\r\nset /p input=\r\n%SystemRoot%\\System32\\ping.exe -t 127.0.0.1 >nul\r\n"
+                .to_owned()
         } else {
-            format!(
-                "$null=[Console]::In.ReadLine(); [Console]::Out.Write('{}')",
-                response.replace('\'', "''")
-            )
+            format!("@echo off\r\nset /p input=\r\n<nul set /p ={response}\r\nexit /b 0\r\n")
         };
-        ExtensionService {
+        script.write_all(contents.as_bytes()).unwrap();
+        let script = script.into_temp_path();
+        let service = ExtensionService {
             name: "process-test".to_owned(),
-            program,
+            program: PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join(r"System32\cmd.exe"),
             args: vec![
-                "-NoProfile".to_owned(),
-                "-NonInteractive".to_owned(),
-                "-Command".to_owned(),
-                command,
+                "/D".to_owned(),
+                "/Q".to_owned(),
+                "/C".to_owned(),
+                script.to_string_lossy().into_owned(),
             ],
             permissions: [ExtensionPermission::ReadDocument].into_iter().collect(),
             timeout_ms: if hangs { 100 } else { 5_000 },
             max_output_bytes: 4_096,
-        }
+        };
+        (service, Some(script))
     }
 
     #[cfg(unix)]
-    fn platform_service(response: &str, hangs: bool) -> ExtensionService {
+    fn platform_service(
+        response: &str,
+        hangs: bool,
+    ) -> (ExtensionService, Option<tempfile::TempPath>) {
         let command = if hangs {
             "IFS= read -r input; while :; do :; done".to_owned()
         } else {
@@ -921,13 +948,14 @@ mod tests {
                 response.replace('\'', "'\\''")
             )
         };
-        ExtensionService {
+        let service = ExtensionService {
             name: "process-test".to_owned(),
             program: PathBuf::from("/bin/sh"),
             args: vec!["-c".to_owned(), command],
             permissions: [ExtensionPermission::ReadDocument].into_iter().collect(),
             timeout_ms: if hangs { 100 } else { 5_000 },
             max_output_bytes: 4_096,
-        }
+        };
+        (service, None)
     }
 }

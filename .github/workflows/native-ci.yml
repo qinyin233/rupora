@@ -95,8 +95,10 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --version '=0.13.2' --locked
 
       - name: Build fuzz targets
         working-directory: fuzz
-        run: cargo fuzz build --locked
+        run: |
+          cargo fuzz build
+          git -C .. diff --exit-code -- fuzz/Cargo.lock
