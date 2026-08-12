@@ -50,6 +50,9 @@ const APP_STATE_KEY: &str = "rupora-native-state";
 const UI_EXPERIENCE_KEY: &str = "rupora-native-ui-experience";
 const CURRENT_UI_EXPERIENCE: u32 = 3;
 const WYSIWYG_STRONG_FAMILY: &str = "rupora-wysiwyg-strong";
+const WYSIWYG_BODY_LINE_HEIGHT: f32 = 27.0;
+const WYSIWYG_INLINE_CODE_LINE_HEIGHT: f32 = 20.0;
+const WYSIWYG_INLINE_CODE_VERTICAL_PADDING: f32 = 2.0;
 
 #[derive(Clone, Copy)]
 struct AppPalette {
@@ -3250,12 +3253,42 @@ impl RuporaApp {
                                         let gap =
                                             blocks[block_index - 1].range.end..block.range.start;
                                         let blank_lines =
-                                            extra_inter_block_blank_lines(&source, gap);
+                                            extra_inter_block_blank_lines(&source, gap.clone());
                                         if blank_lines > 0 {
                                             let line_height = ui
                                                 .text_style_height(&egui::TextStyle::Body)
                                                 .max(1.0);
-                                            ui.add_space(blank_lines as f32 * line_height);
+                                            let response = ui
+                                                .allocate_response(
+                                                    Vec2::new(
+                                                        ui.available_width(),
+                                                        blank_lines as f32 * line_height,
+                                                    ),
+                                                    egui::Sense::click(),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::Text)
+                                                .on_hover_text("点击编辑段落之间的空行");
+                                            if response.clicked()
+                                                && let Some(position) =
+                                                    response.interact_pointer_pos()
+                                            {
+                                                let line = ((position.y - response.rect.top())
+                                                    / line_height)
+                                                    .floor()
+                                                    as usize;
+                                                if let Some(cursor_byte) =
+                                                    inter_block_blank_line_cursor_byte(
+                                                        &source,
+                                                        gap,
+                                                        line.min(blank_lines - 1),
+                                                    )
+                                                {
+                                                    activate = Some((
+                                                        blocks[block_index - 1].id,
+                                                        cursor_byte,
+                                                    ));
+                                                }
+                                            }
                                         }
                                     }
                                     ui.push_id(("hybrid-block", block.id), |ui| {
@@ -4328,6 +4361,16 @@ fn block_for_char_index<'a>(
             (block.range.start..block.range.end).contains(&byte_index)
                 || (block.range.is_empty() && block.range.start == byte_index)
         })
+        // Inter-block whitespace belongs to the preceding block's editable
+        // range. Keeping the cursor there prevents a queued blank-line click
+        // from being clamped to the beginning of the following paragraph on
+        // the next frame. An exact next-block start was handled above.
+        .or_else(|| {
+            blocks
+                .iter()
+                .rev()
+                .find(|block| block.range.start < byte_index)
+        })
         .or_else(|| blocks.iter().find(|block| block.range.start >= byte_index))
         .unwrap_or_else(|| blocks.last().expect("Markdown always has an editing block"))
 }
@@ -4450,10 +4493,63 @@ fn multiline_edit_rows(source: &str) -> usize {
 }
 
 fn extra_inter_block_blank_lines(source: &str, gap: std::ops::Range<usize>) -> usize {
-    source
-        .get(gap)
-        .map_or(0, |gap| gap.bytes().filter(|byte| *byte == b'\n').count())
-        .saturating_sub(2)
+    line_break_count(source, gap).saturating_sub(2)
+}
+
+fn inter_block_blank_line_cursor_byte(
+    source: &str,
+    gap: std::ops::Range<usize>,
+    blank_line: usize,
+) -> Option<usize> {
+    // Two line breaks are the normal Markdown paragraph separator. Each
+    // additional visible blank row starts after the second, third, … break.
+    nth_line_break_end(source, gap, blank_line.saturating_add(1))
+}
+
+fn line_break_count(source: &str, range: std::ops::Range<usize>) -> usize {
+    let Some(fragment) = source.get(range) else {
+        return 0;
+    };
+    let bytes = fragment.as_bytes();
+    let mut cursor = 0usize;
+    let mut count = 0usize;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\r' => {
+                cursor += usize::from(bytes.get(cursor + 1) == Some(&b'\n')) + 1;
+                count += 1;
+            }
+            b'\n' => {
+                cursor += 1;
+                count += 1;
+            }
+            _ => cursor += 1,
+        }
+    }
+    count
+}
+
+fn nth_line_break_end(source: &str, range: std::ops::Range<usize>, target: usize) -> Option<usize> {
+    let fragment = source.get(range.clone())?;
+    let bytes = fragment.as_bytes();
+    let mut cursor = 0usize;
+    let mut index = 0usize;
+    while cursor < bytes.len() {
+        let length = match bytes[cursor] {
+            b'\r' if bytes.get(cursor + 1) == Some(&b'\n') => 2,
+            b'\r' | b'\n' => 1,
+            _ => {
+                cursor += 1;
+                continue;
+            }
+        };
+        cursor += length;
+        if index == target {
+            return Some(range.start + cursor);
+        }
+        index += 1;
+    }
+    None
 }
 
 fn wysiwyg_layout(
@@ -4508,9 +4604,6 @@ fn rounded_inline_code_backgrounds(
 
     for placed_row in &galley.rows {
         let row_offset = galley_pos.to_vec2() + placed_row.pos.to_vec2();
-        let row_rect = placed_row.rect().translate(galley_pos.to_vec2());
-        let chip_top = row_rect.top() + 2.0;
-        let chip_bottom = row_rect.bottom() - 2.0;
         let mut chip_rect = None;
         for glyph in &placed_row.glyphs {
             while runs
@@ -4523,15 +4616,7 @@ fn rounded_inline_code_backgrounds(
                 run.range.contains(&char_index) && run.style.code && !run.style.marker
             });
             if is_inline_code {
-                let glyph_rect = glyph.logical_rect().translate(row_offset);
-                // Font ascent differs between the proportional body font and
-                // the monospace code font. Basing the chip vertically on the
-                // glyph rectangle makes one side look heavier. Use the row's
-                // center instead, leaving equal space above and below.
-                let rect = egui::Rect::from_min_max(
-                    egui::pos2(glyph_rect.left(), chip_top),
-                    egui::pos2(glyph_rect.right(), chip_bottom),
-                );
+                let rect = glyph.logical_rect().translate(row_offset);
                 chip_rect = Some(chip_rect.map_or(rect, |current: egui::Rect| current.union(rect)));
             } else {
                 push_inline_code_background(&mut shapes, chip_rect.take(), palette);
@@ -4604,7 +4689,7 @@ fn push_inline_code_background(
     let Some(rect) = rect else {
         return;
     };
-    let rect = rect.expand2(Vec2::new(3.0, 0.0));
+    let rect = rect.expand2(Vec2::new(3.0, WYSIWYG_INLINE_CODE_VERTICAL_PADDING));
     shapes.push(egui::Shape::rect_filled(rect, 4, palette.code_bg));
     shapes.push(egui::Shape::rect_stroke(
         rect,
@@ -4640,13 +4725,17 @@ fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
             palette.text
         },
     );
-    format.line_height = Some(match style.heading {
-        1 => 44.0,
-        2 => 36.0,
-        3 => 31.0,
-        4 => 27.0,
-        _ => 27.0,
+    format.line_height = Some(match (style.code, style.heading) {
+        (_, 1) => 44.0,
+        (_, 2) => 36.0,
+        (_, 3) => 31.0,
+        (_, 4) => WYSIWYG_BODY_LINE_HEIGHT,
+        (true, _) => WYSIWYG_INLINE_CODE_LINE_HEIGHT,
+        _ => WYSIWYG_BODY_LINE_HEIGHT,
     });
+    if style.code {
+        format.valign = Align::Center;
+    }
     if style.strong || style.heading > 0 {
         format.extra_letter_spacing = 0.2;
     }
@@ -5311,6 +5400,55 @@ mod tests {
     }
 
     #[test]
+    fn inline_code_text_and_chip_are_centered_on_the_body_line() {
+        use egui::RawInput;
+
+        let context = Context::default();
+        let mut measured = None;
+        let _ = context.run_ui(RawInput::default(), |ui| {
+            let source = "before `code` after";
+            let projection = VisualProjection::from_markdown(source);
+            let runs = projection.runs_for(projection.text());
+            let galley = wysiwyg_layout(
+                ui,
+                projection.text(),
+                &projection,
+                480.0,
+                app_palette(false),
+                true,
+            );
+            let code_start = projection.text().find("code").unwrap();
+            let code_start = projection.text()[..code_start].chars().count();
+            let row = galley
+                .rows
+                .iter()
+                .find(|row| code_start < row.glyphs.len())
+                .expect("single-line inline code should have a row");
+            let glyph = &row.glyphs[code_start];
+            let glyph_rect = glyph.logical_rect().translate(row.pos.to_vec2());
+            let shapes = rounded_inline_code_backgrounds(
+                &galley,
+                egui::Pos2::ZERO,
+                &runs,
+                app_palette(false),
+            );
+            let egui::Shape::Rect(chip) = &shapes[0] else {
+                panic!("inline code background should start with a rectangle");
+            };
+            measured = Some((row.rect(), glyph_rect, chip.rect));
+        });
+
+        let (row, glyph, chip) = measured.expect("layout should be measured");
+        assert!((glyph.center().y - row.center().y).abs() <= 0.5);
+        assert!((chip.center().y - row.center().y).abs() <= 0.5);
+        assert_eq!(glyph.height(), WYSIWYG_INLINE_CODE_LINE_HEIGHT);
+        assert_eq!(
+            chip.height(),
+            WYSIWYG_INLINE_CODE_LINE_HEIGHT + 2.0 * WYSIWYG_INLINE_CODE_VERTICAL_PADDING
+        );
+    }
+
+    #[test]
     fn wysiwyg_editor_keeps_trailing_newlines_inside_the_active_range() {
         let source = "第一段\n\n第二段";
         let blocks = markdown::blocks(source);
@@ -5516,6 +5654,20 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_boundary_backspace_removes_each_extra_blank_line() {
+        let mut source = "first\n\n\n\nsecond".to_owned();
+        for expected in ["first\n\n\nsecond", "first\n\nsecond"] {
+            let blocks = markdown::blocks(&source);
+            let second_range = hybrid_edit_range(&source, &blocks, blocks[1].id);
+            let second = source[second_range.clone()].to_owned();
+            let (replacement, cursor) = boundary_backspace_edit(&source, second_range).unwrap();
+            source.replace_range(replacement, &second);
+            assert_eq!(source, expected);
+            assert_eq!(cursor, expected.find("second").unwrap());
+        }
+    }
+
+    #[test]
     fn wysiwyg_editor_preserves_extra_blank_lines_between_blocks() {
         for (source, expected) in [
             ("第一段\n\n第二段", 0),
@@ -5536,6 +5688,34 @@ mod tests {
         let blocks = markdown::blocks(source);
         let first_range = hybrid_edit_range(source, &blocks, blocks[0].id);
         assert_eq!(&source[first_range], "第一段\n\n\n\n");
+
+        let gap = blocks[0].range.end..blocks[1].range.start;
+        let first_blank_cursor = "第一段\n\n".chars().count();
+        assert_eq!(
+            block_for_char_index(source, &blocks, first_blank_cursor).id,
+            blocks[0].id
+        );
+        assert_eq!(
+            block_for_char_index(source, &blocks, "第一段\n\n\n\n".chars().count()).id,
+            blocks[1].id
+        );
+        assert_eq!(
+            inter_block_blank_line_cursor_byte(source, gap.clone(), 0),
+            Some("第一段\n\n".len())
+        );
+        assert_eq!(
+            inter_block_blank_line_cursor_byte(source, gap, 1),
+            Some("第一段\n\n\n".len())
+        );
+
+        let crlf = "first\r\n\r\n\r\n\r\nsecond";
+        let crlf_blocks = markdown::blocks(crlf);
+        let crlf_gap = crlf_blocks[0].range.end..crlf_blocks[1].range.start;
+        assert_eq!(extra_inter_block_blank_lines(crlf, crlf_gap.clone()), 2);
+        assert_eq!(
+            inter_block_blank_line_cursor_byte(crlf, crlf_gap, 0),
+            Some("first\r\n\r\n".len())
+        );
     }
 
     #[test]

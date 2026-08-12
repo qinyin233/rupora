@@ -714,17 +714,11 @@ impl ProjectionBuilder {
         let unmapped_start = trailing_start + visible_whitespace;
         self.set_current_boundary(unmapped_start);
 
-        let style = self
-            .runs
-            .iter()
-            .rev()
-            .find(|run| !run.style.marker)
-            .map_or_else(VisualStyle::default, |run| run.style);
         self.append_mapped(
             source,
             &source[unmapped_start..],
             unmapped_start..source.len(),
-            style,
+            VisualStyle::default(),
         );
     }
 
@@ -1174,6 +1168,34 @@ mod tests {
     }
 
     #[test]
+    fn a_space_typed_after_inline_code_stays_outside_the_code_style() {
+        let source = "`无法访问是`";
+        let cursor = source.chars().count();
+        let projection =
+            VisualProjection::from_markdown_with_selection(source, Some(cursor..cursor));
+        let mut edited = projection.text().to_owned();
+        edited.push(' ');
+        let visual_cursor = edited.chars().count();
+        let update = projection
+            .apply_edit(source, &edited, visual_cursor..visual_cursor)
+            .unwrap();
+
+        assert_eq!(update.source, "`无法访问是` ");
+        let reparsed = VisualProjection::from_markdown_with_selection(
+            &update.source,
+            Some(update.selection.clone()),
+        );
+        assert_eq!(reparsed.text(), "无法访问是 ");
+        let trailing = reparsed
+            .runs
+            .iter()
+            .find(|run| run.range.contains(&(reparsed.text().chars().count() - 1)))
+            .unwrap();
+        assert!(!trailing.style.code);
+        assert!(!trailing.style.marker);
+    }
+
+    #[test]
     fn arrow_keys_stop_on_the_hidden_inline_code_delimiters() {
         let source = "`ab`";
         assert_eq!(
@@ -1470,6 +1492,21 @@ mod tests {
                 "source: {source:?}"
             );
         }
+    }
+
+    #[test]
+    fn clicked_inter_block_blank_line_projects_to_its_visual_row() {
+        let source = "前置 `无法访问是`  后置\n\n\n\n";
+        let cursor = "前置 `无法访问是`  后置\n\n".chars().count();
+        let projection =
+            VisualProjection::from_markdown_with_selection(source, Some(cursor..cursor));
+
+        assert_eq!(projection.text(), "前置 无法访问是  后置\n\n\n\n");
+        let visual_cursor = "前置 无法访问是  后置\n\n".chars().count();
+        assert_eq!(
+            projection.visual_char_range(source, cursor..cursor),
+            visual_cursor..visual_cursor
+        );
     }
 
     #[test]
