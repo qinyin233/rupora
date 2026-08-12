@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
 
 use crate::markdown::parser_options;
 
@@ -66,50 +66,66 @@ impl VisualProjection {
         let mut builder = ProjectionBuilder::new();
         let mut format = FormatState::default();
         let mut table_cells = 0usize;
+        let mut block_depth = 0usize;
+        let mut trailing_container_block = false;
+        let mut trailing_fenced_code_block = false;
 
         for (event, range) in Parser::new_ext(source, parser_options()).into_offset_iter() {
             match event {
-                Event::Start(tag) => match tag {
-                    Tag::Heading { level, .. } => format.heading = heading_level(level),
-                    Tag::BlockQuote(_) => format.quote += 1,
-                    Tag::CodeBlock(_) | Tag::HtmlBlock => format.code += 1,
-                    Tag::Item => {
-                        builder.ensure_line_break(range.start, format.visual());
-                        if let Some((prefix_range, prefix)) = item_prefix(source, range.start) {
-                            builder.append_marker(&prefix, prefix_range, format.visual());
+                Event::Start(tag) => {
+                    if block_depth == 0 {
+                        trailing_container_block =
+                            matches!(&tag, Tag::List(_) | Tag::BlockQuote(_));
+                        trailing_fenced_code_block =
+                            matches!(&tag, Tag::CodeBlock(CodeBlockKind::Fenced(_)));
+                    }
+                    block_depth += 1;
+                    match tag {
+                        Tag::Heading { level, .. } => format.heading = heading_level(level),
+                        Tag::BlockQuote(_) => format.quote += 1,
+                        Tag::CodeBlock(_) | Tag::HtmlBlock => format.code += 1,
+                        Tag::Item => {
+                            builder.ensure_line_break(range.start, format.visual());
+                            if let Some((prefix_range, prefix)) = item_prefix(source, range.start) {
+                                builder.append_marker(&prefix, prefix_range, format.visual());
+                            }
                         }
-                    }
-                    Tag::TableRow => table_cells = 0,
-                    Tag::TableCell => {
-                        if table_cells > 0 {
-                            builder.append_virtual("  │  ", range.start, marker_style(format));
+                        Tag::TableRow => table_cells = 0,
+                        Tag::TableCell => {
+                            if table_cells > 0 {
+                                builder.append_virtual("  │  ", range.start, marker_style(format));
+                            }
+                            table_cells += 1;
                         }
-                        table_cells += 1;
+                        Tag::Emphasis => format.emphasis += 1,
+                        Tag::Strong => format.strong += 1,
+                        Tag::Strikethrough => format.strikethrough += 1,
+                        Tag::Link { .. } => format.link += 1,
+                        Tag::Image { .. } => {
+                            format.link += 1;
+                            let marker_end = source[range.clone()]
+                                .find('[')
+                                .map_or(range.start, |offset| range.start + offset + 1);
+                            builder.append_marker(
+                                "▧ ",
+                                range.start..marker_end,
+                                marker_style(format),
+                            );
+                        }
+                        Tag::FootnoteDefinition(label) => {
+                            let marker = format!("〔{label}〕 ");
+                            let marker_end = source[range.clone()]
+                                .find(':')
+                                .map_or(range.start, |offset| range.start + offset + 1);
+                            builder.append_marker(
+                                &marker,
+                                range.start..marker_end,
+                                marker_style(format),
+                            );
+                        }
+                        _ => {}
                     }
-                    Tag::Emphasis => format.emphasis += 1,
-                    Tag::Strong => format.strong += 1,
-                    Tag::Strikethrough => format.strikethrough += 1,
-                    Tag::Link { .. } => format.link += 1,
-                    Tag::Image { .. } => {
-                        format.link += 1;
-                        let marker_end = source[range.clone()]
-                            .find('[')
-                            .map_or(range.start, |offset| range.start + offset + 1);
-                        builder.append_marker("▧ ", range.start..marker_end, marker_style(format));
-                    }
-                    Tag::FootnoteDefinition(label) => {
-                        let marker = format!("〔{label}〕 ");
-                        let marker_end = source[range.clone()]
-                            .find(':')
-                            .map_or(range.start, |offset| range.start + offset + 1);
-                        builder.append_marker(
-                            &marker,
-                            range.start..marker_end,
-                            marker_style(format),
-                        );
-                    }
-                    _ => {}
-                },
+                }
                 Event::End(tag) => {
                     match tag {
                         TagEnd::Paragraph
@@ -141,6 +157,7 @@ impl VisualProjection {
                         }
                         _ => {}
                     }
+                    block_depth = block_depth.saturating_sub(1);
                 }
                 Event::Text(text) => {
                     builder.append_container_prefix(source, range.start, format);
@@ -170,6 +187,10 @@ impl VisualProjection {
                     builder.append_container_prefix_at_line_start(source, next_line_start, format);
                 }
                 Event::Rule => {
+                    if block_depth == 0 {
+                        trailing_container_block = false;
+                        trailing_fenced_code_block = false;
+                    }
                     builder.append_transformed(
                         "────────────────",
                         range.clone(),
@@ -182,7 +203,7 @@ impl VisualProjection {
         }
 
         builder.append_trailing_container_line(source);
-        builder.finish(source)
+        builder.finish(source, trailing_container_block, trailing_fenced_code_block)
     }
 
     pub fn text(&self) -> &str {
@@ -398,37 +419,78 @@ impl ProjectionBuilder {
         }
     }
 
-    fn finish(mut self, source: &str) -> VisualProjection {
-        let trailing_source_lines = source
-            .trim_end_matches([' ', '\t'])
-            .bytes()
-            .rev()
-            .take_while(|byte| matches!(byte, b'\n' | b'\r'))
-            .filter(|byte| *byte == b'\n')
-            .count();
-        let retained_newlines = usize::from(trailing_source_lines >= 1);
-        while self
-            .text
-            .chars()
-            .rev()
-            .take_while(|character| *character == '\n')
-            .count()
-            > retained_newlines
-        {
+    fn finish(
+        mut self,
+        source: &str,
+        trailing_container_block: bool,
+        trailing_fenced_code_block: bool,
+    ) -> VisualProjection {
+        while self.text.ends_with('\n') {
+            let newline = self.text.chars().count() - 1;
+            let start = self.source_boundaries[newline];
+            let end = self.source_boundaries[newline + 1];
+            let maps_source_line_break = source
+                .get(start..end)
+                .is_some_and(|mapped| mapped.bytes().any(|byte| matches!(byte, b'\n' | b'\r')));
+            if maps_source_line_break {
+                break;
+            }
             self.text.pop();
             self.source_boundaries.pop();
         }
-        if self.text.ends_with('\n') {
-            // A single editable visual newline can represent multiple trailing
-            // Markdown newlines. Insert at the true source end so typing after
-            // an empty list item preserves the blank line that exits the list.
-            self.set_current_boundary(source.len());
+
+        if trailing_fenced_code_block && self.text.ends_with('\n') {
+            // pulldown-cmark includes the mandatory line terminator before a
+            // closing fence in the code text. It terminates the final code
+            // line, but is not itself an editable blank line.
+            self.text.pop();
+            self.source_boundaries.pop();
         }
+
+        let trailing_breaks = trailing_line_break_ranges(source);
+        let collapsed_breaks = usize::from(trailing_container_block && trailing_breaks.len() >= 2);
+        let mut represented_breaks = 0usize;
+        let trailing_visual_start = self.text.chars().count().saturating_sub(
+            self.text
+                .chars()
+                .rev()
+                .take_while(|character| *character == '\n')
+                .count(),
+        );
+        for visual_index in trailing_visual_start..self.text.chars().count() {
+            let boundary = self.source_boundaries[visual_index + 1];
+            if let Some(relative) = trailing_breaks[represented_breaks..]
+                .iter()
+                .position(|range| range.end == boundary)
+            {
+                represented_breaks += relative + 1;
+            }
+        }
+
+        if collapsed_breaks == 1 && represented_breaks >= 1 {
+            let collapsed_boundary = trailing_breaks[1].end;
+            self.set_current_boundary(collapsed_boundary);
+            represented_breaks = represented_breaks.max(2);
+        }
+
         let trimmed_length = self.text.chars().count();
         self.runs.retain_mut(|run| {
             run.range.end = run.range.end.min(trimmed_length);
             run.range.start < run.range.end
         });
+        let first_unrepresented = represented_breaks.max(collapsed_breaks);
+        for line_break in trailing_breaks.iter().skip(first_unrepresented) {
+            let visual_start = self.text.chars().count();
+            self.text.push('\n');
+            let previous_boundary = self.source_boundaries.last().copied().unwrap_or_default();
+            self.source_boundaries
+                .push(line_break.end.max(previous_boundary).min(source.len()));
+            push_run(
+                &mut self.runs,
+                visual_start..visual_start + 1,
+                VisualStyle::default(),
+            );
+        }
         self.append_trailing_editable_whitespace(source);
         let length = self.text.chars().count();
         self.runs.retain_mut(|run| {
@@ -777,6 +839,29 @@ fn trailing_line_break_boundary(source: &str, range: &Range<usize>) -> usize {
     }
 }
 
+fn trailing_line_break_ranges(source: &str) -> Vec<Range<usize>> {
+    let mut cursor = source.trim_end_matches([' ', '\t']).len();
+    let bytes = source.as_bytes();
+    let mut ranges = Vec::new();
+    while cursor > 0 {
+        let end = cursor;
+        let mut start = cursor - 1;
+        match bytes[start] {
+            b'\n' => {
+                if start > 0 && bytes[start - 1] == b'\r' {
+                    start -= 1;
+                }
+            }
+            b'\r' => {}
+            _ => break,
+        }
+        ranges.push(start..end);
+        cursor = start;
+    }
+    ranges.reverse();
+    ranges
+}
+
 fn marker_style(format: FormatState) -> VisualStyle {
     let mut style = format.visual();
     style.marker = true;
@@ -1015,6 +1100,105 @@ mod tests {
             VisualProjection::from_markdown(&update.source).text(),
             edited
         );
+    }
+
+    #[test]
+    fn repeated_enter_frames_preserve_every_plain_blank_line() {
+        let mut source = "第一段".to_owned();
+        for line_breaks in 1..=4 {
+            let projection = VisualProjection::from_markdown(&source);
+            let mut edited = projection.text().to_owned();
+            edited.push('\n');
+            let cursor = edited.chars().count();
+            let mut update = projection
+                .apply_edit(&source, &edited, cursor..cursor)
+                .unwrap();
+            update.selection = complete_visual_enter(&mut update.source, update.selection, false);
+            source = update.source;
+
+            let expected = format!("第一段{}", "\n".repeat(line_breaks));
+            assert_eq!(source, expected);
+            assert_eq!(VisualProjection::from_markdown(&source).text(), expected);
+        }
+
+        let projection = VisualProjection::from_markdown(&source);
+        let mut edited = projection.text().to_owned();
+        edited.push_str("第二段");
+        let cursor = edited.chars().count();
+        let update = projection
+            .apply_edit(&source, &edited, cursor..cursor)
+            .unwrap();
+        assert_eq!(update.source, "第一段\n\n\n\n第二段");
+    }
+
+    #[test]
+    fn empty_formatted_and_crlf_documents_keep_trailing_blank_lines() {
+        for (source, expected) in [
+            ("\n\n\n", "\n\n\n"),
+            ("**粗体**\n\n\n", "粗体\n\n\n"),
+            ("段落\r\n\r\n\r\n", "段落\n\n\n"),
+        ] {
+            let projection = VisualProjection::from_markdown(source);
+            assert_eq!(projection.text(), expected, "source: {source:?}");
+            assert_eq!(
+                projection.source_boundaries.last().copied(),
+                Some(source.len()),
+                "source: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fenced_code_keeps_blank_content_without_exposing_the_closing_terminator() {
+        for (source, expected) in [
+            ("```text\n代码\n```", "代码"),
+            ("```text\n代码\n\n```", "代码\n"),
+            ("```text\n代码\n```\n\n", "代码\n\n"),
+        ] {
+            assert_eq!(
+                VisualProjection::from_markdown(source).text(),
+                expected,
+                "source: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_exit_collapses_only_its_structural_separator() {
+        let source = "- 项目\n\n";
+        let projection = VisualProjection::from_markdown(source);
+        assert_eq!(projection.text(), "• 项目\n");
+
+        let edited = format!("{}\n", projection.text());
+        let cursor = edited.chars().count();
+        let mut update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+        update.selection = complete_visual_enter(&mut update.source, update.selection, false);
+        assert_eq!(update.source, "- 项目\n\n\n");
+        assert_eq!(
+            VisualProjection::from_markdown(&update.source).text(),
+            "• 项目\n\n"
+        );
+    }
+
+    #[test]
+    fn backspace_removes_exactly_one_of_several_blank_lines() {
+        let source = "段落\n\n\n";
+        let projection = VisualProjection::from_markdown(source);
+        let mut edited = projection.text().to_owned();
+        edited.pop();
+        let cursor = edited.chars().count();
+        let update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+
+        assert_eq!(update.source, "段落\n\n");
+        assert_eq!(
+            VisualProjection::from_markdown(&update.source).text(),
+            edited
+        );
+        assert_eq!(update.selection, cursor..cursor);
     }
 
     #[test]

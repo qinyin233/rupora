@@ -3251,7 +3251,21 @@ impl RuporaApp {
                             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                                 ui.set_width((page_width - 112.0).max(160.0));
                                 ui.set_min_height((viewport_height - 142.0).max(480.0));
-                                for block in &blocks {
+                                for (block_index, block) in blocks.iter().enumerate() {
+                                    if block_index > 0
+                                        && Some(blocks[block_index - 1].id) != active_id
+                                    {
+                                        let gap =
+                                            blocks[block_index - 1].range.end..block.range.start;
+                                        let blank_lines =
+                                            extra_inter_block_blank_lines(&source, gap);
+                                        if blank_lines > 0 {
+                                            let line_height = ui
+                                                .text_style_height(&egui::TextStyle::Body)
+                                                .max(1.0);
+                                            ui.add_space(blank_lines as f32 * line_height);
+                                        }
+                                    }
                                     ui.push_id(("hybrid-block", block.id), |ui| {
                                         if Some(block.id) == active_id {
                                             let edit_range =
@@ -4158,6 +4172,13 @@ fn multiline_edit_rows(source: &str) -> usize {
     source.bytes().filter(|byte| *byte == b'\n').count() + 1
 }
 
+fn extra_inter_block_blank_lines(source: &str, gap: std::ops::Range<usize>) -> usize {
+    source
+        .get(gap)
+        .map_or(0, |gap| gap.bytes().filter(|byte| *byte == b'\n').count())
+        .saturating_sub(2)
+}
+
 fn wysiwyg_layout(
     ui: &Ui,
     text: &str,
@@ -4874,6 +4895,29 @@ mod tests {
         let updated_range = hybrid_edit_range(&trailing, &updated_blocks, updated_blocks[0].id);
         assert_eq!(&trailing[updated_range], "换句话\n");
         assert_eq!(multiline_edit_rows(&trailing), 2);
+    }
+
+    #[test]
+    fn wysiwyg_editor_preserves_extra_blank_lines_between_blocks() {
+        for (source, expected) in [
+            ("第一段\n\n第二段", 0),
+            ("第一段\n\n\n第二段", 1),
+            ("第一段\n\n\n\n第二段", 2),
+        ] {
+            let blocks = markdown::blocks(source);
+            assert_eq!(blocks.len(), 2, "source: {source:?}");
+            let gap = blocks[0].range.end..blocks[1].range.start;
+            assert_eq!(
+                extra_inter_block_blank_lines(source, gap),
+                expected,
+                "source: {source:?}"
+            );
+        }
+
+        let source = "第一段\n\n\n\n第二段";
+        let blocks = markdown::blocks(source);
+        let first_range = hybrid_edit_range(source, &blocks, blocks[0].id);
+        assert_eq!(&source[first_range], "第一段\n\n\n\n");
     }
 
     #[test]
