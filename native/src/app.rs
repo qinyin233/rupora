@@ -44,7 +44,7 @@ use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, Messag
 
 const APP_STATE_KEY: &str = "rupora-native-state";
 const UI_EXPERIENCE_KEY: &str = "rupora-native-ui-experience";
-const CURRENT_UI_EXPERIENCE: u32 = 2;
+const CURRENT_UI_EXPERIENCE: u32 = 3;
 const WYSIWYG_STRONG_FAMILY: &str = "rupora-wysiwyg-strong";
 
 #[derive(Clone, Copy)]
@@ -219,6 +219,9 @@ impl RuporaApp {
         if ui_experience < CURRENT_UI_EXPERIENCE {
             state.view_mode = ViewMode::Hybrid;
             state.show_outline = false;
+        }
+        if matches!(state.view_mode, ViewMode::Split | ViewMode::Preview) {
+            state.view_mode = ViewMode::Hybrid;
         }
         apply_theme(&creation_context.egui_ctx, state.dark);
         let recovery_store = RecoveryStore::for_app("RUPORA");
@@ -794,6 +797,7 @@ impl RuporaApp {
         self.hybrid_ime_session = None;
         self.restore_active_view_state();
         if self.documents.is_empty() {
+            self.next_untitled_id = 1;
             self.new_document();
         }
     }
@@ -1768,7 +1772,6 @@ impl RuporaApp {
     }
 
     fn top_bar(&mut self, root: &mut Ui) {
-        let previous_view_mode = self.state.view_mode;
         let extension_names = self
             .extension_registry
             .services()
@@ -2037,16 +2040,6 @@ impl RuporaApp {
                             self.command_palette_open = true;
                             self.command_focus_requested = true;
                         }
-                        ui.separator();
-                        ui.selectable_value(&mut self.state.view_mode, ViewMode::Edit, "编辑");
-                        ui.selectable_value(&mut self.state.view_mode, ViewMode::Split, "分屏");
-                        ui.selectable_value(
-                            &mut self.state.view_mode,
-                            ViewMode::Hybrid,
-                            "所见即所得",
-                        );
-                        ui.selectable_value(&mut self.state.view_mode, ViewMode::Preview, "预览");
-
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let theme_label = if self.state.dark { "浅色" } else { "深色" };
                             if ui.button(theme_label).clicked() {
@@ -2059,7 +2052,7 @@ impl RuporaApp {
                     });
 
                     ui.add_space(10.0);
-                    let command_width = (ui.available_width() - 252.0).clamp(0.0, 360.0);
+                    let command_width = (ui.available_width() - 12.0).clamp(0.0, 440.0);
                     if command_width >= 170.0
                         && ui
                             .add_sized(
@@ -2079,15 +2072,8 @@ impl RuporaApp {
                         self.command_palette_open = true;
                         self.command_focus_requested = true;
                     }
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        view_mode_selector(ui, &mut self.state.view_mode, palette);
-                    });
                 });
             });
-        if self.state.view_mode != previous_view_mode && self.state.view_mode != ViewMode::Hybrid {
-            self.hybrid_ime_session = None;
-        }
     }
 
     fn find_bar(&mut self, root: &mut Ui) {
@@ -2202,13 +2188,11 @@ impl RuporaApp {
             ("检查更新", AppCommand::CheckUpdates),
             ("打开诊断日志目录", AppCommand::OpenDiagnostics),
             ("关于 RUPORA", AppCommand::About),
-            ("切换到编辑模式", AppCommand::SetView(ViewMode::Edit)),
-            ("切换到分屏模式", AppCommand::SetView(ViewMode::Split)),
+            ("切换到源码模式", AppCommand::SetView(ViewMode::Edit)),
             (
                 "切换到所见即所得模式",
                 AppCommand::SetView(ViewMode::Hybrid),
             ),
-            ("切换到预览模式", AppCommand::SetView(ViewMode::Preview)),
             ("格式：粗体", AppCommand::Format(MarkdownCommand::Bold)),
             ("格式：斜体", AppCommand::Format(MarkdownCommand::Italic)),
             ("格式：链接", AppCommand::Format(MarkdownCommand::Link)),
@@ -3270,23 +3254,6 @@ impl RuporaApp {
                                         if Some(block.id) == active_id {
                                             let edit_range =
                                                 hybrid_edit_range(&source, &blocks, block.id);
-                                            let (
-                                                original_block,
-                                                mut visual_content,
-                                                had_ime_session,
-                                            ) = if let Some(session) = ime_session.take() {
-                                                (session.base_source, session.visual_content, true)
-                                            } else {
-                                                let original =
-                                                    source[edit_range.clone()].to_owned();
-                                                let visual =
-                                                    VisualProjection::from_markdown(&original)
-                                                        .text()
-                                                        .to_owned();
-                                                (original, visual, false)
-                                            };
-                                            let projection =
-                                                VisualProjection::from_markdown(&original_block);
                                             let block_char_start =
                                                 source[..edit_range.start].chars().count();
                                             let local_source_selection_before =
@@ -3296,6 +3263,31 @@ impl RuporaApp {
                                                             .end
                                                             .saturating_sub(block_char_start)
                                                 });
+                                            let (original_block, ime_visual_content) =
+                                                if let Some(session) = ime_session.take() {
+                                                    (
+                                                        session.base_source,
+                                                        Some(session.visual_content),
+                                                    )
+                                                } else {
+                                                    (source[edit_range.clone()].to_owned(), None)
+                                                };
+                                            let had_ime_session = ime_visual_content.is_some();
+                                            let projection = match local_source_selection_before
+                                                .clone()
+                                            {
+                                                Some(selection) => {
+                                                    VisualProjection::from_markdown_with_selection(
+                                                        &original_block,
+                                                        Some(selection),
+                                                    )
+                                                }
+                                                None => {
+                                                    VisualProjection::from_markdown(&original_block)
+                                                }
+                                            };
+                                            let mut visual_content = ime_visual_content
+                                                .unwrap_or_else(|| projection.text().to_owned());
                                             let visual_selection_before =
                                                 local_source_selection_before.as_ref().map(
                                                     |selection| {
@@ -3310,21 +3302,31 @@ impl RuporaApp {
                                                 index,
                                                 block.id,
                                             ));
-                                            if let Some(cursor_range) = pending_source_cursor.take()
-                                            {
-                                                let [selection_start, selection_end] =
-                                                    cursor_range.sorted_cursors();
-                                                let local_source = selection_start
-                                                    .index
-                                                    .0
-                                                    .saturating_sub(block_char_start)
-                                                    ..selection_end
+                                            let pending_local_source =
+                                                pending_source_cursor.take().map(|cursor_range| {
+                                                    let [selection_start, selection_end] =
+                                                        cursor_range.sorted_cursors();
+                                                    selection_start
                                                         .index
                                                         .0
-                                                        .saturating_sub(block_char_start);
+                                                        .saturating_sub(block_char_start)
+                                                        ..selection_end
+                                                            .index
+                                                            .0
+                                                            .saturating_sub(block_char_start)
+                                                });
+                                            let cursor_source_selection =
+                                                if pending_local_source.is_some() {
+                                                    pending_local_source.as_ref()
+                                                } else if had_ime_session {
+                                                    None
+                                                } else {
+                                                    local_source_selection_before.as_ref()
+                                                };
+                                            if let Some(local_source) = cursor_source_selection {
                                                 let local_visual = projection.visual_char_range(
                                                     &original_block,
-                                                    local_source,
+                                                    local_source.clone(),
                                                 );
                                                 let mut state =
                                                     TextEdit::load_state(ui.ctx(), editor_id)
@@ -3336,6 +3338,8 @@ impl RuporaApp {
                                                     ),
                                                 ));
                                                 state.store(ui.ctx(), editor_id);
+                                            }
+                                            if pending_local_source.is_some() {
                                                 ui.memory_mut(|memory| {
                                                     memory.request_focus(editor_id)
                                                 });
@@ -3734,12 +3738,14 @@ impl RuporaApp {
             .unwrap_or_default();
 
         let palette = app_palette(self.state.dark);
+        let source_mode = self.state.view_mode == ViewMode::Edit;
+        let mut toggle_source_mode = false;
         Panel::bottom("status")
-            .exact_size(23.0)
+            .exact_size(31.0)
             .frame(
                 egui::Frame::new()
                     .fill(palette.toolbar)
-                    .inner_margin(Margin::symmetric(10, 3))
+                    .inner_margin(Margin::symmetric(10, 4))
                     .stroke(Stroke::new(1.0, palette.border)),
             )
             .show(root, |ui| {
@@ -3747,6 +3753,23 @@ impl RuporaApp {
                     ui.label(RichText::new("●").size(8.0).color(palette.accent));
                     ui.label(RichText::new(&self.status).small().color(palette.secondary));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(AppIconButton {
+                                icon: AppIcon::Source,
+                                selected: source_mode,
+                                palette,
+                                size: 22.0,
+                            })
+                            .on_hover_text(if source_mode {
+                                "返回所见即所得模式"
+                            } else {
+                                "切换到 Markdown 源码模式"
+                            })
+                            .clicked()
+                        {
+                            toggle_source_mode = true;
+                        }
+                        ui.separator();
                         ui.label(
                             RichText::new(document_info)
                                 .small()
@@ -3755,6 +3778,20 @@ impl RuporaApp {
                     });
                 });
             });
+        if toggle_source_mode {
+            let next_mode = if source_mode {
+                ViewMode::Hybrid
+            } else {
+                ViewMode::Edit
+            };
+            self.execute(AppCommand::SetView(next_mode));
+            self.status = if next_mode == ViewMode::Edit {
+                "已切换到 Markdown 源码模式"
+            } else {
+                "已返回所见即所得模式"
+            }
+            .to_owned();
+        }
     }
 
     fn confirm_application_close(&mut self, ctx: &Context) {
@@ -3850,6 +3887,7 @@ enum AppIcon {
     Sidebar,
     Outline,
     Theme,
+    Source,
     File,
     Close,
 }
@@ -3863,6 +3901,7 @@ impl AppIcon {
             Self::Sidebar => "资源管理器",
             Self::Outline => "文档大纲",
             Self::Theme => "切换主题",
+            Self::Source => "源码 / 所见即所得",
             Self::File => "Markdown 文档",
             Self::Close => "关闭",
         }
@@ -4019,6 +4058,43 @@ fn paint_app_icon(painter: &egui::Painter, rect: egui::Rect, icon: AppIcon, colo
                 painter.line_segment([center + direction * 5.3, center + direction * 7.0], stroke);
             }
         }
+        AppIcon::Source => {
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 2.0, top + 1.5),
+                    egui::pos2(left, center.y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(left, center.y),
+                    egui::pos2(center.x - 2.0, bottom - 1.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x + 2.0, top + 1.5),
+                    egui::pos2(right, center.y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(right, center.y),
+                    egui::pos2(center.x + 2.0, bottom - 1.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x + 1.5, top),
+                    egui::pos2(center.x - 1.5, bottom),
+                ],
+                stroke,
+            );
+        }
         AppIcon::File => {
             painter.add(egui::Shape::line(
                 vec![
@@ -4056,52 +4132,6 @@ fn paint_app_icon(painter: &egui::Painter, rect: egui::Rect, icon: AppIcon, colo
             );
         }
     }
-}
-
-fn view_mode_selector(ui: &mut Ui, mode: &mut ViewMode, palette: AppPalette) {
-    ui.allocate_ui_with_layout(
-        Vec2::new(204.0, 30.0),
-        Layout::left_to_right(Align::Center),
-        |ui| {
-            egui::Frame::new()
-                .fill(palette.surface)
-                .stroke(Stroke::new(1.0, palette.border))
-                .corner_radius(8)
-                .inner_margin(2)
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.x = 1.0;
-                    for (value, label, tooltip, width) in [
-                        (ViewMode::Hybrid, "所见", "所见即所得编辑", 66.0),
-                        (ViewMode::Edit, "源码", "Markdown 源码编辑", 64.0),
-                        (ViewMode::Preview, "预览", "只读排版预览", 64.0),
-                    ] {
-                        let selected = *mode == value;
-                        let text_color = if selected {
-                            palette.accent
-                        } else {
-                            palette.secondary
-                        };
-                        if ui
-                            .add(
-                                Button::new(RichText::new(label).color(text_color))
-                                    .fill(if selected {
-                                        palette.accent_soft
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    })
-                                    .stroke(Stroke::NONE)
-                                    .corner_radius(6)
-                                    .min_size(Vec2::new(width, 24.0)),
-                            )
-                            .on_hover_text(tooltip)
-                            .clicked()
-                        {
-                            *mode = value;
-                        }
-                    }
-                });
-        },
-    );
 }
 
 fn outline_row(ui: &mut Ui, heading: &Heading) -> bool {
@@ -4211,11 +4241,12 @@ fn wysiwyg_layout(
 }
 
 fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
-    let size = match style.heading {
-        1 => 34.0,
-        2 => 27.0,
-        3 => 22.0,
-        4 => 18.0,
+    let size = match (style.code, style.heading) {
+        (_, 1) => 34.0,
+        (_, 2) => 27.0,
+        (_, 3) => 22.0,
+        (_, 4) => 18.0,
+        (true, _) => 15.0,
         _ => 16.0,
     };
     let family = if style.code {
@@ -4254,7 +4285,8 @@ fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
     }
     if style.code {
         format.background = palette.hover;
-        format.expand_bg = 2.0;
+        format.expand_bg = 3.0;
+        format.extra_letter_spacing = 0.1;
     }
     format
 }

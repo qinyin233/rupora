@@ -217,7 +217,7 @@ pub fn apply_smart_pair(
     typed: &str,
 ) -> Option<Range<usize>> {
     let selection = clamp_char_range(text, selection);
-    if selection.is_empty() && matches!(typed, ")" | "]" | "}" | "\"" | "'" | "`") {
+    if selection.is_empty() && matches!(typed, ")" | "]" | "}" | "\"" | "'") {
         let start = char_to_byte(text, selection.start);
         let end = start + typed.len();
         if text.get(start..end) == Some(typed) {
@@ -231,7 +231,6 @@ pub fn apply_smart_pair(
         "{" => ("{", "}"),
         "\"" => ("\"", "\""),
         "'" => ("'", "'"),
-        "`" => ("`", "`"),
         _ => return None,
     };
 
@@ -640,7 +639,7 @@ mod tests {
         assert_eq!(text, "call()");
 
         let mut text = String::new();
-        assert_eq!(apply_smart_pair(&mut text, 0..0, "`"), Some(1..1));
-        assert_eq!(text, "``");
+        assert_eq!(apply_smart_pair(&mut text, 0..0, "`"), None);
+        assert!(text.is_empty());
     }
 }

@@ -63,12 +63,23 @@ impl FormatState {
 
 impl VisualProjection {
     pub fn from_markdown(source: &str) -> Self {
+        Self::from_markdown_with_selection(source, None)
+    }
+
+    pub fn from_markdown_with_selection(
+        source: &str,
+        source_selection: Option<Range<usize>>,
+    ) -> Self {
         let mut builder = ProjectionBuilder::new();
         let mut format = FormatState::default();
         let mut table_cells = 0usize;
         let mut block_depth = 0usize;
         let mut trailing_container_block = false;
         let mut trailing_fenced_code_block = false;
+        let source_selection = source_selection.map(|selection| {
+            let selection = clamp_range(selection, source.chars().count());
+            char_to_byte(source, selection.start)..char_to_byte(source, selection.end)
+        });
 
         for (event, range) in Parser::new_ext(source, parser_options()).into_offset_iter() {
             match event {
@@ -163,7 +174,20 @@ impl VisualProjection {
                     builder.append_container_prefix(source, range.start, format);
                     builder.append_mapped(source, &text, range, format.visual());
                 }
-                Event::Code(text) | Event::InlineMath(text) | Event::DisplayMath(text) => {
+                Event::Code(text) => {
+                    builder.append_container_prefix(source, range.start, format);
+                    let mut style = format.visual();
+                    style.code = true;
+                    let content_range = inline_code_content_range(source, &text, range.clone());
+                    if source_selection.as_ref().is_some_and(|selection| {
+                        selection_reveals_inline_code(selection, &content_range)
+                    }) {
+                        builder.append_revealed_inline_code(source, range, content_range, style);
+                    } else {
+                        builder.append_mapped(source, &text, range, style);
+                    }
+                }
+                Event::InlineMath(text) | Event::DisplayMath(text) => {
                     builder.append_container_prefix(source, range.start, format);
                     let mut style = format.visual();
                     style.code = true;
@@ -646,6 +670,41 @@ impl ProjectionBuilder {
         self.append_transformed(rendered, range, style);
     }
 
+    fn append_revealed_inline_code(
+        &mut self,
+        source: &str,
+        syntax_range: Range<usize>,
+        content_range: Range<usize>,
+        style: VisualStyle,
+    ) {
+        let mut marker_style = style;
+        marker_style.marker = true;
+        if syntax_range.start < content_range.start {
+            self.append_mapped(
+                source,
+                &source[syntax_range.start..content_range.start],
+                syntax_range.start..content_range.start,
+                marker_style,
+            );
+        }
+        if content_range.start < content_range.end {
+            self.append_mapped(
+                source,
+                &source[content_range.clone()],
+                content_range.clone(),
+                style,
+            );
+        }
+        if content_range.end < syntax_range.end {
+            self.append_mapped(
+                source,
+                &source[content_range.end..syntax_range.end],
+                content_range.end..syntax_range.end,
+                marker_style,
+            );
+        }
+    }
+
     fn append_transformed(
         &mut self,
         rendered: &str,
@@ -702,6 +761,30 @@ impl ProjectionBuilder {
             *boundary = source_byte;
         }
     }
+}
+
+fn inline_code_content_range(
+    source: &str,
+    rendered: &str,
+    syntax_range: Range<usize>,
+) -> Range<usize> {
+    let fragment = &source[syntax_range.clone()];
+    fragment
+        .find(rendered)
+        .map_or(syntax_range.clone(), |start| {
+            syntax_range.start + start..syntax_range.start + start + rendered.len()
+        })
+}
+
+fn selection_reveals_inline_code(
+    source_selection: &Range<usize>,
+    content_range: &Range<usize>,
+) -> bool {
+    if source_selection.is_empty() {
+        return content_range.start <= source_selection.start
+            && source_selection.start <= content_range.end;
+    }
+    source_selection.start <= content_range.end && source_selection.end >= content_range.start
 }
 
 #[derive(Clone, Debug)]
@@ -931,6 +1014,85 @@ mod tests {
         assert!(projection.runs.iter().any(|run| run.style.emphasis));
         assert!(projection.runs.iter().any(|run| run.style.code));
         assert!(projection.runs.iter().any(|run| run.style.marker));
+    }
+
+    #[test]
+    fn reveals_inline_code_delimiters_only_while_the_caret_is_inside() {
+        let source = "a `code` z";
+        let content_start = source.find("code").unwrap();
+        let content_end = content_start + "code".len();
+
+        let collapsed = VisualProjection::from_markdown(source);
+        assert_eq!(collapsed.text(), "a code z");
+        assert!(collapsed.runs.iter().any(|run| run.style.code));
+
+        for cursor in content_start..=content_end {
+            let revealed =
+                VisualProjection::from_markdown_with_selection(source, Some(cursor..cursor));
+            assert_eq!(revealed.text(), source, "cursor: {cursor}");
+            assert!(revealed.runs.iter().any(|run| run.style.code));
+            assert!(revealed.runs.iter().any(|run| run.style.marker));
+        }
+
+        for cursor in [content_start - 1, content_end + 1] {
+            assert_eq!(
+                VisualProjection::from_markdown_with_selection(source, Some(cursor..cursor)).text(),
+                collapsed.text(),
+                "cursor: {cursor}"
+            );
+        }
+    }
+
+    #[test]
+    fn edits_revealed_inline_code_without_losing_its_delimiters() {
+        let source = "a `code` z";
+        let projection = VisualProjection::from_markdown_with_selection(source, Some(4..4));
+        let edited = "a `coder` z";
+        let cursor = edited.find('r').unwrap() + 1;
+        let update = projection
+            .apply_edit(source, edited, cursor..cursor)
+            .unwrap();
+
+        assert_eq!(update.source, edited);
+        assert_eq!(update.selection, cursor..cursor);
+        assert_eq!(VisualProjection::from_markdown(edited).text(), "a coder z");
+    }
+
+    #[test]
+    fn reveals_only_the_selected_unicode_inline_code_span() {
+        let source = "前 `代码` 与 `second` 后";
+        let second_byte = source.find("second").unwrap();
+        let second_start = source[..second_byte].chars().count();
+        let projection = VisualProjection::from_markdown_with_selection(
+            source,
+            Some(second_start + 2..second_start + 2),
+        );
+
+        assert_eq!(projection.text(), "前 代码 与 `second` 后");
+        assert_eq!(projection.text().matches('`').count(), 2);
+    }
+
+    #[test]
+    fn reveals_multi_backtick_delimiters_around_embedded_backticks() {
+        let source = "before ``a ` b`` after";
+        let content_byte = source.find("a ` b").unwrap();
+        let content_start = source[..content_byte].chars().count();
+        let projection = VisualProjection::from_markdown_with_selection(
+            source,
+            Some(content_start + 2..content_start + 2),
+        );
+
+        assert_eq!(projection.text(), source);
+        assert_eq!(
+            VisualProjection::from_markdown(source).text(),
+            "before a ` b after"
+        );
+    }
+
+    #[test]
+    fn keeps_incomplete_backtick_sequences_visible_for_direct_typing() {
+        assert_eq!(VisualProjection::from_markdown("`").text(), "`");
+        assert_eq!(VisualProjection::from_markdown("``").text(), "``");
     }
 
     #[test]
