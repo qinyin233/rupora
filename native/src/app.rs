@@ -28,7 +28,7 @@ use crate::{
     table::{self, MarkdownTable},
     updater::{self, UpdateInfo, UpdateStatus},
     workspace::{Workspace, WorkspaceEntry},
-    wysiwyg::{VisualProjection, VisualStyle},
+    wysiwyg::{VisualProjection, VisualStyle, complete_visual_enter},
 };
 use eframe::{
     CreationContext, Frame, Storage,
@@ -3475,15 +3475,12 @@ impl RuporaApp {
                                                         selection,
                                                     )
                                                 {
-                                                    if focused
-                                                        && input_action.enter
-                                                        && let Some(next) =
-                                                            editing::continue_markdown_line(
-                                                                &mut update.source,
-                                                                update.selection.end,
-                                                            )
-                                                    {
-                                                        update.selection = next;
+                                                    if focused && input_action.enter {
+                                                        update.selection = complete_visual_enter(
+                                                            &mut update.source,
+                                                            update.selection,
+                                                            input_action.shift,
+                                                        );
                                                     }
                                                     cursor_adjusted = true;
                                                     source_update =

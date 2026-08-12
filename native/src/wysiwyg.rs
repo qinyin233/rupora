@@ -325,6 +325,64 @@ impl VisualProjection {
     }
 }
 
+pub fn complete_visual_enter(
+    source: &mut String,
+    selection: Range<usize>,
+    shift: bool,
+) -> Range<usize> {
+    let mut selection = selection;
+    if shift {
+        let inserted = ensure_hard_break_before_cursor(source, selection.end);
+        selection =
+            selection.start.saturating_add(inserted)..selection.end.saturating_add(inserted);
+    }
+    if shift || has_hard_break_before_cursor(source, selection.end) {
+        selection
+    } else {
+        crate::editing::continue_markdown_line(source, selection.end).unwrap_or(selection)
+    }
+}
+
+fn ensure_hard_break_before_cursor(source: &mut String, cursor: usize) -> usize {
+    let cursor_byte = char_to_byte(source, cursor);
+    let Some(newline_start) = newline_start_before_cursor(source, cursor_byte) else {
+        return 0;
+    };
+    if source[..newline_start].ends_with('\\') {
+        return 0;
+    }
+    let spaces = source[..newline_start]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b' ')
+        .take(2)
+        .count();
+    let inserted = 2usize.saturating_sub(spaces);
+    if inserted > 0 {
+        source.insert_str(newline_start, &" ".repeat(inserted));
+    }
+    inserted
+}
+
+fn has_hard_break_before_cursor(source: &str, cursor: usize) -> bool {
+    let cursor_byte = char_to_byte(source, cursor);
+    let Some(newline_start) = newline_start_before_cursor(source, cursor_byte) else {
+        return false;
+    };
+    source[..newline_start].ends_with("  ") || source[..newline_start].ends_with('\\')
+}
+
+fn newline_start_before_cursor(source: &str, cursor_byte: usize) -> Option<usize> {
+    let before = source.get(..cursor_byte)?;
+    if before.ends_with("\r\n") {
+        Some(cursor_byte - 2)
+    } else if before.ends_with(['\n', '\r']) {
+        Some(cursor_byte - 1)
+    } else {
+        None
+    }
+}
+
 struct ProjectionBuilder {
     text: String,
     source_boundaries: Vec<usize>,
@@ -342,6 +400,7 @@ impl ProjectionBuilder {
 
     fn finish(mut self, source: &str) -> VisualProjection {
         let trailing_source_lines = source
+            .trim_end_matches([' ', '\t'])
             .bytes()
             .rev()
             .take_while(|byte| matches!(byte, b'\n' | b'\r'))
@@ -359,11 +418,23 @@ impl ProjectionBuilder {
             self.text.pop();
             self.source_boundaries.pop();
         }
-        let length = self.text.chars().count();
-        self.runs.retain(|run| run.range.start < length);
-        for run in &mut self.runs {
-            run.range.end = run.range.end.min(length);
+        if self.text.ends_with('\n') {
+            // A single editable visual newline can represent multiple trailing
+            // Markdown newlines. Insert at the true source end so typing after
+            // an empty list item preserves the blank line that exits the list.
+            self.set_current_boundary(source.len());
         }
+        let trimmed_length = self.text.chars().count();
+        self.runs.retain_mut(|run| {
+            run.range.end = run.range.end.min(trimmed_length);
+            run.range.start < run.range.end
+        });
+        self.append_trailing_editable_whitespace(source);
+        let length = self.text.chars().count();
+        self.runs.retain_mut(|run| {
+            run.range.end = run.range.end.min(length);
+            run.range.start < run.range.end
+        });
         VisualProjection {
             text: self.text,
             source_boundaries: self.source_boundaries,
@@ -444,6 +515,42 @@ impl ProjectionBuilder {
             self.ensure_line_break(line_start, style);
             self.append_marker(&visual, line_start..line_start + consumed, style);
         }
+    }
+
+    fn append_trailing_editable_whitespace(&mut self, source: &str) {
+        let trailing_start = source.trim_end_matches([' ', '\t']).len();
+        if trailing_start == source.len() {
+            return;
+        }
+        if !source[..trailing_start].is_empty() && self.text.is_empty() {
+            return;
+        }
+        let source_whitespace = &source[trailing_start..];
+        let visible_whitespace = self
+            .text
+            .bytes()
+            .rev()
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count()
+            .min(source_whitespace.len());
+        if visible_whitespace == source_whitespace.len() {
+            return;
+        }
+        let unmapped_start = trailing_start + visible_whitespace;
+        self.set_current_boundary(unmapped_start);
+
+        let style = self
+            .runs
+            .iter()
+            .rev()
+            .find(|run| !run.style.marker)
+            .map_or_else(VisualStyle::default, |run| run.style);
+        self.append_mapped(
+            source,
+            &source[unmapped_start..],
+            unmapped_start..source.len(),
+            style,
+        );
     }
 
     fn append_mapped(
@@ -722,7 +829,6 @@ fn shift_index(index: usize, delta: isize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editing;
     use proptest::prelude::*;
 
     #[test]
@@ -794,8 +900,7 @@ mod tests {
             let mut update = projection
                 .apply_edit(source, &edited, cursor..cursor)
                 .unwrap();
-            update.selection =
-                editing::continue_markdown_line(&mut update.source, update.selection.end).unwrap();
+            update.selection = complete_visual_enter(&mut update.source, update.selection, false);
 
             assert_eq!(update.source, expected_source);
             let continued = VisualProjection::from_markdown(&update.source);
@@ -806,6 +911,129 @@ mod tests {
                 expected_visual.chars().count()
             );
         }
+    }
+
+    #[test]
+    fn preserves_trailing_spaces_until_the_user_completes_a_hard_break() {
+        for source in ["普通段落  ", "- 列表正文  ", "**粗体**  "] {
+            let projection = VisualProjection::from_markdown(source);
+            assert!(projection.text().ends_with("  "), "source: {source:?}");
+            assert_eq!(
+                projection.source_boundaries.last().copied(),
+                Some(source.len()),
+                "source: {source:?}"
+            );
+        }
+
+        let source = "- 列表正文";
+        let projection = VisualProjection::from_markdown(source);
+        let edited = format!("{}  ", projection.text());
+        let cursor = edited.chars().count();
+        let update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+        assert_eq!(update.source, "- 列表正文  ");
+        assert_eq!(
+            VisualProjection::from_markdown(&update.source).text(),
+            edited
+        );
+    }
+
+    #[test]
+    fn two_spaces_then_enter_stays_inside_the_current_list_item() {
+        let source = "- 列表正文  ";
+        let projection = VisualProjection::from_markdown(source);
+        let edited = format!("{}\n", projection.text());
+        let cursor = edited.chars().count();
+        let mut update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+        update.selection = complete_visual_enter(&mut update.source, update.selection, false);
+
+        assert_eq!(update.source, "- 列表正文  \n");
+        assert_eq!(
+            VisualProjection::from_markdown(&update.source).text(),
+            "• 列表正文\n"
+        );
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_hard_break_without_starting_a_new_list_item() {
+        let source = "- 列表正文";
+        let projection = VisualProjection::from_markdown(source);
+        let edited = format!("{}\n", projection.text());
+        let cursor = edited.chars().count();
+        let mut update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+        update.selection = complete_visual_enter(&mut update.source, update.selection, true);
+
+        assert_eq!(update.source, "- 列表正文  \n");
+        assert_eq!(
+            update.selection,
+            update.source.chars().count()..update.source.chars().count()
+        );
+    }
+
+    #[test]
+    fn repeated_space_frames_survive_until_enter_and_accept_continuation_text() {
+        let mut source = "- 一行文字".to_owned();
+        for spaces in 1..=3 {
+            let projection = VisualProjection::from_markdown(&source);
+            let mut edited = projection.text().to_owned();
+            edited.push(' ');
+            let cursor = edited.chars().count();
+            let update = projection
+                .apply_edit(&source, &edited, cursor..cursor)
+                .unwrap();
+            source = update.source;
+            assert_eq!(source, format!("- 一行文字{}", " ".repeat(spaces)));
+            assert_eq!(VisualProjection::from_markdown(&source).text(), edited);
+        }
+
+        let projection = VisualProjection::from_markdown(&source);
+        let mut edited = projection.text().to_owned();
+        edited.push('\n');
+        let cursor = edited.chars().count();
+        let mut update = projection
+            .apply_edit(&source, &edited, cursor..cursor)
+            .unwrap();
+        update.selection = complete_visual_enter(&mut update.source, update.selection, false);
+        assert_eq!(update.source, "- 一行文字   \n");
+        assert!(!update.source.contains("\n- "));
+
+        source = update.source;
+        let projection = VisualProjection::from_markdown(&source);
+        let mut edited = projection.text().to_owned();
+        edited.push_str("继续输入");
+        let cursor = edited.chars().count();
+        let update = projection
+            .apply_edit(&source, &edited, cursor..cursor)
+            .unwrap();
+        assert_eq!(update.source, "- 一行文字   \n继续输入");
+        assert_eq!(
+            VisualProjection::from_markdown(&update.source).text(),
+            edited
+        );
+    }
+
+    #[test]
+    fn backspace_removes_one_trailing_space_without_collapsing_the_cursor() {
+        let source = "- 文本  ";
+        let projection = VisualProjection::from_markdown(source);
+        let mut edited = projection.text().to_owned();
+        edited.pop();
+        let cursor = edited.chars().count();
+        let update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+
+        assert_eq!(update.source, "- 文本 ");
+        assert_eq!(
+            VisualProjection::from_markdown(&update.source).text(),
+            edited
+        );
+        assert_eq!(update.selection, cursor..cursor);
     }
 
     #[test]
@@ -837,6 +1065,13 @@ mod tests {
             projection.visual_char_for_source_byte(char_to_byte(source, source_cursor)),
             projection.text().chars().count()
         );
+
+        let edited = format!("{}列表后的普通段落", projection.text());
+        let cursor = edited.chars().count();
+        let update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+        assert_eq!(update.source, "- 第一项\n\n列表后的普通段落");
     }
 
     #[test]
