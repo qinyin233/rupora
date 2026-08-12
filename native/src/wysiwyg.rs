@@ -446,6 +446,37 @@ pub fn complete_fenced_code_on_enter(
     Some(selection)
 }
 
+pub fn move_across_hidden_inline_code_boundary(
+    source: &str,
+    selection: Range<usize>,
+    move_left: bool,
+    move_right: bool,
+) -> Option<Range<usize>> {
+    if !selection.is_empty() || move_left == move_right {
+        return None;
+    }
+    let selection = clamp_range(selection, source.chars().count());
+    let cursor_byte = char_to_byte(source, selection.start);
+
+    Parser::new_ext(source, parser_options())
+        .into_offset_iter()
+        .find_map(|(event, syntax_range)| {
+            if !matches!(event, Event::Code(_)) {
+                return None;
+            }
+            let content_range = inline_code_delimited_content_range(source, syntax_range.clone())?;
+            let target_byte = if move_left && cursor_byte == syntax_range.end {
+                content_range.end
+            } else if move_right && cursor_byte == syntax_range.start {
+                content_range.start
+            } else {
+                return None;
+            };
+            let target = source[..target_byte].chars().count();
+            Some(target..target)
+        })
+}
+
 fn ensure_hard_break_before_cursor(source: &mut String, cursor: usize) -> usize {
     let cursor_byte = char_to_byte(source, cursor);
     let Some(newline_start) = newline_start_before_cursor(source, cursor_byte) else {
@@ -834,6 +865,23 @@ fn inline_code_content_range(
         })
 }
 
+fn inline_code_delimited_content_range(
+    source: &str,
+    syntax_range: Range<usize>,
+) -> Option<Range<usize>> {
+    let fragment = source.get(syntax_range.clone())?;
+    let opening = fragment.bytes().take_while(|byte| *byte == b'`').count();
+    let closing = fragment
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'`')
+        .count();
+    if opening == 0 || closing < opening || fragment.len() < opening.saturating_mul(2) {
+        return None;
+    }
+    Some(syntax_range.start + opening..syntax_range.end - opening)
+}
+
 fn selection_reveals_inline_code(
     source_selection: &Range<usize>,
     content_range: &Range<usize>,
@@ -1123,6 +1171,38 @@ mod tests {
         let inserted_after = after.apply_edit(source, "abcX", 4..4).unwrap();
         assert_eq!(inserted_after.source, "`abc`X");
         assert_eq!(inserted_after.selection, 6..6);
+    }
+
+    #[test]
+    fn arrow_keys_stop_on_the_hidden_inline_code_delimiters() {
+        let source = "`ab`";
+        assert_eq!(
+            move_across_hidden_inline_code_boundary(source, 4..4, true, false),
+            Some(3..3)
+        );
+        assert_eq!(
+            move_across_hidden_inline_code_boundary(source, 0..0, false, true),
+            Some(1..1)
+        );
+        assert_eq!(
+            move_across_hidden_inline_code_boundary(source, 3..3, true, false),
+            None
+        );
+        assert_eq!(
+            move_across_hidden_inline_code_boundary(source, 1..1, false, true),
+            None
+        );
+
+        let multi = "``a ` b``";
+        let after = multi.chars().count();
+        assert_eq!(
+            move_across_hidden_inline_code_boundary(multi, after..after, true, false),
+            Some(after - 2..after - 2)
+        );
+        assert_eq!(
+            move_across_hidden_inline_code_boundary(multi, 0..0, false, true),
+            Some(2..2)
+        );
     }
 
     #[test]

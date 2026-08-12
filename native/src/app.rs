@@ -30,6 +30,7 @@ use crate::{
     workspace::{Workspace, WorkspaceEntry},
     wysiwyg::{
         VisualProjection, VisualStyle, complete_fenced_code_on_enter, complete_visual_enter,
+        move_across_hidden_inline_code_boundary,
     },
 };
 use eframe::{
@@ -42,6 +43,7 @@ use eframe::{
     },
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use pulldown_cmark::{Event as MarkdownEvent, Parser, Tag, TagEnd};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
 const APP_STATE_KEY: &str = "rupora-native-state";
@@ -60,6 +62,7 @@ struct AppPalette {
     border: Color32,
     accent: Color32,
     accent_soft: Color32,
+    code_bg: Color32,
     hover: Color32,
 }
 
@@ -75,6 +78,7 @@ fn app_palette(dark: bool) -> AppPalette {
             border: Color32::from_rgb(51, 53, 64),
             accent: Color32::from_rgb(139, 148, 255),
             accent_soft: Color32::from_rgb(50, 52, 81),
+            code_bg: Color32::from_rgb(38, 39, 46),
             hover: Color32::from_rgb(42, 44, 53),
         }
     } else {
@@ -88,6 +92,7 @@ fn app_palette(dark: bool) -> AppPalette {
             border: Color32::from_rgb(222, 225, 232),
             accent: Color32::from_rgb(91, 95, 235),
             accent_soft: Color32::from_rgb(235, 236, 255),
+            code_bg: Color32::from_rgb(244, 245, 247),
             hover: Color32::from_rgb(234, 237, 243),
         }
     }
@@ -3351,7 +3356,7 @@ impl RuporaApp {
                                                 is_fenced_code_block(&original_block);
                                             let frame = if block_is_code {
                                                 egui::Frame::new()
-                                                    .fill(palette.hover)
+                                                    .fill(palette.code_bg)
                                                     .stroke(Stroke::new(1.0, palette.border))
                                                     .corner_radius(8)
                                                     .inner_margin(Margin::symmetric(14, 10))
@@ -3376,6 +3381,7 @@ impl RuporaApp {
                                                             &projection,
                                                             wrap_width,
                                                             palette,
+                                                            !block_is_code,
                                                         )
                                                     };
                                                 let mut editor =
@@ -3394,7 +3400,23 @@ impl RuporaApp {
                                                 if block_is_code {
                                                     editor = editor.code_editor();
                                                 }
+                                                let inline_code_background = (!block_is_code)
+                                                    .then(|| ui.painter().add(egui::Shape::Noop));
                                                 let output = editor.show(ui);
+                                                if let Some(shape_index) = inline_code_background {
+                                                    let runs = projection.runs_for(&visual_content);
+                                                    ui.painter().set(
+                                                        shape_index,
+                                                        egui::Shape::Vec(
+                                                            rounded_inline_code_backgrounds(
+                                                                &output.galley,
+                                                                output.galley_pos,
+                                                                &runs,
+                                                                palette,
+                                                            ),
+                                                        ),
+                                                    );
+                                                }
                                                 set_accessible_label(
                                                     ui.ctx(),
                                                     editor_id,
@@ -3410,7 +3432,7 @@ impl RuporaApp {
                                                 let mut changed = output.response.changed();
                                                 let mut kind = EditKind::Typing;
                                                 let mut source_update = None;
-                                                let mut boundary_backspace_handled = false;
+                                                let mut boundary_input_handled = false;
                                                 let defer_ime = focused
                                                     && (ime_action == ImeFrameAction::Preedit
                                                         || had_ime_session
@@ -3427,9 +3449,34 @@ impl RuporaApp {
                                                     && ime_action == ImeFrameAction::Commit
                                                 {
                                                     ime_session = None;
+                                                } else if !defer_ime
+                                                    && focused
+                                                    && !changed
+                                                    && !input_action.horizontal_modified
+                                                    && let Some(selection) =
+                                                        local_source_selection_before.clone()
+                                                    && let Some(selection) =
+                                                        move_across_hidden_inline_code_boundary(
+                                                            &original_block,
+                                                            selection,
+                                                            input_action.left,
+                                                            input_action.right,
+                                                        )
+                                                {
+                                                    next_global_cursor = Some(CCursorRange::two(
+                                                        CCursor::new(
+                                                            block_char_start + selection.start,
+                                                        ),
+                                                        CCursor::new(
+                                                            block_char_start + selection.end,
+                                                        ),
+                                                    ));
+                                                    cursor_adjusted = true;
+                                                    boundary_input_handled = true;
                                                 }
 
-                                                if !defer_ime
+                                                if !boundary_input_handled
+                                                    && !defer_ime
                                                     && focused
                                                     && let (Some(url), Some(selection)) = (
                                                         input_action.pasted_url.as_deref(),
@@ -3523,10 +3570,10 @@ impl RuporaApp {
                                                         CCursor::new(cursor),
                                                     ));
                                                     cursor_adjusted = true;
-                                                    boundary_backspace_handled = true;
+                                                    boundary_input_handled = true;
                                                 }
 
-                                                if !boundary_backspace_handled
+                                                if !boundary_input_handled
                                                     && !defer_ime
                                                     && source_update.is_none()
                                                     && changed
@@ -3572,7 +3619,7 @@ impl RuporaApp {
                                                         base_source: original_block,
                                                         visual_content,
                                                     });
-                                                } else if !boundary_backspace_handled
+                                                } else if !boundary_input_handled
                                                     && let Some((updated, selection)) =
                                                         source_update
                                                 {
@@ -3586,7 +3633,7 @@ impl RuporaApp {
                                                     ));
                                                     pending_edit =
                                                         Some((edit_range.clone(), updated, kind));
-                                                } else if !boundary_backspace_handled
+                                                } else if !boundary_input_handled
                                                     && let Some(selection) = visual_selection_after
                                                 {
                                                     let source_selection =
@@ -3610,16 +3657,29 @@ impl RuporaApp {
                                             });
                                             active_editor_rect = Some(editor_frame.response.rect);
                                         } else {
+                                            let source_block = &source[block.range.clone()];
                                             let block_text = preview_blocks
                                                 .get(&block.id)
                                                 .map(String::as_str)
-                                                .unwrap_or(&source[block.range.clone()]);
+                                                .unwrap_or(source_block);
                                             let shown = ui.scope(|ui| {
                                                 ui.add_space(6.0);
-                                                CommonMarkViewer::new()
-                                                    .default_implicit_uri_scheme(base_uri.clone())
-                                                    .render_math_fn(Some(&render_math))
-                                                    .show(ui, &mut self.preview_cache, block_text);
+                                                if !show_inline_code_chip_preview(
+                                                    ui,
+                                                    source_block,
+                                                    palette,
+                                                ) {
+                                                    CommonMarkViewer::new()
+                                                        .default_implicit_uri_scheme(
+                                                            base_uri.clone(),
+                                                        )
+                                                        .render_math_fn(Some(&render_math))
+                                                        .show(
+                                                            ui,
+                                                            &mut self.preview_cache,
+                                                            block_text,
+                                                        );
+                                                }
                                                 ui.add_space(6.0);
                                             });
                                             let response = ui
@@ -4310,6 +4370,7 @@ fn wysiwyg_layout(
     projection: &VisualProjection,
     wrap_width: f32,
     palette: AppPalette,
+    inline_code_chips: bool,
 ) -> Arc<egui::Galley> {
     let runs = projection.runs_for(text);
     if runs.is_empty() {
@@ -4326,13 +4387,128 @@ fn wysiwyg_layout(
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width;
     job.keep_trailing_whitespace = true;
+    let mut previous_was_inline_code = false;
     for run in runs {
         let start = char_to_byte(text, run.range.start);
         let end = char_to_byte(text, run.range.end);
         let format = visual_text_format(run.style, palette);
-        job.append(&text[start..end], 0.0, format);
+        let is_inline_code = inline_code_chips && run.style.code && !run.style.marker;
+        let leading_space = if is_inline_code != previous_was_inline_code {
+            3.0
+        } else {
+            0.0
+        };
+        job.append(&text[start..end], leading_space, format);
+        previous_was_inline_code = is_inline_code;
     }
     ui.fonts_mut(|fonts| fonts.layout_job(job))
+}
+
+fn rounded_inline_code_backgrounds(
+    galley: &egui::Galley,
+    galley_pos: egui::Pos2,
+    runs: &[crate::wysiwyg::VisualRun],
+    palette: AppPalette,
+) -> Vec<egui::Shape> {
+    let mut shapes = Vec::new();
+    let mut char_index = 0usize;
+    let mut run_index = 0usize;
+
+    for placed_row in &galley.rows {
+        let row_offset = galley_pos.to_vec2() + placed_row.pos.to_vec2();
+        let mut chip_rect = None;
+        for glyph in &placed_row.glyphs {
+            while runs
+                .get(run_index)
+                .is_some_and(|run| run.range.end <= char_index)
+            {
+                run_index += 1;
+            }
+            let is_inline_code = runs.get(run_index).is_some_and(|run| {
+                run.range.contains(&char_index) && run.style.code && !run.style.marker
+            });
+            if is_inline_code {
+                let rect = glyph.logical_rect().translate(row_offset);
+                chip_rect = Some(chip_rect.map_or(rect, |current: egui::Rect| current.union(rect)));
+            } else {
+                push_inline_code_background(&mut shapes, chip_rect.take(), palette);
+            }
+            char_index += 1;
+        }
+        push_inline_code_background(&mut shapes, chip_rect.take(), palette);
+        if placed_row.ends_with_newline {
+            char_index += 1;
+        }
+    }
+    shapes
+}
+
+fn show_inline_code_chip_preview(ui: &mut Ui, source: &str, palette: AppPalette) -> bool {
+    if !supports_inline_code_chip_preview(source) {
+        return false;
+    }
+    let projection = VisualProjection::from_markdown(source);
+    let runs = projection.runs_for(projection.text());
+    let galley = wysiwyg_layout(
+        ui,
+        projection.text(),
+        &projection,
+        ui.available_width(),
+        palette,
+        true,
+    );
+    let (galley_pos, galley, _) = egui::Label::new(galley).selectable(false).layout_in_ui(ui);
+    ui.painter().extend(rounded_inline_code_backgrounds(
+        &galley, galley_pos, &runs, palette,
+    ));
+    ui.painter().galley(galley_pos, galley, palette.text);
+    true
+}
+
+fn supports_inline_code_chip_preview(source: &str) -> bool {
+    let mut has_inline_code = false;
+    for event in Parser::new_ext(source, markdown::parser_options()) {
+        match event {
+            MarkdownEvent::Code(_) => has_inline_code = true,
+            MarkdownEvent::Start(
+                Tag::Paragraph
+                | Tag::Heading { .. }
+                | Tag::Emphasis
+                | Tag::Strong
+                | Tag::Strikethrough,
+            )
+            | MarkdownEvent::End(
+                TagEnd::Paragraph
+                | TagEnd::Heading(_)
+                | TagEnd::Emphasis
+                | TagEnd::Strong
+                | TagEnd::Strikethrough,
+            )
+            | MarkdownEvent::Text(_)
+            | MarkdownEvent::SoftBreak
+            | MarkdownEvent::HardBreak => {}
+            _ => return false,
+        }
+    }
+    has_inline_code
+}
+
+fn push_inline_code_background(
+    shapes: &mut Vec<egui::Shape>,
+    rect: Option<egui::Rect>,
+    palette: AppPalette,
+) {
+    let Some(rect) = rect else {
+        return;
+    };
+    let rect = rect.expand2(Vec2::new(3.0, 1.0));
+    shapes.push(egui::Shape::rect_filled(rect, 4, palette.code_bg));
+    shapes.push(egui::Shape::rect_stroke(
+        rect,
+        4,
+        Stroke::new(0.75, palette.border),
+        egui::StrokeKind::Inside,
+    ));
 }
 
 fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
@@ -4379,8 +4555,6 @@ fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
         format.underline = Stroke::new(1.0, palette.accent);
     }
     if style.code {
-        format.background = palette.hover;
-        format.expand_bg = 3.0;
         format.extra_letter_spacing = 0.1;
     }
     format
@@ -4490,7 +4664,10 @@ fn duplicate_shortcuts(bindings: &KeyBindings) -> bool {
 struct EditorInputAction {
     backspace: bool,
     enter: bool,
+    horizontal_modified: bool,
+    left: bool,
     tab: bool,
+    right: bool,
     shift: bool,
     pasted_url: Option<String>,
     typed_text: Option<String>,
@@ -4500,7 +4677,13 @@ fn editor_input_action(ui: &Ui) -> EditorInputAction {
     ui.input(|input| EditorInputAction {
         backspace: input.key_pressed(Key::Backspace),
         enter: input.key_pressed(Key::Enter),
+        horizontal_modified: input.modifiers.alt
+            || input.modifiers.ctrl
+            || input.modifiers.mac_cmd
+            || input.modifiers.shift,
+        left: input.key_pressed(Key::ArrowLeft),
         tab: input.key_pressed(Key::Tab),
+        right: input.key_pressed(Key::ArrowRight),
         shift: input.modifiers.shift,
         pasted_url: input.events.iter().rev().find_map(|event| match event {
             egui::Event::Paste(text) => Some(text.trim().to_owned()),
@@ -4683,11 +4866,7 @@ fn apply_theme(ctx: &Context, dark: bool) {
     visuals.faint_bg_color = palette.hover;
     visuals.extreme_bg_color = palette.surface;
     visuals.text_edit_bg_color = Some(palette.surface);
-    visuals.code_bg_color = if dark {
-        Color32::from_rgb(27, 27, 29)
-    } else {
-        Color32::from_rgb(247, 247, 249)
-    };
+    visuals.code_bg_color = palette.code_bg;
     visuals.hyperlink_color = palette.accent;
     visuals.selection.bg_fill = palette.accent_soft;
     visuals.selection.stroke = Stroke::new(1.5, palette.accent);
@@ -5005,6 +5184,27 @@ mod tests {
         let code = VisualProjection::from_markdown("```rust\nfn main() {}\n```");
         assert_eq!(code.text(), "fn main() {}");
         assert!(code.runs_for(code.text())[0].style.code);
+    }
+
+    #[test]
+    fn rounded_inline_code_preview_only_replaces_simple_text_blocks() {
+        for source in [
+            "before `code` after",
+            "# heading with `code`",
+            "**bold `code`** and *emphasis*",
+        ] {
+            assert!(supports_inline_code_chip_preview(source), "{source}");
+        }
+
+        for source in [
+            "plain text",
+            "- list with `code`",
+            "[link](note.md) and `code`",
+            "![image](image.png) and `code`",
+            "```rust\ncode\n```",
+        ] {
+            assert!(!supports_inline_code_chip_preview(source), "{source}");
+        }
     }
 
     #[test]
