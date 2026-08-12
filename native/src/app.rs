@@ -33,7 +33,8 @@ use eframe::{
     CreationContext, Frame, Storage,
     egui::{
         self, Align, Button, CentralPanel, Color32, Context, FontData, FontDefinitions, FontFamily,
-        Key, Layout, Panel, RichText, ScrollArea, TextEdit, Ui, Vec2, ViewportCommand,
+        FontId, Key, Layout, Margin, Panel, RichText, ScrollArea, Stroke, TextEdit, TextStyle, Ui,
+        Vec2, ViewportCommand,
         text::{CCursor, CCursorRange},
     },
 };
@@ -41,6 +42,52 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
 const APP_STATE_KEY: &str = "rupora-native-state";
+const UI_EXPERIENCE_KEY: &str = "rupora-native-ui-experience";
+const CURRENT_UI_EXPERIENCE: u32 = 1;
+
+#[derive(Clone, Copy)]
+struct AppPalette {
+    canvas: Color32,
+    surface: Color32,
+    toolbar: Color32,
+    sidebar: Color32,
+    text: Color32,
+    secondary: Color32,
+    border: Color32,
+    accent: Color32,
+    accent_soft: Color32,
+    hover: Color32,
+}
+
+fn app_palette(dark: bool) -> AppPalette {
+    if dark {
+        AppPalette {
+            canvas: Color32::from_rgb(28, 28, 30),
+            surface: Color32::from_rgb(36, 36, 38),
+            toolbar: Color32::from_rgb(31, 31, 33),
+            sidebar: Color32::from_rgb(32, 32, 34),
+            text: Color32::from_rgb(245, 245, 247),
+            secondary: Color32::from_rgb(161, 161, 166),
+            border: Color32::from_rgb(58, 58, 60),
+            accent: Color32::from_rgb(10, 132, 255),
+            accent_soft: Color32::from_rgb(22, 59, 99),
+            hover: Color32::from_rgb(44, 44, 46),
+        }
+    } else {
+        AppPalette {
+            canvas: Color32::from_rgb(245, 245, 247),
+            surface: Color32::WHITE,
+            toolbar: Color32::from_rgb(251, 251, 253),
+            sidebar: Color32::from_rgb(242, 242, 244),
+            text: Color32::from_rgb(29, 29, 31),
+            secondary: Color32::from_rgb(110, 110, 115),
+            border: Color32::from_rgb(210, 210, 215),
+            accent: Color32::from_rgb(0, 122, 255),
+            accent_soft: Color32::from_rgb(232, 242, 255),
+            hover: Color32::from_rgb(232, 232, 237),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SplitScrollDriver {
@@ -105,7 +152,6 @@ pub struct RuporaApp {
     split_editor_maximum: f32,
     split_preview_maximum: f32,
     split_scroll_document: Option<usize>,
-    collapsed_blocks: HashSet<(usize, BlockId)>,
     shortcut_settings_open: bool,
     external_diff_view: Option<String>,
     generated_svg_cache: Rc<RefCell<HashMap<String, Arc<[u8]>>>>,
@@ -142,10 +188,18 @@ impl RuporaApp {
         instance_coordinator: Option<InstanceCoordinator>,
     ) -> Self {
         install_fonts(&creation_context.egui_ctx);
-        let state: PersistedState = creation_context
+        let mut state: PersistedState = creation_context
             .storage
             .and_then(|storage| eframe::get_value(storage, APP_STATE_KEY))
             .unwrap_or_default();
+        let ui_experience = creation_context
+            .storage
+            .and_then(|storage| eframe::get_value::<u32>(storage, UI_EXPERIENCE_KEY))
+            .unwrap_or_default();
+        if ui_experience < CURRENT_UI_EXPERIENCE {
+            state.view_mode = ViewMode::Hybrid;
+            state.show_outline = false;
+        }
         apply_theme(&creation_context.egui_ctx, state.dark);
         let recovery_store = RecoveryStore::for_app("RUPORA");
         let recovered_entries = recovery_store.load();
@@ -194,7 +248,6 @@ impl RuporaApp {
             split_editor_maximum: 0.0,
             split_preview_maximum: 0.0,
             split_scroll_document: None,
-            collapsed_blocks: HashSet::new(),
             shortcut_settings_open: false,
             external_diff_view: None,
             generated_svg_cache: Rc::new(RefCell::new(HashMap::new())),
@@ -706,7 +759,6 @@ impl RuporaApp {
             self.external_conflicts.remove(path);
         }
         self.documents.remove(index);
-        self.collapsed_blocks.clear();
         self.active = match (self.active, self.documents.is_empty()) {
             (_, true) => None,
             (Some(active), false) if active > index => Some(active - 1),
@@ -1688,218 +1740,320 @@ impl RuporaApp {
             .iter()
             .map(|service| service.name.clone())
             .collect::<Vec<_>>();
-        Panel::top("toolbar").exact_size(48.0).show(root, |ui| {
-            ui.add_space(7.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                if ui.button("新建").on_hover_text("Ctrl+N").clicked() {
-                    self.execute(AppCommand::New);
-                }
-                if ui.button("打开").on_hover_text("Ctrl+O").clicked() {
-                    self.execute(AppCommand::Open);
-                }
-                if ui.button("文件夹").on_hover_text("Ctrl+Shift+O").clicked() {
-                    self.execute(AppCommand::OpenFolder);
-                }
-                if ui.button("保存").on_hover_text("Ctrl+S").clicked() {
-                    self.execute(AppCommand::Save);
-                }
-                if ui.button("另存为").on_hover_text("Ctrl+Shift+S").clicked() {
-                    self.execute(AppCommand::SaveAs);
-                }
-                let can_undo = self
-                    .active
-                    .and_then(|index| self.documents.get(index))
-                    .is_some_and(Document::can_undo);
-                if ui
-                    .add_enabled(can_undo, Button::new("撤销"))
-                    .on_hover_text("Ctrl+Z")
-                    .clicked()
-                {
-                    self.execute(AppCommand::Undo);
-                }
-                let can_redo = self
-                    .active
-                    .and_then(|index| self.documents.get(index))
-                    .is_some_and(Document::can_redo);
-                if ui
-                    .add_enabled(can_redo, Button::new("重做"))
-                    .on_hover_text("Ctrl+Shift+Z / Ctrl+Y")
-                    .clicked()
-                {
-                    self.execute(AppCommand::Redo);
-                }
-                ui.menu_button("导出", |ui| {
-                    if ui.button("HTML…").clicked() {
-                        self.execute(AppCommand::ExportHtml);
-                        ui.close();
+        let palette = app_palette(self.state.dark);
+        let active_document = self.active.and_then(|index| self.documents.get(index));
+        let document_title = active_document
+            .map(Document::title)
+            .unwrap_or_else(|| "RUPORA".to_owned());
+        let document_dirty = active_document.is_some_and(|document| document.dirty);
+        let toolbar_frame = egui::Frame::new()
+            .fill(palette.toolbar)
+            .inner_margin(Margin::symmetric(14, 9))
+            .stroke(Stroke::new(1.0, palette.border));
+        Panel::top("toolbar")
+            .exact_size(60.0)
+            .frame(toolbar_frame)
+            .show(root, |ui| {
+                ui.horizontal(|ui| {
+                    if toolbar_symbol_button(ui, "＋", "新建文档 · Ctrl+N").clicked() {
+                        self.execute(AppCommand::New);
                     }
-                    if ui.button("PDF…").clicked() {
-                        self.execute(AppCommand::ExportPdf);
-                        ui.close();
-                    }
-                    if ui.button("打印…").clicked() {
-                        self.execute(AppCommand::Print);
-                        ui.close();
-                    }
-                });
-                ui.menu_button("扩展", |ui| {
-                    if !self.extension_registry.is_enabled() {
-                        ui.label("扩展默认关闭");
-                    } else if extension_names.is_empty() {
-                        ui.label("没有已配置的扩展服务");
-                    }
-                    for (index, name) in extension_names.iter().enumerate() {
-                        if ui
-                            .add_enabled(
-                                self.extension_receiver.is_none() && self.active.is_some(),
-                                Button::new(name),
-                            )
-                            .clicked()
-                        {
-                            self.execute(AppCommand::RunExtension(index));
-                            ui.close();
-                        }
-                    }
-                    ui.separator();
-                    if ui.button("打开扩展配置").clicked() {
-                        self.execute(AppCommand::OpenExtensionConfig);
-                        ui.close();
-                    }
-                    if ui.button("重新加载扩展配置").clicked() {
-                        self.execute(AppCommand::ReloadExtensions);
-                        ui.close();
-                    }
-                });
-                ui.menu_button("帮助", |ui| {
                     if ui
-                        .add_enabled(self.update_receiver.is_none(), Button::new("检查更新…"))
+                        .add(
+                            Button::new("打开")
+                                .fill(palette.surface)
+                                .stroke(Stroke::new(1.0, palette.border)),
+                        )
+                        .on_hover_text("打开 Markdown · Ctrl+O")
                         .clicked()
                     {
-                        self.execute(AppCommand::CheckUpdates);
-                        ui.close();
+                        self.execute(AppCommand::Open);
                     }
-                    if self.available_update.is_some() && ui.button("打开新版本发布页").clicked()
+                    if ui
+                        .add_enabled(
+                            self.active.is_some(),
+                            Button::new(RichText::new("保存").color(Color32::WHITE))
+                                .fill(palette.accent)
+                                .stroke(Stroke::NONE),
+                        )
+                        .on_hover_text("保存当前文档 · Ctrl+S")
+                        .clicked()
                     {
-                        self.execute(AppCommand::OpenReleasePage);
-                        ui.close();
+                        self.execute(AppCommand::Save);
                     }
-                    if ui.button("所有版本与校验信息").clicked() {
-                        self.execute(AppCommand::OpenReleasePage);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("打开诊断日志目录").clicked() {
-                        self.execute(AppCommand::OpenDiagnostics);
-                        ui.close();
-                    }
-                    if ui.button("关于 RUPORA").clicked() {
-                        self.execute(AppCommand::About);
-                        ui.close();
-                    }
-                });
-
-                ui.separator();
-                ui.menu_button("格式", |ui| {
-                    if ui.button("粗体    Ctrl+B").clicked() {
-                        self.execute(AppCommand::Format(MarkdownCommand::Bold));
-                        ui.close();
-                    }
-                    if ui.button("斜体    Ctrl+I").clicked() {
-                        self.execute(AppCommand::Format(MarkdownCommand::Italic));
-                        ui.close();
-                    }
-                    if ui.button("删除线").clicked() {
-                        self.execute(AppCommand::Format(MarkdownCommand::Strikethrough));
-                        ui.close();
-                    }
-                    if ui.button("行内代码").clicked() {
-                        self.execute(AppCommand::Format(MarkdownCommand::InlineCode));
-                        ui.close();
-                    }
-                    if ui.button("链接    Ctrl+K").clicked() {
-                        self.execute(AppCommand::Format(MarkdownCommand::Link));
-                        ui.close();
-                    }
-                    ui.separator();
-                    for level in 1..=6 {
-                        if ui.button(format!("标题 {level}")).clicked() {
-                            self.execute(AppCommand::Format(MarkdownCommand::Heading(level)));
-                            ui.close();
+                    ui.menu_button(RichText::new("•••").size(16.0), |ui| {
+                        ui.set_min_width(180.0);
+                        ui.label(RichText::new("全部操作").small().color(palette.secondary));
+                        ui.separator();
+                        if ui.button("新建").on_hover_text("Ctrl+N").clicked() {
+                            self.execute(AppCommand::New);
                         }
-                    }
-                    if ui.button("引用").clicked() {
-                        self.execute(AppCommand::Format(MarkdownCommand::Quote));
-                        ui.close();
-                    }
-                    if ui.button("无序列表").clicked() {
-                        self.execute(AppCommand::Format(MarkdownCommand::BulletList));
-                        ui.close();
-                    }
-                    if ui.button("有序列表").clicked() {
-                        self.execute(AppCommand::Format(MarkdownCommand::OrderedList));
-                        ui.close();
-                    }
-                    if ui.button("代码块").clicked() {
-                        self.execute(AppCommand::Format(MarkdownCommand::CodeBlock));
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("目录 [TOC]").clicked() {
-                        self.execute(AppCommand::InsertToc);
-                        ui.close();
-                    }
-                    if ui.button("脚注").clicked() {
-                        self.execute(AppCommand::InsertFootnote);
-                        ui.close();
-                    }
-                    if ui.button("可视化表格…").clicked() {
-                        self.execute(AppCommand::EditTable);
-                        ui.close();
-                    }
-                    let anchors = self
-                        .active
-                        .map(|index| markdown::heading_anchors(&self.documents[index].content))
-                        .unwrap_or_default();
-                    ui.menu_button("交叉引用", |ui| {
-                        if anchors.is_empty() {
-                            ui.label("当前文档没有标题");
+                        if ui.button("打开").on_hover_text("Ctrl+O").clicked() {
+                            self.execute(AppCommand::Open);
                         }
-                        for anchor in &anchors {
-                            let label =
-                                format!("H{}  {}", anchor.heading.level, anchor.heading.text);
-                            if ui.button(label).clicked() {
-                                self.insert_cross_reference(&anchor.heading.text, &anchor.id);
+                        if ui.button("文件夹").on_hover_text("Ctrl+Shift+O").clicked() {
+                            self.execute(AppCommand::OpenFolder);
+                        }
+                        if ui.button("保存").on_hover_text("Ctrl+S").clicked() {
+                            self.execute(AppCommand::Save);
+                        }
+                        if ui.button("另存为").on_hover_text("Ctrl+Shift+S").clicked() {
+                            self.execute(AppCommand::SaveAs);
+                        }
+                        let can_undo = self
+                            .active
+                            .and_then(|index| self.documents.get(index))
+                            .is_some_and(Document::can_undo);
+                        if ui
+                            .add_enabled(can_undo, Button::new("撤销"))
+                            .on_hover_text("Ctrl+Z")
+                            .clicked()
+                        {
+                            self.execute(AppCommand::Undo);
+                        }
+                        let can_redo = self
+                            .active
+                            .and_then(|index| self.documents.get(index))
+                            .is_some_and(Document::can_redo);
+                        if ui
+                            .add_enabled(can_redo, Button::new("重做"))
+                            .on_hover_text("Ctrl+Shift+Z / Ctrl+Y")
+                            .clicked()
+                        {
+                            self.execute(AppCommand::Redo);
+                        }
+                        ui.menu_button("导出", |ui| {
+                            if ui.button("HTML…").clicked() {
+                                self.execute(AppCommand::ExportHtml);
                                 ui.close();
                             }
+                            if ui.button("PDF…").clicked() {
+                                self.execute(AppCommand::ExportPdf);
+                                ui.close();
+                            }
+                            if ui.button("打印…").clicked() {
+                                self.execute(AppCommand::Print);
+                                ui.close();
+                            }
+                        });
+                        ui.menu_button("扩展", |ui| {
+                            if !self.extension_registry.is_enabled() {
+                                ui.label("扩展默认关闭");
+                            } else if extension_names.is_empty() {
+                                ui.label("没有已配置的扩展服务");
+                            }
+                            for (index, name) in extension_names.iter().enumerate() {
+                                if ui
+                                    .add_enabled(
+                                        self.extension_receiver.is_none() && self.active.is_some(),
+                                        Button::new(name),
+                                    )
+                                    .clicked()
+                                {
+                                    self.execute(AppCommand::RunExtension(index));
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("打开扩展配置").clicked() {
+                                self.execute(AppCommand::OpenExtensionConfig);
+                                ui.close();
+                            }
+                            if ui.button("重新加载扩展配置").clicked() {
+                                self.execute(AppCommand::ReloadExtensions);
+                                ui.close();
+                            }
+                        });
+                        ui.menu_button("帮助", |ui| {
+                            if ui
+                                .add_enabled(
+                                    self.update_receiver.is_none(),
+                                    Button::new("检查更新…"),
+                                )
+                                .clicked()
+                            {
+                                self.execute(AppCommand::CheckUpdates);
+                                ui.close();
+                            }
+                            if self.available_update.is_some()
+                                && ui.button("打开新版本发布页").clicked()
+                            {
+                                self.execute(AppCommand::OpenReleasePage);
+                                ui.close();
+                            }
+                            if ui.button("所有版本与校验信息").clicked() {
+                                self.execute(AppCommand::OpenReleasePage);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("打开诊断日志目录").clicked() {
+                                self.execute(AppCommand::OpenDiagnostics);
+                                ui.close();
+                            }
+                            if ui.button("关于 RUPORA").clicked() {
+                                self.execute(AppCommand::About);
+                                ui.close();
+                            }
+                        });
+
+                        ui.separator();
+                        ui.menu_button("格式", |ui| {
+                            if ui.button("粗体    Ctrl+B").clicked() {
+                                self.execute(AppCommand::Format(MarkdownCommand::Bold));
+                                ui.close();
+                            }
+                            if ui.button("斜体    Ctrl+I").clicked() {
+                                self.execute(AppCommand::Format(MarkdownCommand::Italic));
+                                ui.close();
+                            }
+                            if ui.button("删除线").clicked() {
+                                self.execute(AppCommand::Format(MarkdownCommand::Strikethrough));
+                                ui.close();
+                            }
+                            if ui.button("行内代码").clicked() {
+                                self.execute(AppCommand::Format(MarkdownCommand::InlineCode));
+                                ui.close();
+                            }
+                            if ui.button("链接    Ctrl+K").clicked() {
+                                self.execute(AppCommand::Format(MarkdownCommand::Link));
+                                ui.close();
+                            }
+                            ui.separator();
+                            for level in 1..=6 {
+                                if ui.button(format!("标题 {level}")).clicked() {
+                                    self.execute(AppCommand::Format(MarkdownCommand::Heading(
+                                        level,
+                                    )));
+                                    ui.close();
+                                }
+                            }
+                            if ui.button("引用").clicked() {
+                                self.execute(AppCommand::Format(MarkdownCommand::Quote));
+                                ui.close();
+                            }
+                            if ui.button("无序列表").clicked() {
+                                self.execute(AppCommand::Format(MarkdownCommand::BulletList));
+                                ui.close();
+                            }
+                            if ui.button("有序列表").clicked() {
+                                self.execute(AppCommand::Format(MarkdownCommand::OrderedList));
+                                ui.close();
+                            }
+                            if ui.button("代码块").clicked() {
+                                self.execute(AppCommand::Format(MarkdownCommand::CodeBlock));
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("目录 [TOC]").clicked() {
+                                self.execute(AppCommand::InsertToc);
+                                ui.close();
+                            }
+                            if ui.button("脚注").clicked() {
+                                self.execute(AppCommand::InsertFootnote);
+                                ui.close();
+                            }
+                            if ui.button("可视化表格…").clicked() {
+                                self.execute(AppCommand::EditTable);
+                                ui.close();
+                            }
+                            let anchors = self
+                                .active
+                                .map(|index| {
+                                    markdown::heading_anchors(&self.documents[index].content)
+                                })
+                                .unwrap_or_default();
+                            ui.menu_button("交叉引用", |ui| {
+                                if anchors.is_empty() {
+                                    ui.label("当前文档没有标题");
+                                }
+                                for anchor in &anchors {
+                                    let label = format!(
+                                        "H{}  {}",
+                                        anchor.heading.level, anchor.heading.text
+                                    );
+                                    if ui.button(label).clicked() {
+                                        self.insert_cross_reference(
+                                            &anchor.heading.text,
+                                            &anchor.id,
+                                        );
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        });
+                        if ui.button("查找").on_hover_text("Ctrl+F").clicked() {
+                            self.find_open = true;
+                            self.find_focus_requested = true;
                         }
+                        if ui.button("命令").on_hover_text("Ctrl+Shift+P").clicked() {
+                            self.command_palette_open = true;
+                            self.command_focus_requested = true;
+                        }
+                        ui.separator();
+                        ui.selectable_value(&mut self.state.view_mode, ViewMode::Edit, "编辑");
+                        ui.selectable_value(&mut self.state.view_mode, ViewMode::Split, "分屏");
+                        ui.selectable_value(&mut self.state.view_mode, ViewMode::Hybrid, "混合");
+                        ui.selectable_value(&mut self.state.view_mode, ViewMode::Preview, "预览");
+
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let theme_label = if self.state.dark { "浅色" } else { "深色" };
+                            if ui.button(theme_label).clicked() {
+                                self.state.dark = !self.state.dark;
+                                apply_theme(ui.ctx(), self.state.dark);
+                            }
+                            ui.checkbox(&mut self.state.show_outline, "大纲");
+                            ui.checkbox(&mut self.state.show_sidebar, "文档");
+                        });
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    let title = if document_dirty {
+                        format!("{document_title}  •")
+                    } else {
+                        document_title.to_owned()
+                    };
+                    ui.add_sized(
+                        [150.0, 32.0],
+                        egui::Label::new(RichText::new(title).strong()).truncate(),
+                    )
+                    .on_hover_text(document_title);
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let theme_symbol = if self.state.dark { "亮" } else { "暗" };
+                        if toolbar_symbol_button(ui, theme_symbol, "切换浅色 / 深色外观").clicked()
+                        {
+                            self.state.dark = !self.state.dark;
+                            apply_theme(ui.ctx(), self.state.dark);
+                        }
+                        if toolbar_toggle_button(
+                            ui,
+                            "纲",
+                            self.state.show_outline,
+                            "显示 / 隐藏大纲",
+                            palette,
+                        )
+                        .clicked()
+                        {
+                            self.state.show_outline = !self.state.show_outline;
+                        }
+                        if toolbar_toggle_button(
+                            ui,
+                            "栏",
+                            self.state.show_sidebar,
+                            "显示 / 隐藏文档栏",
+                            palette,
+                        )
+                        .clicked()
+                        {
+                            self.state.show_sidebar = !self.state.show_sidebar;
+                        }
+                        ui.add_space(6.0);
+                        view_mode_selector(ui, &mut self.state.view_mode, palette);
                     });
                 });
-                if ui.button("查找").on_hover_text("Ctrl+F").clicked() {
-                    self.find_open = true;
-                    self.find_focus_requested = true;
-                }
-                if ui.button("命令").on_hover_text("Ctrl+Shift+P").clicked() {
-                    self.command_palette_open = true;
-                    self.command_focus_requested = true;
-                }
-                ui.separator();
-                ui.selectable_value(&mut self.state.view_mode, ViewMode::Edit, "编辑");
-                ui.selectable_value(&mut self.state.view_mode, ViewMode::Split, "分屏");
-                ui.selectable_value(&mut self.state.view_mode, ViewMode::Hybrid, "混合");
-                ui.selectable_value(&mut self.state.view_mode, ViewMode::Preview, "预览");
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let theme_label = if self.state.dark { "浅色" } else { "深色" };
-                    if ui.button(theme_label).clicked() {
-                        self.state.dark = !self.state.dark;
-                        apply_theme(ui.ctx(), self.state.dark);
-                    }
-                    ui.checkbox(&mut self.state.show_outline, "大纲");
-                    ui.checkbox(&mut self.state.show_sidebar, "文档");
-                });
             });
-        });
     }
 
     fn find_bar(&mut self, root: &mut Ui) {
@@ -2125,12 +2279,18 @@ impl RuporaApp {
             return;
         }
 
+        let palette = app_palette(self.state.dark);
         Panel::left("documents")
-            .default_size(230.0)
-            .size_range(160.0..=420.0)
+            .default_size(248.0)
+            .size_range(190.0..=420.0)
             .resizable(true)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.sidebar)
+                    .inner_margin(Margin::symmetric(14, 12))
+                    .stroke(Stroke::new(1.0, palette.border)),
+            )
             .show(root, |ui| {
-                ui.add_space(8.0);
                 let mut workspace_file_to_open = None;
                 let mut refresh_workspace = false;
                 let mut close_workspace = false;
@@ -2180,9 +2340,14 @@ impl RuporaApp {
                 }
 
                 ui.horizontal(|ui| {
-                    ui.heading("文档");
+                    ui.label(
+                        RichText::new("文稿")
+                            .small()
+                            .strong()
+                            .color(palette.secondary),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("+").on_hover_text("新建文档").clicked() {
+                        if toolbar_symbol_button(ui, "＋", "新建文档").clicked() {
                             self.new_document();
                         }
                     });
@@ -2264,13 +2429,25 @@ impl RuporaApp {
             .unwrap_or_default();
 
         let mut jump_to_line = None;
+        let palette = app_palette(self.state.dark);
         Panel::right("outline")
-            .default_size(220.0)
-            .size_range(150.0..=400.0)
+            .default_size(236.0)
+            .size_range(180.0..=400.0)
             .resizable(true)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.sidebar)
+                    .inner_margin(Margin::symmetric(14, 12))
+                    .stroke(Stroke::new(1.0, palette.border)),
+            )
             .show(root, |ui| {
-                ui.add_space(8.0);
-                ui.heading("大纲");
+                ui.label(
+                    RichText::new("内容大纲")
+                        .small()
+                        .strong()
+                        .color(palette.secondary),
+                );
+                ui.add_space(4.0);
                 ui.separator();
                 if headings.is_empty() {
                     ui.label(RichText::new("暂无标题").weak());
@@ -2290,57 +2467,102 @@ impl RuporaApp {
     }
 
     fn editor(&mut self, root: &mut Ui) {
-        CentralPanel::default().show(root, |ui| {
-            let Some(index) = self.active else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("新建或打开一个 Markdown 文档");
-                });
-                return;
-            };
-
-            let mode = self.state.view_mode;
-            match mode {
-                ViewMode::Edit => {
-                    self.edit_pane(ui, index, None);
-                }
-                ViewMode::Preview => {
-                    self.preview_pane(ui, index, None);
-                }
-                ViewMode::Hybrid => self.hybrid_pane(ui, index),
-                ViewMode::Split => {
-                    if self.split_scroll_document != Some(index) {
-                        self.split_scroll_document = Some(index);
-                        self.split_scroll_ratio = 0.0;
-                        self.split_editor_maximum = 0.0;
-                        self.split_preview_maximum = 0.0;
-                    }
-                    let editor_target = (self.split_scroll_driver == SplitScrollDriver::Preview)
-                        .then_some(self.split_scroll_ratio * self.split_editor_maximum);
-                    let preview_target = (self.split_scroll_driver == SplitScrollDriver::Editor)
-                        .then_some(self.split_scroll_ratio * self.split_preview_maximum);
-                    let mut editor_scroll = PaneScroll::default();
-                    let mut preview_scroll = PaneScroll::default();
-                    ui.columns(2, |columns| {
-                        columns[0].push_id("source-pane", |ui| {
-                            editor_scroll = self.edit_pane(ui, index, editor_target);
-                        });
-                        columns[1].separator();
-                        columns[1].push_id("preview-pane", |ui| {
-                            preview_scroll = self.preview_pane(ui, index, preview_target);
-                        });
+        let palette = app_palette(self.state.dark);
+        CentralPanel::default()
+            .frame(egui::Frame::new().fill(palette.canvas))
+            .show(root, |ui| {
+                let Some(index) = self.active else {
+                    ui.centered_and_justified(|ui| {
+                        egui::Frame::new()
+                            .fill(palette.surface)
+                            .stroke(Stroke::new(1.0, palette.border))
+                            .corner_radius(18)
+                            .inner_margin(Margin::symmetric(48, 40))
+                            .show(ui, |ui| {
+                                ui.vertical_centered(|ui| {
+                                    ui.label(RichText::new("R").size(42.0).color(palette.accent));
+                                    ui.add_space(8.0);
+                                    ui.label(RichText::new("开始书写").size(24.0).strong());
+                                    ui.label(
+                                        RichText::new("创建新文稿，或继续编辑已有 Markdown 文件")
+                                            .color(palette.secondary),
+                                    );
+                                    ui.add_space(18.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add(
+                                                Button::new(
+                                                    RichText::new("新建文稿").color(Color32::WHITE),
+                                                )
+                                                .fill(palette.accent)
+                                                .stroke(Stroke::NONE),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.execute(AppCommand::New);
+                                        }
+                                        if ui
+                                            .add(
+                                                Button::new("打开文件")
+                                                    .fill(palette.canvas)
+                                                    .stroke(Stroke::new(1.0, palette.border)),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.execute(AppCommand::Open);
+                                        }
+                                    });
+                                });
+                            });
                     });
-                    self.split_editor_maximum = editor_scroll.maximum;
-                    self.split_preview_maximum = preview_scroll.maximum;
-                    if editor_scroll.hovered {
-                        self.split_scroll_driver = SplitScrollDriver::Editor;
-                        self.split_scroll_ratio = scroll_ratio(editor_scroll);
-                    } else if preview_scroll.hovered {
-                        self.split_scroll_driver = SplitScrollDriver::Preview;
-                        self.split_scroll_ratio = scroll_ratio(preview_scroll);
+                    return;
+                };
+
+                let mode = self.state.view_mode;
+                match mode {
+                    ViewMode::Edit => {
+                        self.edit_pane(ui, index, None);
+                    }
+                    ViewMode::Preview => {
+                        self.preview_pane(ui, index, None);
+                    }
+                    ViewMode::Hybrid => self.hybrid_pane(ui, index),
+                    ViewMode::Split => {
+                        if self.split_scroll_document != Some(index) {
+                            self.split_scroll_document = Some(index);
+                            self.split_scroll_ratio = 0.0;
+                            self.split_editor_maximum = 0.0;
+                            self.split_preview_maximum = 0.0;
+                        }
+                        let editor_target = (self.split_scroll_driver
+                            == SplitScrollDriver::Preview)
+                            .then_some(self.split_scroll_ratio * self.split_editor_maximum);
+                        let preview_target = (self.split_scroll_driver
+                            == SplitScrollDriver::Editor)
+                            .then_some(self.split_scroll_ratio * self.split_preview_maximum);
+                        let mut editor_scroll = PaneScroll::default();
+                        let mut preview_scroll = PaneScroll::default();
+                        ui.columns(2, |columns| {
+                            columns[0].push_id("source-pane", |ui| {
+                                editor_scroll = self.edit_pane(ui, index, editor_target);
+                            });
+                            columns[1].separator();
+                            columns[1].push_id("preview-pane", |ui| {
+                                preview_scroll = self.preview_pane(ui, index, preview_target);
+                            });
+                        });
+                        self.split_editor_maximum = editor_scroll.maximum;
+                        self.split_preview_maximum = preview_scroll.maximum;
+                        if editor_scroll.hovered {
+                            self.split_scroll_driver = SplitScrollDriver::Editor;
+                            self.split_scroll_ratio = scroll_ratio(editor_scroll);
+                        } else if preview_scroll.hovered {
+                            self.split_scroll_driver = SplitScrollDriver::Preview;
+                            self.split_scroll_ratio = scroll_ratio(preview_scroll);
+                        }
                     }
                 }
-            }
-        });
+            });
     }
 
     fn edit_pane(&mut self, ui: &mut Ui, index: usize, scroll_offset: Option<f32>) -> PaneScroll {
@@ -2350,152 +2572,191 @@ impl RuporaApp {
             scroll_area = scroll_area.vertical_scroll_offset(offset);
         }
         let mut context_command = None;
+        let palette = app_palette(self.state.dark);
         let output = scroll_area.show(ui, |ui| {
-            let available = ui.available_size();
-            ui.set_min_size(Vec2::new(available.x, available.y.max(420.0)));
-            let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
-            let desired_rows = (available.y / row_height).max(20.0) as usize;
-            let editor_id = ui.make_persistent_id(("editor", index));
-            if let Some(cursor_range) = self.pending_editor_cursor.take() {
-                let mut state = TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
-                state.cursor.set_char_range(Some(cursor_range));
-                state.store(ui.ctx(), editor_id);
-                ui.memory_mut(|memory| memory.request_focus(editor_id));
-                self.editor_cursor = Some(cursor_range);
-            }
-            let input_action = editor_input_action(ui);
-            let mut editor_buffer = TrackingTextBuffer::new(&mut self.documents[index].content);
-            let output = TextEdit::multiline(&mut editor_buffer)
-                .id(editor_id)
-                .font(egui::TextStyle::Monospace)
-                .code_editor()
-                .hint_text("Markdown 源码编辑区")
-                .desired_width(f32::INFINITY)
-                .desired_rows(desired_rows)
-                .lock_focus(true)
-                .show(ui);
-            set_accessible_label(ui.ctx(), editor_id, "Markdown 源码编辑区");
-            let mut before_content = editor_buffer.take_before();
-            drop(editor_buffer);
-            output.response.context_menu(|ui| {
-                if ui.button("撤销").clicked() {
-                    context_command = Some(AppCommand::Undo);
-                    ui.close();
-                }
-                if ui.button("重做").clicked() {
-                    context_command = Some(AppCommand::Redo);
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("粗体").clicked() {
-                    context_command = Some(AppCommand::Format(MarkdownCommand::Bold));
-                    ui.close();
-                }
-                if ui.button("斜体").clicked() {
-                    context_command = Some(AppCommand::Format(MarkdownCommand::Italic));
-                    ui.close();
-                }
-                if ui.button("链接").clicked() {
-                    context_command = Some(AppCommand::Format(MarkdownCommand::Link));
-                    ui.close();
-                }
-                if ui.button("行内代码").clicked() {
-                    context_command = Some(AppCommand::Format(MarkdownCommand::InlineCode));
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("粘贴剪贴板图片").clicked() {
-                    context_command = Some(AppCommand::PasteImage);
-                    ui.close();
-                }
-                if ui.button("可视化编辑表格").clicked() {
-                    context_command = Some(AppCommand::EditTable);
-                    ui.close();
-                }
+            let viewport = ui.available_size();
+            ui.set_min_size(Vec2::new(viewport.x, viewport.y.max(420.0)));
+            ui.add_space(24.0);
+            let page_width = ui.available_width().min(920.0);
+            let side_margin = ((ui.available_width() - page_width) * 0.5).max(16.0);
+            ui.horizontal(|ui| {
+                ui.add_space(side_margin);
+                egui::Frame::new()
+                    .fill(palette.surface)
+                    .stroke(Stroke::new(1.0, palette.border))
+                    .corner_radius(16)
+                    .inner_margin(Margin::symmetric(42, 34))
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 22,
+                        spread: 0,
+                        color: Color32::from_black_alpha(if self.state.dark { 72 } else { 20 }),
+                    })
+                    .show(ui, |ui| {
+                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                            ui.set_width((page_width - 84.0).max(200.0));
+                            let available =
+                                Vec2::new(ui.available_width(), (viewport.y - 116.0).max(360.0));
+                            let row_height =
+                                ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
+                            let desired_rows = (available.y / row_height).max(20.0) as usize;
+                            let editor_id = ui.make_persistent_id(("editor", index));
+                            if let Some(cursor_range) = self.pending_editor_cursor.take() {
+                                let mut state =
+                                    TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+                                state.cursor.set_char_range(Some(cursor_range));
+                                state.store(ui.ctx(), editor_id);
+                                ui.memory_mut(|memory| memory.request_focus(editor_id));
+                                self.editor_cursor = Some(cursor_range);
+                            }
+                            let input_action = editor_input_action(ui);
+                            let mut editor_buffer =
+                                TrackingTextBuffer::new(&mut self.documents[index].content);
+                            let output = TextEdit::multiline(&mut editor_buffer)
+                                .id(editor_id)
+                                .font(egui::TextStyle::Monospace)
+                                .code_editor()
+                                .hint_text("Markdown 源码编辑区")
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(desired_rows)
+                                .lock_focus(true)
+                                .show(ui);
+                            set_accessible_label(ui.ctx(), editor_id, "Markdown 源码编辑区");
+                            let mut before_content = editor_buffer.take_before();
+                            drop(editor_buffer);
+                            output.response.context_menu(|ui| {
+                                if ui.button("撤销").clicked() {
+                                    context_command = Some(AppCommand::Undo);
+                                    ui.close();
+                                }
+                                if ui.button("重做").clicked() {
+                                    context_command = Some(AppCommand::Redo);
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("粗体").clicked() {
+                                    context_command =
+                                        Some(AppCommand::Format(MarkdownCommand::Bold));
+                                    ui.close();
+                                }
+                                if ui.button("斜体").clicked() {
+                                    context_command =
+                                        Some(AppCommand::Format(MarkdownCommand::Italic));
+                                    ui.close();
+                                }
+                                if ui.button("链接").clicked() {
+                                    context_command =
+                                        Some(AppCommand::Format(MarkdownCommand::Link));
+                                    ui.close();
+                                }
+                                if ui.button("行内代码").clicked() {
+                                    context_command =
+                                        Some(AppCommand::Format(MarkdownCommand::InlineCode));
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("粘贴剪贴板图片").clicked() {
+                                    context_command = Some(AppCommand::PasteImage);
+                                    ui.close();
+                                }
+                                if ui.button("可视化编辑表格").clicked() {
+                                    context_command = Some(AppCommand::EditTable);
+                                    ui.close();
+                                }
+                            });
+                            let mut selection_after =
+                                output.cursor_range.map(cursor_range_to_char_range);
+                            if let Some(cursor_range) = output.cursor_range {
+                                self.editor_cursor = Some(cursor_range);
+                            }
+                            let focused = output.response.has_focus();
+                            let mut changed = output.response.changed();
+                            let mut kind = EditKind::Typing;
+                            let mut cursor_adjusted = false;
+
+                            if focused
+                                && let (Some(url), Some(selection)) =
+                                    (input_action.pasted_url.as_deref(), selection_before.clone())
+                                && !selection.is_empty()
+                                && let Some(before_content) = before_content.as_ref()
+                            {
+                                self.documents[index].content.clone_from(before_content);
+                                if let Some(next) = editing::paste_url_as_markdown_link(
+                                    &mut self.documents[index].content,
+                                    selection,
+                                    url,
+                                ) {
+                                    selection_after = Some(next);
+                                    kind = EditKind::Other;
+                                    changed = true;
+                                    cursor_adjusted = true;
+                                }
+                            } else if focused
+                                && input_action.tab
+                                && let Some(before_content) = before_content.as_ref()
+                            {
+                                self.documents[index].content.clone_from(before_content);
+                                let selection = selection_before.clone().unwrap_or_else(|| {
+                                    let end = before_content.chars().count();
+                                    end..end
+                                });
+                                selection_after = Some(editing::indent_selected_lines(
+                                    &mut self.documents[index].content,
+                                    selection,
+                                    input_action.shift,
+                                ));
+                                kind = EditKind::Other;
+                                changed = true;
+                                cursor_adjusted = true;
+                            } else if focused
+                                && let (Some(typed), Some(selection)) =
+                                    (input_action.typed_text.as_deref(), selection_before.clone())
+                                && let Some(before_content) = before_content.as_ref()
+                            {
+                                let mut paired = before_content.clone();
+                                if let Some(next) =
+                                    editing::apply_smart_pair(&mut paired, selection, typed)
+                                {
+                                    changed = paired != *before_content;
+                                    self.documents[index].content = paired;
+                                    selection_after = Some(next);
+                                    kind = EditKind::Other;
+                                    cursor_adjusted = true;
+                                }
+                            } else if focused
+                                && changed
+                                && input_action.enter
+                                && let Some(cursor) =
+                                    selection_after.as_ref().map(|range| range.end)
+                                && let Some(next) = editing::continue_markdown_line(
+                                    &mut self.documents[index].content,
+                                    cursor,
+                                )
+                            {
+                                selection_after = Some(next);
+                                cursor_adjusted = true;
+                            }
+
+                            if changed
+                                && let Some(before_content) = before_content.take()
+                                && self.documents[index].record_edit(
+                                    before_content,
+                                    selection_before,
+                                    selection_after.clone(),
+                                    kind,
+                                )
+                            {
+                                if cursor_adjusted && let Some(selection) = selection_after {
+                                    self.queue_editor_selection(selection);
+                                }
+                                self.status = "已修改".to_owned();
+                            } else if cursor_adjusted && let Some(selection) = selection_after {
+                                self.queue_editor_selection(selection);
+                            }
+                        });
+                    });
             });
-            let mut selection_after = output.cursor_range.map(cursor_range_to_char_range);
-            if let Some(cursor_range) = output.cursor_range {
-                self.editor_cursor = Some(cursor_range);
-            }
-            let focused = output.response.has_focus();
-            let mut changed = output.response.changed();
-            let mut kind = EditKind::Typing;
-            let mut cursor_adjusted = false;
-
-            if focused
-                && let (Some(url), Some(selection)) =
-                    (input_action.pasted_url.as_deref(), selection_before.clone())
-                && !selection.is_empty()
-                && let Some(before_content) = before_content.as_ref()
-            {
-                self.documents[index].content.clone_from(before_content);
-                if let Some(next) = editing::paste_url_as_markdown_link(
-                    &mut self.documents[index].content,
-                    selection,
-                    url,
-                ) {
-                    selection_after = Some(next);
-                    kind = EditKind::Other;
-                    changed = true;
-                    cursor_adjusted = true;
-                }
-            } else if focused
-                && input_action.tab
-                && let Some(before_content) = before_content.as_ref()
-            {
-                self.documents[index].content.clone_from(before_content);
-                let selection = selection_before.clone().unwrap_or_else(|| {
-                    let end = before_content.chars().count();
-                    end..end
-                });
-                selection_after = Some(editing::indent_selected_lines(
-                    &mut self.documents[index].content,
-                    selection,
-                    input_action.shift,
-                ));
-                kind = EditKind::Other;
-                changed = true;
-                cursor_adjusted = true;
-            } else if focused
-                && let (Some(typed), Some(selection)) =
-                    (input_action.typed_text.as_deref(), selection_before.clone())
-                && let Some(before_content) = before_content.as_ref()
-            {
-                let mut paired = before_content.clone();
-                if let Some(next) = editing::apply_smart_pair(&mut paired, selection, typed) {
-                    changed = paired != *before_content;
-                    self.documents[index].content = paired;
-                    selection_after = Some(next);
-                    kind = EditKind::Other;
-                    cursor_adjusted = true;
-                }
-            } else if focused
-                && changed
-                && input_action.enter
-                && let Some(cursor) = selection_after.as_ref().map(|range| range.end)
-                && let Some(next) =
-                    editing::continue_markdown_line(&mut self.documents[index].content, cursor)
-            {
-                selection_after = Some(next);
-                cursor_adjusted = true;
-            }
-
-            if changed
-                && let Some(before_content) = before_content.take()
-                && self.documents[index].record_edit(
-                    before_content,
-                    selection_before,
-                    selection_after.clone(),
-                    kind,
-                )
-            {
-                if cursor_adjusted && let Some(selection) = selection_after {
-                    self.queue_editor_selection(selection);
-                }
-                self.status = "已修改".to_owned();
-            } else if cursor_adjusted && let Some(selection) = selection_after {
-                self.queue_editor_selection(selection);
-            }
+            ui.add_space(32.0);
         });
         if let Some(command) = context_command {
             self.execute(command);
@@ -2516,6 +2777,7 @@ impl RuporaApp {
         index: usize,
         scroll_offset: Option<f32>,
     ) -> PaneScroll {
+        let viewport_height = ui.available_height();
         let before_content = self.documents[index].content.clone();
         let mut preview_content = prepare_native_preview(
             ui.ctx(),
@@ -2525,6 +2787,7 @@ impl RuporaApp {
         );
         let base_uri = self.preview_base_uri(index);
         let local_links = markdown::local_link_destinations(&before_content);
+        let palette = app_palette(self.state.dark);
         self.preview_cache.link_hooks_clear();
         for destination in &local_links {
             self.preview_cache.add_link_hook(destination);
@@ -2542,24 +2805,41 @@ impl RuporaApp {
                 scroll_area = scroll_area.vertical_scroll_offset(offset);
             }
             scroll_area.show(ui, |ui| {
-                ui.add_space(12.0);
+                ui.add_space(24.0);
+                let page_width = ui.available_width().min(920.0);
+                let side_margin = ((ui.available_width() - page_width) * 0.5).max(16.0);
                 let changed = ui
                     .horizontal(|ui| {
-                        ui.add_space(14.0);
-                        ui.vertical(|ui| {
-                            ui.set_max_width((ui.available_width() - 24.0).max(200.0));
-                            CommonMarkViewer::new()
-                                .default_implicit_uri_scheme(base_uri)
-                                .enable_scroll_to_heading(true)
-                                .render_math_fn(Some(&render_math))
-                                .show_mut(ui, cache, &mut preview_content)
-                                .response
-                                .changed()
-                        })
-                        .inner
+                        ui.add_space(side_margin);
+                        egui::Frame::new()
+                            .fill(palette.surface)
+                            .stroke(Stroke::new(1.0, palette.border))
+                            .corner_radius(16)
+                            .inner_margin(Margin::symmetric(42, 34))
+                            .shadow(egui::Shadow {
+                                offset: [0, 6],
+                                blur: 22,
+                                spread: 0,
+                                color: Color32::from_black_alpha(if dark { 72 } else { 20 }),
+                            })
+                            .show(ui, |ui| {
+                                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                                    ui.set_width((page_width - 84.0).max(200.0));
+                                    ui.set_min_height((viewport_height - 118.0).max(480.0));
+                                    CommonMarkViewer::new()
+                                        .default_implicit_uri_scheme(base_uri)
+                                        .enable_scroll_to_heading(true)
+                                        .render_math_fn(Some(&render_math))
+                                        .show_mut(ui, cache, &mut preview_content)
+                                        .response
+                                        .changed()
+                                })
+                                .inner
+                            })
+                            .inner
                     })
                     .inner;
-                ui.add_space(40.0);
+                ui.add_space(32.0);
                 changed
             })
         };
@@ -2589,6 +2869,7 @@ impl RuporaApp {
     }
 
     fn hybrid_pane(&mut self, ui: &mut Ui, index: usize) {
+        let viewport_height = ui.available_height();
         let source = self.documents[index].content.clone();
         let selection_before = self.editor_cursor.map(cursor_range_to_char_range);
         let blocks = self.documents[index].blocks().to_vec();
@@ -2630,227 +2911,283 @@ impl RuporaApp {
             self.hybrid_active = Some((index, selected_block.id));
         }
 
-        let active_block = self
+        let active_id = self
             .hybrid_active
             .filter(|(document, id)| {
                 *document == index && blocks.iter().any(|block| block.id == *id)
             })
-            .and_then(|(_, id)| blocks.iter().find(|block| block.id == id))
-            .unwrap_or(&blocks[0]);
-        let active_id = active_block.id;
-        self.hybrid_active = Some((index, active_id));
+            .map(|(_, id)| id)
+            .or_else(|| source.is_empty().then(|| blocks[0].id));
 
         let mut pending_edit = None;
         let mut activate = None;
         let mut next_global_cursor = None;
         let mut cursor_adjusted = false;
+        let mut page_rect = None;
+        let mut active_editor_rect = None;
+        let palette = app_palette(self.state.dark);
 
         ScrollArea::vertical()
             .id_salt(("hybrid-scroll", index))
             .show(ui, |ui| {
-                ui.add_space(12.0);
-                ui.set_max_width((ui.available_width() - 28.0).max(260.0));
-                for block in &blocks {
-                    ui.push_id(("hybrid-block", block.id), |ui| {
-                        if block.id == active_id {
-                            let mut block_content = source[block.range.clone()].to_owned();
-                            let original_block = block_content.clone();
-                            let block_char_start = source[..block.range.start].chars().count();
-                            let local_selection_before =
-                                selection_before.as_ref().map(|selection| {
-                                    selection.start.saturating_sub(block_char_start)
-                                        ..selection.end.saturating_sub(block_char_start)
-                                });
-                            let editor_id =
-                                ui.make_persistent_id(("hybrid-editor", index, block.id));
-                            if let Some(cursor_range) = pending_local.take() {
-                                let mut state =
-                                    TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
-                                state.cursor.set_char_range(Some(cursor_range));
-                                state.store(ui.ctx(), editor_id);
-                                ui.memory_mut(|memory| memory.request_focus(editor_id));
-                            }
+                ui.add_space(24.0);
+                let page_width = ui.available_width().min(920.0);
+                let side_margin = ((ui.available_width() - page_width) * 0.5).max(16.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(side_margin);
+                    let page = egui::Frame::new()
+                        .fill(palette.surface)
+                        .stroke(Stroke::new(1.0, palette.border))
+                        .corner_radius(16)
+                        .inner_margin(Margin::symmetric(42, 34))
+                        .shadow(egui::Shadow {
+                            offset: [0, 6],
+                            blur: 22,
+                            spread: 0,
+                            color: Color32::from_black_alpha(if self.state.dark { 72 } else { 20 }),
+                        })
+                        .show(ui, |ui| {
+                            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                                ui.set_width((page_width - 84.0).max(280.0));
+                                ui.set_min_height((viewport_height - 118.0).max(480.0));
+                                for block in &blocks {
+                                    ui.push_id(("hybrid-block", block.id), |ui| {
+                                        if Some(block.id) == active_id {
+                                            let mut block_content =
+                                                source[block.range.clone()].to_owned();
+                                            let original_block = block_content.clone();
+                                            let block_char_start =
+                                                source[..block.range.start].chars().count();
+                                            let local_selection_before =
+                                                selection_before.as_ref().map(|selection| {
+                                                    selection.start.saturating_sub(block_char_start)
+                                                        ..selection
+                                                            .end
+                                                            .saturating_sub(block_char_start)
+                                                });
+                                            let editor_id = ui.make_persistent_id((
+                                                "hybrid-editor",
+                                                index,
+                                                block.id,
+                                            ));
+                                            if let Some(cursor_range) = pending_local.take() {
+                                                let mut state =
+                                                    TextEdit::load_state(ui.ctx(), editor_id)
+                                                        .unwrap_or_default();
+                                                state.cursor.set_char_range(Some(cursor_range));
+                                                state.store(ui.ctx(), editor_id);
+                                                ui.memory_mut(|memory| {
+                                                    memory.request_focus(editor_id)
+                                                });
+                                            }
 
-                            let frame = egui::Frame::group(ui.style())
-                                .inner_margin(10.0)
-                                .stroke(ui.visuals().selection.stroke);
-                            frame.show(ui, |ui| {
-                                let desired_rows = block_content.lines().count().max(1);
-                                let input_action = editor_input_action(ui);
-                                let output = TextEdit::multiline(&mut block_content)
-                                    .id(editor_id)
-                                    .font(egui::TextStyle::Monospace)
-                                    .code_editor()
-                                    .desired_width(f32::INFINITY)
-                                    .desired_rows(desired_rows)
-                                    .lock_focus(true)
-                                    .show(ui);
-                                set_accessible_label(
-                                    ui.ctx(),
-                                    editor_id,
-                                    format!("从第 {} 行开始的 Markdown 块", block.line),
-                                );
-                                let mut local_selection_after =
-                                    output.cursor_range.map(cursor_range_to_char_range);
-                                let focused = output.response.has_focus();
-                                let mut changed = output.response.changed();
-                                let mut kind = EditKind::Typing;
+                                            let editor_style =
+                                                hybrid_editor_text_style(&block_content);
+                                            let block_is_code =
+                                                is_fenced_code_block(&block_content);
+                                            let frame = egui::Frame::new()
+                                                .fill(palette.accent_soft)
+                                                .inner_margin(Margin::symmetric(14, 10))
+                                                .corner_radius(10)
+                                                .stroke(Stroke::new(1.0, palette.accent));
+                                            let editor_frame = frame.show(ui, |ui| {
+                                                let desired_rows =
+                                                    block_content.lines().count().max(1);
+                                                let input_action = editor_input_action(ui);
+                                                let mut editor =
+                                                    TextEdit::multiline(&mut block_content)
+                                                        .id(editor_id)
+                                                        .font(editor_style)
+                                                        .desired_width(f32::INFINITY)
+                                                        .desired_rows(desired_rows)
+                                                        .lock_focus(true);
+                                                if block_is_code {
+                                                    editor = editor.code_editor();
+                                                }
+                                                let output = editor.show(ui);
+                                                set_accessible_label(
+                                                    ui.ctx(),
+                                                    editor_id,
+                                                    format!(
+                                                        "从第 {} 行开始的 Markdown 块",
+                                                        block.line
+                                                    ),
+                                                );
+                                                let mut local_selection_after = output
+                                                    .cursor_range
+                                                    .map(cursor_range_to_char_range);
+                                                let focused = output.response.has_focus();
+                                                let mut changed = output.response.changed();
+                                                let mut kind = EditKind::Typing;
 
-                                if focused
-                                    && let (Some(url), Some(selection)) = (
-                                        input_action.pasted_url.as_deref(),
-                                        local_selection_before.clone(),
-                                    )
-                                    && !selection.is_empty()
-                                {
-                                    block_content.clone_from(&original_block);
-                                    if let Some(next) = editing::paste_url_as_markdown_link(
-                                        &mut block_content,
-                                        selection,
-                                        url,
-                                    ) {
-                                        local_selection_after = Some(next);
-                                        kind = EditKind::Other;
-                                        changed = true;
-                                        cursor_adjusted = true;
-                                    }
-                                } else if focused && input_action.tab {
-                                    block_content.clone_from(&original_block);
-                                    let selection =
-                                        local_selection_before.clone().unwrap_or_else(|| {
-                                            let end = original_block.chars().count();
-                                            end..end
-                                        });
-                                    local_selection_after = Some(editing::indent_selected_lines(
-                                        &mut block_content,
-                                        selection,
-                                        input_action.shift,
-                                    ));
-                                    kind = EditKind::Other;
-                                    changed = true;
-                                    cursor_adjusted = true;
-                                } else if focused
-                                    && let (Some(typed), Some(selection)) = (
-                                        input_action.typed_text.as_deref(),
-                                        local_selection_before.clone(),
-                                    )
-                                {
-                                    let mut paired = original_block.clone();
-                                    if let Some(next) =
-                                        editing::apply_smart_pair(&mut paired, selection, typed)
-                                    {
-                                        changed = paired != original_block;
-                                        block_content = paired;
-                                        local_selection_after = Some(next);
-                                        kind = EditKind::Other;
-                                        cursor_adjusted = true;
-                                    }
-                                } else if focused
-                                    && changed
-                                    && input_action.enter
-                                    && let Some(cursor) =
-                                        local_selection_after.as_ref().map(|range| range.end)
-                                    && let Some(next) =
-                                        editing::continue_markdown_line(&mut block_content, cursor)
-                                {
-                                    local_selection_after = Some(next);
-                                    cursor_adjusted = true;
-                                }
+                                                if focused
+                                                    && let (Some(url), Some(selection)) = (
+                                                        input_action.pasted_url.as_deref(),
+                                                        local_selection_before.clone(),
+                                                    )
+                                                    && !selection.is_empty()
+                                                {
+                                                    block_content.clone_from(&original_block);
+                                                    if let Some(next) =
+                                                        editing::paste_url_as_markdown_link(
+                                                            &mut block_content,
+                                                            selection,
+                                                            url,
+                                                        )
+                                                    {
+                                                        local_selection_after = Some(next);
+                                                        kind = EditKind::Other;
+                                                        changed = true;
+                                                        cursor_adjusted = true;
+                                                    }
+                                                } else if focused && input_action.tab {
+                                                    block_content.clone_from(&original_block);
+                                                    let selection = local_selection_before
+                                                        .clone()
+                                                        .unwrap_or_else(|| {
+                                                            let end =
+                                                                original_block.chars().count();
+                                                            end..end
+                                                        });
+                                                    local_selection_after =
+                                                        Some(editing::indent_selected_lines(
+                                                            &mut block_content,
+                                                            selection,
+                                                            input_action.shift,
+                                                        ));
+                                                    kind = EditKind::Other;
+                                                    changed = true;
+                                                    cursor_adjusted = true;
+                                                } else if focused
+                                                    && let (Some(typed), Some(selection)) = (
+                                                        input_action.typed_text.as_deref(),
+                                                        local_selection_before.clone(),
+                                                    )
+                                                {
+                                                    let mut paired = original_block.clone();
+                                                    if let Some(next) = editing::apply_smart_pair(
+                                                        &mut paired,
+                                                        selection,
+                                                        typed,
+                                                    ) {
+                                                        changed = paired != original_block;
+                                                        block_content = paired;
+                                                        local_selection_after = Some(next);
+                                                        kind = EditKind::Other;
+                                                        cursor_adjusted = true;
+                                                    }
+                                                } else if focused
+                                                    && changed
+                                                    && input_action.enter
+                                                    && let Some(cursor) = local_selection_after
+                                                        .as_ref()
+                                                        .map(|range| range.end)
+                                                    && let Some(next) =
+                                                        editing::continue_markdown_line(
+                                                            &mut block_content,
+                                                            cursor,
+                                                        )
+                                                {
+                                                    local_selection_after = Some(next);
+                                                    cursor_adjusted = true;
+                                                }
 
-                                if let Some(selection) = local_selection_after {
-                                    next_global_cursor = Some(CCursorRange::two(
-                                        CCursor::new(block_char_start + selection.start),
-                                        CCursor::new(block_char_start + selection.end),
-                                    ));
-                                }
-                                if changed {
-                                    pending_edit =
-                                        Some((block.range.clone(), block_content.clone(), kind));
-                                }
-                            });
-                        } else {
-                            let block_text = preview_blocks
-                                .get(&block.id)
-                                .map(String::as_str)
-                                .unwrap_or(&source[block.range.clone()]);
-                            let foldable = is_foldable_block(block_text);
-                            let collapse_key = (index, block.id);
-                            let collapsed = self.collapsed_blocks.contains(&collapse_key);
-                            if foldable {
-                                ui.horizontal(|ui| {
-                                    let icon = if collapsed { "▸" } else { "▾" };
-                                    if ui
-                                        .small_button(icon)
-                                        .on_hover_text(if collapsed {
-                                            "展开 Markdown 块"
+                                                if let Some(selection) = local_selection_after {
+                                                    next_global_cursor = Some(CCursorRange::two(
+                                                        CCursor::new(
+                                                            block_char_start + selection.start,
+                                                        ),
+                                                        CCursor::new(
+                                                            block_char_start + selection.end,
+                                                        ),
+                                                    ));
+                                                }
+                                                if changed {
+                                                    pending_edit = Some((
+                                                        block.range.clone(),
+                                                        block_content.clone(),
+                                                        kind,
+                                                    ));
+                                                }
+                                            });
+                                            active_editor_rect = Some(editor_frame.response.rect);
                                         } else {
-                                            "折叠 Markdown 块"
-                                        })
-                                        .clicked()
-                                    {
-                                        if collapsed {
-                                            self.collapsed_blocks.remove(&collapse_key);
-                                        } else {
-                                            self.collapsed_blocks.insert(collapse_key);
+                                            let block_text = preview_blocks
+                                                .get(&block.id)
+                                                .map(String::as_str)
+                                                .unwrap_or(&source[block.range.clone()]);
+                                            let shown = ui.scope(|ui| {
+                                                ui.add_space(6.0);
+                                                CommonMarkViewer::new()
+                                                    .default_implicit_uri_scheme(base_uri.clone())
+                                                    .render_math_fn(Some(&render_math))
+                                                    .show(ui, &mut self.preview_cache, block_text);
+                                                ui.add_space(6.0);
+                                            });
+                                            let response = ui
+                                                .interact(
+                                                    shown.response.rect,
+                                                    ui.make_persistent_id((
+                                                        "activate-block",
+                                                        block.id,
+                                                    )),
+                                                    egui::Sense::click(),
+                                                )
+                                                .on_hover_text(format!(
+                                                    "点击编辑第 {} 行开始的 Markdown 块",
+                                                    block.line
+                                                ));
+                                            if response.hovered() {
+                                                ui.painter().rect_stroke(
+                                                    response.rect.expand(5.0),
+                                                    9.0,
+                                                    Stroke::new(1.0, palette.border),
+                                                    egui::StrokeKind::Outside,
+                                                );
+                                            }
+                                            if response.clicked() {
+                                                let local_source_byte = response
+                                                    .interact_pointer_pos()
+                                                    .map(|position| {
+                                                        let width = response.rect.width().max(1.0);
+                                                        let height =
+                                                            response.rect.height().max(1.0);
+                                                        SourceMap::from_markdown(
+                                                            &source[block.range.clone()],
+                                                        )
+                                                        .source_byte_at_normalized_point(
+                                                            (position.x - response.rect.left())
+                                                                / width,
+                                                            (position.y - response.rect.top())
+                                                                / height,
+                                                        )
+                                                    })
+                                                    .unwrap_or_default();
+                                                activate = Some((
+                                                    block.id,
+                                                    block.range.start + local_source_byte,
+                                                ));
+                                            }
                                         }
-                                    }
-                                    ui.label(
-                                        RichText::new(format!("第 {} 行", block.line))
-                                            .small()
-                                            .weak(),
-                                    );
-                                });
-                            }
-                            if collapsed {
-                                return;
-                            }
-                            let shown = ui.scope(|ui| {
-                                ui.add_space(8.0);
-                                CommonMarkViewer::new()
-                                    .default_implicit_uri_scheme(base_uri.clone())
-                                    .render_math_fn(Some(&render_math))
-                                    .show(ui, &mut self.preview_cache, block_text);
-                                ui.add_space(8.0);
+                                    });
+                                    ui.add_space(6.0);
+                                }
+                                ui.add_space(52.0);
                             });
-                            let response = ui
-                                .interact(
-                                    shown.response.rect,
-                                    ui.make_persistent_id(("activate-block", block.id)),
-                                    egui::Sense::click(),
-                                )
-                                .on_hover_text(format!(
-                                    "点击编辑第 {} 行开始的 Markdown 块",
-                                    block.line
-                                ));
-                            if response.hovered() {
-                                ui.painter().rect_stroke(
-                                    response.rect,
-                                    4.0,
-                                    ui.visuals().selection.stroke,
-                                    egui::StrokeKind::Outside,
-                                );
-                            }
-                            if response.clicked() {
-                                let local_source_byte = response
-                                    .interact_pointer_pos()
-                                    .map(|position| {
-                                        let width = response.rect.width().max(1.0);
-                                        let height = response.rect.height().max(1.0);
-                                        SourceMap::from_markdown(&source[block.range.clone()])
-                                            .source_byte_at_normalized_point(
-                                                (position.x - response.rect.left()) / width,
-                                                (position.y - response.rect.top()) / height,
-                                            )
-                                    })
-                                    .unwrap_or_default();
-                                activate = Some((block.id, block.range.start + local_source_byte));
-                            }
-                        }
-                    });
-                    ui.add_space(6.0);
-                }
-                ui.add_space(40.0);
+                        });
+                    page_rect = Some(page.response.rect);
+                });
+                ui.add_space(32.0);
             });
+
+        let deactivate = ui.input(|input| {
+            input.key_pressed(Key::Escape)
+                || input.pointer.any_click()
+                    && input.pointer.interact_pos().is_some_and(|position| {
+                        page_rect.is_some_and(|rect| rect.contains(position))
+                            && active_editor_rect.is_some_and(|rect| !rect.contains(position))
+                    })
+        });
 
         if let Some(cursor_range) = next_global_cursor {
             self.editor_cursor = Some(cursor_range);
@@ -2866,11 +3203,16 @@ impl RuporaApp {
                 selection_after,
                 kind,
             );
-            self.hybrid_active = Some((index, active_id));
+            if let Some(active_id) = active_id {
+                self.hybrid_active = Some((index, active_id));
+            }
             self.status = "已更新当前 Markdown 块".to_owned();
         }
         if cursor_adjusted {
             self.pending_editor_cursor = next_global_cursor;
+        }
+        if deactivate {
+            self.hybrid_active = None;
         }
         if let Some((id, start)) = activate {
             let char_start = source[..start].chars().count();
@@ -2953,16 +3295,27 @@ impl RuporaApp {
             })
             .unwrap_or_default();
 
-        Panel::bottom("status").exact_size(28.0).show(root, |ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.label(RichText::new(&self.status).small().color(Color32::GRAY));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(document_info).small().color(Color32::GRAY));
+        let palette = app_palette(self.state.dark);
+        Panel::bottom("status")
+            .exact_size(30.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.toolbar)
+                    .inner_margin(Margin::symmetric(10, 5))
+                    .stroke(Stroke::new(1.0, palette.border)),
+            )
+            .show(root, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&self.status).small().color(palette.secondary));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(document_info)
+                                .small()
+                                .color(palette.secondary),
+                        );
+                    });
                 });
             });
-        });
     }
 
     fn confirm_application_close(&mut self, ctx: &Context) {
@@ -3035,6 +3388,7 @@ impl eframe::App for RuporaApp {
             .and_then(|index| self.documents.get(index))
             .and_then(|document| document.path.clone());
         eframe::set_value(storage, APP_STATE_KEY, &self.state);
+        eframe::set_value(storage, UI_EXPERIENCE_KEY, &CURRENT_UI_EXPERIENCE);
         let _ = self.recovery_store.save(&self.documents);
     }
 
@@ -3046,6 +3400,82 @@ impl eframe::App for RuporaApp {
         }
         diagnostics::append_event("INFO", "RUPORA exited normally").ok();
     }
+}
+
+fn toolbar_symbol_button(ui: &mut Ui, symbol: &str, tooltip: &str) -> egui::Response {
+    ui.add(
+        Button::new(RichText::new(symbol).size(18.0))
+            .frame(false)
+            .min_size(Vec2::splat(34.0)),
+    )
+    .on_hover_text(tooltip)
+}
+
+fn toolbar_toggle_button(
+    ui: &mut Ui,
+    symbol: &str,
+    selected: bool,
+    tooltip: &str,
+    palette: AppPalette,
+) -> egui::Response {
+    let button = Button::new(RichText::new(symbol).size(14.0))
+        .fill(if selected {
+            palette.accent_soft
+        } else {
+            Color32::TRANSPARENT
+        })
+        .stroke(if selected {
+            Stroke::new(1.0, palette.accent)
+        } else {
+            Stroke::NONE
+        })
+        .min_size(Vec2::splat(34.0));
+    ui.add(button).on_hover_text(tooltip)
+}
+
+fn view_mode_selector(ui: &mut Ui, mode: &mut ViewMode, palette: AppPalette) {
+    ui.allocate_ui_with_layout(
+        Vec2::new(158.0, 32.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            egui::Frame::new()
+                .fill(palette.canvas)
+                .stroke(Stroke::new(1.0, palette.border))
+                .corner_radius(10)
+                .inner_margin(2)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (value, label, tooltip) in [
+                        (ViewMode::Hybrid, "即时", "即时排版编辑"),
+                        (ViewMode::Edit, "源码", "Markdown 源码编辑"),
+                        (ViewMode::Preview, "预览", "只读排版预览"),
+                    ] {
+                        let selected = *mode == value;
+                        let text_color = if selected {
+                            palette.accent
+                        } else {
+                            palette.secondary
+                        };
+                        if ui
+                            .add(
+                                Button::new(RichText::new(label).color(text_color))
+                                    .fill(if selected {
+                                        palette.surface
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    })
+                                    .stroke(Stroke::NONE)
+                                    .min_size(Vec2::new(48.0, 28.0)),
+                            )
+                            .on_hover_text(tooltip)
+                            .clicked()
+                        {
+                            *mode = value;
+                        }
+                    }
+                });
+        },
+    );
 }
 
 fn outline_row(ui: &mut Ui, heading: &Heading) -> bool {
@@ -3091,12 +3521,32 @@ fn scroll_ratio(scroll: PaneScroll) -> f32 {
     }
 }
 
-fn is_foldable_block(source: &str) -> bool {
-    source.contains('\n')
-        || source.starts_with('#')
-        || source.starts_with("```")
-        || source.starts_with("~~~")
-        || source.starts_with("> ")
+fn is_fenced_code_block(source: &str) -> bool {
+    let trimmed = source.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+fn hybrid_editor_text_style(source: &str) -> TextStyle {
+    if is_fenced_code_block(source) {
+        return TextStyle::Monospace;
+    }
+    let trimmed = source.trim_start();
+    let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&level)
+        || !trimmed
+            .as_bytes()
+            .get(level)
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        return TextStyle::Body;
+    }
+    let name = match level {
+        1 => "rupora-title",
+        2 => "rupora-h2",
+        3 => "rupora-h3",
+        _ => "rupora-h4",
+    };
+    TextStyle::Name(name.into())
 }
 
 fn parse_shortcut(specification: &str) -> Option<egui::KeyboardShortcut> {
@@ -3356,11 +3806,103 @@ fn next_footnote_number(source: &str) -> usize {
 }
 
 fn apply_theme(ctx: &Context, dark: bool) {
-    if dark {
-        ctx.set_visuals(egui::Visuals::dark());
+    let palette = app_palette(dark);
+    let mut visuals = if dark {
+        egui::Visuals::dark()
     } else {
-        ctx.set_visuals(egui::Visuals::light());
-    }
+        egui::Visuals::light()
+    };
+    visuals.override_text_color = Some(palette.text);
+    visuals.weak_text_color = Some(palette.secondary);
+    visuals.panel_fill = palette.canvas;
+    visuals.window_fill = palette.surface;
+    visuals.window_stroke = Stroke::new(1.0, palette.border);
+    visuals.window_corner_radius = egui::CornerRadius::same(14);
+    visuals.menu_corner_radius = egui::CornerRadius::same(12);
+    visuals.faint_bg_color = palette.hover;
+    visuals.extreme_bg_color = palette.surface;
+    visuals.text_edit_bg_color = Some(palette.surface);
+    visuals.code_bg_color = if dark {
+        Color32::from_rgb(27, 27, 29)
+    } else {
+        Color32::from_rgb(247, 247, 249)
+    };
+    visuals.hyperlink_color = palette.accent;
+    visuals.selection.bg_fill = palette.accent_soft;
+    visuals.selection.stroke = Stroke::new(1.5, palette.accent);
+    visuals.button_frame = true;
+    visuals.collapsing_header_frame = false;
+    visuals.indent_has_left_vline = false;
+
+    visuals.widgets.noninteractive.bg_fill = palette.surface;
+    visuals.widgets.noninteractive.weak_bg_fill = palette.surface;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.border);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette.text);
+    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(10);
+
+    visuals.widgets.inactive.bg_fill = palette.surface;
+    visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, palette.text);
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(9);
+
+    visuals.widgets.hovered.bg_fill = palette.hover;
+    visuals.widgets.hovered.weak_bg_fill = palette.hover;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, palette.border);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, palette.text);
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(9);
+    visuals.widgets.hovered.expansion = 0.0;
+
+    visuals.widgets.active.bg_fill = palette.accent_soft;
+    visuals.widgets.active.weak_bg_fill = palette.accent_soft;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, palette.accent);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, palette.text);
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(9);
+    visuals.widgets.active.expansion = 0.0;
+    visuals.widgets.open = visuals.widgets.active;
+
+    ctx.set_theme(if dark {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    });
+    ctx.global_style_mut(|style| {
+        style.visuals = visuals;
+        style.spacing.item_spacing = Vec2::new(8.0, 7.0);
+        style.spacing.button_padding = Vec2::new(10.0, 6.0);
+        style.spacing.interact_size = Vec2::new(36.0, 32.0);
+        style.spacing.window_margin = Margin::same(18);
+        style.text_styles.insert(
+            TextStyle::Heading,
+            FontId::new(28.0, FontFamily::Proportional),
+        );
+        style
+            .text_styles
+            .insert(TextStyle::Body, FontId::new(16.0, FontFamily::Proportional));
+        style.text_styles.insert(
+            TextStyle::Button,
+            FontId::new(14.0, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Small,
+            FontId::new(12.5, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Monospace,
+            FontId::new(14.5, FontFamily::Monospace),
+        );
+        for (name, size) in [
+            ("rupora-title", 34.0),
+            ("rupora-h2", 27.0),
+            ("rupora-h3", 22.0),
+            ("rupora-h4", 18.0),
+        ] {
+            style.text_styles.insert(
+                TextStyle::Name(name.into()),
+                FontId::new(size, FontFamily::Proportional),
+            );
+        }
+    });
 }
 
 fn install_fonts(ctx: &Context) {
@@ -3376,13 +3918,13 @@ fn install_fonts(ctx: &Context) {
     fonts
         .font_data
         .insert(font_name.clone(), Arc::new(FontData::from_owned(bytes)));
-    for family in [FontFamily::Proportional, FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .insert(0, font_name.clone());
-    }
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, font_name.clone());
+    let monospace = fonts.families.entry(FontFamily::Monospace).or_default();
+    monospace.insert(monospace.len().min(1), font_name);
     ctx.set_fonts(fonts);
 }
 
@@ -3550,5 +4092,22 @@ mod tests {
 
         assert!(path_is_within(&inside, &workspace));
         assert!(!path_is_within(&outside, &workspace));
+    }
+
+    #[test]
+    fn instant_editor_matches_editing_typography_to_markdown_blocks() {
+        assert_eq!(hybrid_editor_text_style("plain paragraph"), TextStyle::Body);
+        assert_eq!(
+            hybrid_editor_text_style("```rust\nfn main() {}\n```"),
+            TextStyle::Monospace
+        );
+        assert!(matches!(
+            hybrid_editor_text_style("# Title"),
+            TextStyle::Name(name) if name.as_ref() == "rupora-title"
+        ));
+        assert!(matches!(
+            hybrid_editor_text_style("### Section"),
+            TextStyle::Name(name) if name.as_ref() == "rupora-h3"
+        ));
     }
 }

@@ -7,8 +7,8 @@ use crate::editing::MarkdownCommand;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ViewMode {
     Edit,
-    #[default]
     Split,
+    #[default]
     Hybrid,
     Preview,
 }
@@ -34,8 +34,8 @@ impl Default for PersistedState {
         Self {
             dark: false,
             show_sidebar: true,
-            show_outline: true,
-            view_mode: ViewMode::Split,
+            show_outline: false,
+            view_mode: ViewMode::Hybrid,
             recent_files: Vec::new(),
             session_files: Vec::new(),
             active_session_file: None,
@@ -118,4 +118,17 @@ pub(crate) enum ShortcutAction {
     Find,
     Replace,
     Palette,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_the_single_canvas_instant_editor() {
+        let state = PersistedState::default();
+        assert_eq!(state.view_mode, ViewMode::Hybrid);
+        assert!(state.show_sidebar);
+        assert!(!state.show_outline);
+    }
 }

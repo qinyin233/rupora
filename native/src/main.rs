@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::path::PathBuf;
 
@@ -37,8 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("RUPORA")
-        .with_inner_size([1240.0, 820.0])
-        .with_min_inner_size([760.0, 520.0]);
+        .with_inner_size([1320.0, 860.0])
+        .with_min_inner_size([820.0, 560.0]);
 
     if let Ok(icon) =
         eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icons/icon.png"))
