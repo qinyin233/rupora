@@ -3156,7 +3156,8 @@ impl RuporaApp {
     fn hybrid_pane(&mut self, ui: &mut Ui, index: usize) {
         let viewport_height = ui.available_height();
         let source = self.documents[index].content.clone();
-        let selection_before = self.editor_cursor.map(cursor_range_to_char_range);
+        let cursor_before = self.editor_cursor;
+        let selection_before = cursor_before.map(cursor_range_to_char_range);
         let blocks = self.documents[index].blocks().to_vec();
         let base_uri = self.preview_base_uri(index);
         let local_links = markdown::local_link_destinations(&source);
@@ -3263,13 +3264,16 @@ impl RuporaApp {
                                                 hybrid_edit_range(&source, &blocks, block.id);
                                             let block_char_start =
                                                 source[..edit_range.start].chars().count();
-                                            let local_source_selection_before =
-                                                selection_before.as_ref().map(|selection| {
-                                                    selection.start.saturating_sub(block_char_start)
-                                                        ..selection
-                                                            .end
-                                                            .saturating_sub(block_char_start)
+                                            let local_source_cursor_before =
+                                                cursor_before.map(|cursor| {
+                                                    cursor_range_saturating_sub(
+                                                        cursor,
+                                                        block_char_start,
+                                                    )
                                                 });
+                                            let local_source_selection_before =
+                                                local_source_cursor_before
+                                                    .map(cursor_range_to_char_range);
                                             let (original_block, ime_visual_content) =
                                                 if let Some(session) = ime_session.take() {
                                                     (
@@ -3309,44 +3313,40 @@ impl RuporaApp {
                                                 index,
                                                 block.id,
                                             ));
-                                            let pending_local_source =
+                                            let pending_local_cursor =
                                                 pending_source_cursor.take().map(|cursor_range| {
-                                                    let [selection_start, selection_end] =
-                                                        cursor_range.sorted_cursors();
-                                                    selection_start
-                                                        .index
-                                                        .0
-                                                        .saturating_sub(block_char_start)
-                                                        ..selection_end
-                                                            .index
-                                                            .0
-                                                            .saturating_sub(block_char_start)
+                                                    cursor_range_saturating_sub(
+                                                        cursor_range,
+                                                        block_char_start,
+                                                    )
                                                 });
-                                            let cursor_source_selection =
-                                                if pending_local_source.is_some() {
-                                                    pending_local_source.as_ref()
+                                            let cursor_source_cursor =
+                                                if pending_local_cursor.is_some() {
+                                                    pending_local_cursor.as_ref()
                                                 } else if had_ime_session {
                                                     None
                                                 } else {
-                                                    local_source_selection_before.as_ref()
+                                                    local_source_cursor_before.as_ref()
                                                 };
-                                            if let Some(local_source) = cursor_source_selection {
+                                            if let Some(local_cursor) = cursor_source_cursor {
+                                                let local_source =
+                                                    cursor_range_to_char_range(*local_cursor);
                                                 let local_visual = projection.visual_char_range(
                                                     &original_block,
-                                                    local_source.clone(),
+                                                    local_source,
                                                 );
                                                 let mut state =
                                                     TextEdit::load_state(ui.ctx(), editor_id)
                                                         .unwrap_or_default();
                                                 state.cursor.set_char_range(Some(
-                                                    CCursorRange::two(
-                                                        CCursor::new(local_visual.start),
-                                                        CCursor::new(local_visual.end),
+                                                    cursor_range_with_direction(
+                                                        local_visual,
+                                                        *local_cursor,
                                                     ),
                                                 ));
                                                 state.store(ui.ctx(), editor_id);
                                             }
-                                            if pending_local_source.is_some() {
+                                            if pending_local_cursor.is_some() {
                                                 ui.memory_mut(|memory| {
                                                     memory.request_focus(editor_id)
                                                 });
@@ -3402,7 +3402,7 @@ impl RuporaApp {
                                                 }
                                                 let inline_code_background = (!block_is_code)
                                                     .then(|| ui.painter().add(egui::Shape::Noop));
-                                                let output = editor.show(ui);
+                                                let mut output = editor.show(ui);
                                                 if let Some(shape_index) = inline_code_background {
                                                     let runs = projection.runs_for(&visual_content);
                                                     ui.painter().set(
@@ -3425,9 +3425,49 @@ impl RuporaApp {
                                                         block.line
                                                     ),
                                                 );
-                                                let mut visual_selection_after = output
-                                                    .cursor_range
-                                                    .map(cursor_range_to_char_range);
+                                                let visual_cursor_after =
+                                                    text_edit_cursor_after_input(&output);
+                                                let mut visual_selection_after =
+                                                    visual_cursor_after
+                                                        .map(cursor_range_to_char_range);
+                                                if output.response.dragged()
+                                                    && let Some(anchor_position) = ui
+                                                        .input(|input| input.pointer.press_origin())
+                                                {
+                                                    // `TextEditOutput::cursor_range` is captured
+                                                    // before pointer interaction in egui 0.35. On
+                                                    // Windows a right-to-left drag can therefore be
+                                                    // observed as only the moving caret. Rebuild the
+                                                    // directed range from the stable press origin
+                                                    // and current pointer position using the exact
+                                                    // galley hit-test used by TextEdit itself.
+                                                    let anchor = text_edit_cursor_at_position(
+                                                        &output,
+                                                        anchor_position,
+                                                    );
+                                                    let current_position = ui
+                                                        .input(|input| input.pointer.interact_pos())
+                                                        .unwrap_or(anchor_position);
+                                                    let current = text_edit_cursor_at_position(
+                                                        &output,
+                                                        current_position,
+                                                    );
+                                                    let cursor = CCursorRange {
+                                                        primary: current,
+                                                        secondary: anchor,
+                                                        h_pos: None,
+                                                    };
+                                                    visual_selection_after =
+                                                        Some(cursor_range_to_char_range(cursor));
+                                                    output
+                                                        .state
+                                                        .cursor
+                                                        .set_char_range(Some(cursor));
+                                                    output
+                                                        .state
+                                                        .clone()
+                                                        .store(ui.ctx(), output.response.id);
+                                                }
                                                 let focused = output.response.has_focus();
                                                 let mut changed = output.response.changed();
                                                 let mut kind = EditKind::Typing;
@@ -3644,14 +3684,22 @@ impl RuporaApp {
                                                             visual_selection_before.as_ref(),
                                                             selection,
                                                         );
-                                                    next_global_cursor = Some(CCursorRange::two(
-                                                        CCursor::new(
-                                                            block_char_start
-                                                                + source_selection.start,
-                                                        ),
-                                                        CCursor::new(
-                                                            block_char_start + source_selection.end,
-                                                        ),
+                                                    let local_cursor = if let Some(visual_cursor) =
+                                                        visual_cursor_after
+                                                    {
+                                                        cursor_range_with_direction(
+                                                            source_selection,
+                                                            visual_cursor,
+                                                        )
+                                                    } else {
+                                                        CCursorRange::two(
+                                                            CCursor::new(source_selection.start),
+                                                            CCursor::new(source_selection.end),
+                                                        )
+                                                    };
+                                                    next_global_cursor = Some(cursor_range_add(
+                                                        local_cursor,
+                                                        block_char_start,
                                                     ));
                                                 }
                                             });
@@ -4289,6 +4337,50 @@ fn cursor_range_to_char_range(range: CCursorRange) -> std::ops::Range<usize> {
     start.index.0..end.index.0
 }
 
+fn cursor_range_saturating_sub(range: CCursorRange, offset: usize) -> CCursorRange {
+    CCursorRange {
+        primary: range.primary - offset,
+        secondary: range.secondary - offset,
+        h_pos: range.h_pos,
+    }
+}
+
+fn cursor_range_add(range: CCursorRange, offset: usize) -> CCursorRange {
+    CCursorRange {
+        primary: range.primary + offset,
+        secondary: range.secondary + offset,
+        h_pos: range.h_pos,
+    }
+}
+
+fn cursor_range_with_direction(
+    sorted: std::ops::Range<usize>,
+    direction: CCursorRange,
+) -> CCursorRange {
+    if direction.primary.index >= direction.secondary.index {
+        CCursorRange::two(CCursor::new(sorted.start), CCursor::new(sorted.end))
+    } else {
+        CCursorRange::two(CCursor::new(sorted.end), CCursor::new(sorted.start))
+    }
+}
+
+fn text_edit_cursor_after_input(output: &egui::text_edit::TextEditOutput) -> Option<CCursorRange> {
+    // In egui 0.35 pointer interaction updates `state.cursor` after the public
+    // `cursor_range` field is captured. Reading the state is therefore
+    // essential for clicks and drag-selection; using the output field would
+    // restore the stale cursor on the next frame.
+    output.state.cursor.range(&output.galley)
+}
+
+fn text_edit_cursor_at_position(
+    output: &egui::text_edit::TextEditOutput,
+    position: egui::Pos2,
+) -> CCursor {
+    output
+        .galley
+        .cursor_from_pos(position - output.galley_pos + egui::vec2(output.galley.rect.left(), 0.0))
+}
+
 fn source_selection_after_visual_input(
     projection: &VisualProjection,
     source: &str,
@@ -4416,6 +4508,9 @@ fn rounded_inline_code_backgrounds(
 
     for placed_row in &galley.rows {
         let row_offset = galley_pos.to_vec2() + placed_row.pos.to_vec2();
+        let row_rect = placed_row.rect().translate(galley_pos.to_vec2());
+        let chip_top = row_rect.top() + 2.0;
+        let chip_bottom = row_rect.bottom() - 2.0;
         let mut chip_rect = None;
         for glyph in &placed_row.glyphs {
             while runs
@@ -4428,7 +4523,15 @@ fn rounded_inline_code_backgrounds(
                 run.range.contains(&char_index) && run.style.code && !run.style.marker
             });
             if is_inline_code {
-                let rect = glyph.logical_rect().translate(row_offset);
+                let glyph_rect = glyph.logical_rect().translate(row_offset);
+                // Font ascent differs between the proportional body font and
+                // the monospace code font. Basing the chip vertically on the
+                // glyph rectangle makes one side look heavier. Use the row's
+                // center instead, leaving equal space above and below.
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(glyph_rect.left(), chip_top),
+                    egui::pos2(glyph_rect.right(), chip_bottom),
+                );
                 chip_rect = Some(chip_rect.map_or(rect, |current: egui::Rect| current.union(rect)));
             } else {
                 push_inline_code_background(&mut shapes, chip_rect.take(), palette);
@@ -4501,7 +4604,7 @@ fn push_inline_code_background(
     let Some(rect) = rect else {
         return;
     };
-    let rect = rect.expand2(Vec2::new(3.0, 1.0));
+    let rect = rect.expand2(Vec2::new(3.0, 0.0));
     shapes.push(egui::Shape::rect_filled(rect, 4, palette.code_bg));
     shapes.push(egui::Shape::rect_stroke(
         rect,
@@ -5254,6 +5357,141 @@ mod tests {
             ),
             3..3
         );
+    }
+
+    #[test]
+    fn wysiwyg_reads_click_and_drag_selection_from_the_post_pointer_state() {
+        use egui::{Event, Id, Modifiers, PointerButton, RawInput, Rect, pos2, vec2};
+
+        fn run_frame(
+            context: &Context,
+            id: Id,
+            text: &mut String,
+            events: Vec<Event>,
+            request_focus: bool,
+        ) -> (Arc<egui::Galley>, egui::Pos2, Option<CCursorRange>) {
+            let mut result = None;
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 160.0))),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| {
+                    ui.set_width(480.0);
+                    if request_focus {
+                        ui.memory_mut(|memory| memory.request_focus(id));
+                    }
+                    let output = TextEdit::singleline(text).id(id).show(ui);
+                    result = Some((
+                        output.galley.clone(),
+                        output.galley_pos,
+                        text_edit_cursor_after_input(&output),
+                    ));
+                },
+            );
+            result.expect("text edit should be laid out")
+        }
+
+        fn cursor_position(
+            galley: &egui::Galley,
+            galley_pos: egui::Pos2,
+            index: usize,
+        ) -> egui::Pos2 {
+            galley_pos
+                + galley
+                    .pos_from_cursor(CCursor::new(index))
+                    .center()
+                    .to_vec2()
+        }
+
+        let context = Context::default();
+        let id = Id::new("wysiwyg-pointer-selection-regression");
+        let mut text = "alpha beta 中文".to_owned();
+        let (galley, galley_pos, _) = run_frame(&context, id, &mut text, Vec::new(), true);
+        let click = cursor_position(&galley, galley_pos, 2);
+        let (_, _, clicked) = run_frame(
+            &context,
+            id,
+            &mut text,
+            vec![
+                Event::PointerMoved(click),
+                Event::PointerButton {
+                    pos: click,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            false,
+        );
+        assert_eq!(clicked.map(cursor_range_to_char_range), Some(2..2));
+
+        let (galley, galley_pos, _) = run_frame(&context, id, &mut text, Vec::new(), false);
+        let drag_to = cursor_position(&galley, galley_pos, 10);
+        let (_, _, selected) = run_frame(
+            &context,
+            id,
+            &mut text,
+            vec![Event::PointerMoved(drag_to)],
+            false,
+        );
+        let selected = selected.expect("dragging should create a selection");
+        assert_eq!(cursor_range_to_char_range(selected), 2..10);
+        assert_eq!(selected.primary.index.0, 10);
+        assert_eq!(selected.secondary.index.0, 2);
+
+        let (galley, galley_pos, _) = run_frame(
+            &context,
+            id,
+            &mut text,
+            vec![Event::PointerButton {
+                pos: drag_to,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+            false,
+        );
+
+        let reverse_start = cursor_position(&galley, galley_pos, 12);
+        let (_, _, reverse_anchor) = run_frame(
+            &context,
+            id,
+            &mut text,
+            vec![
+                Event::PointerMoved(reverse_start),
+                Event::PointerButton {
+                    pos: reverse_start,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            false,
+        );
+        assert_eq!(reverse_anchor.map(cursor_range_to_char_range), Some(12..12));
+
+        let (galley, galley_pos, _) = run_frame(&context, id, &mut text, Vec::new(), false);
+        let reverse_to = cursor_position(&galley, galley_pos, 6);
+        let (_, _, reverse_selected) = run_frame(
+            &context,
+            id,
+            &mut text,
+            vec![Event::PointerMoved(reverse_to)],
+            false,
+        );
+        let reverse_selected = reverse_selected.expect("reverse dragging should select text");
+        assert_eq!(cursor_range_to_char_range(reverse_selected), 6..12);
+        assert_eq!(reverse_selected.primary.index.0, 6);
+        assert_eq!(reverse_selected.secondary.index.0, 12);
+
+        let reverse = cursor_range_with_direction(
+            2..10,
+            CCursorRange::two(CCursor::new(10), CCursor::new(2)),
+        );
+        assert_eq!(reverse.primary.index.0, 2);
+        assert_eq!(reverse.secondary.index.0, 10);
     }
 
     #[test]
