@@ -28,6 +28,7 @@ use crate::{
     table::{self, MarkdownTable},
     updater::{self, UpdateInfo, UpdateStatus},
     workspace::{Workspace, WorkspaceEntry},
+    wysiwyg::{VisualProjection, VisualStyle},
 };
 use eframe::{
     CreationContext, Frame, Storage,
@@ -35,7 +36,7 @@ use eframe::{
         self, Align, Button, CentralPanel, Color32, Context, FontData, FontDefinitions, FontFamily,
         FontId, Key, Layout, Margin, Panel, RichText, ScrollArea, Stroke, TextEdit, TextStyle, Ui,
         Vec2, ViewportCommand,
-        text::{CCursor, CCursorRange},
+        text::{CCursor, CCursorRange, LayoutJob, TextFormat},
     },
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -44,6 +45,7 @@ use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, Messag
 const APP_STATE_KEY: &str = "rupora-native-state";
 const UI_EXPERIENCE_KEY: &str = "rupora-native-ui-experience";
 const CURRENT_UI_EXPERIENCE: u32 = 1;
+const WYSIWYG_STRONG_FAMILY: &str = "rupora-wysiwyg-strong";
 
 #[derive(Clone, Copy)]
 struct AppPalette {
@@ -1987,7 +1989,11 @@ impl RuporaApp {
                         ui.separator();
                         ui.selectable_value(&mut self.state.view_mode, ViewMode::Edit, "编辑");
                         ui.selectable_value(&mut self.state.view_mode, ViewMode::Split, "分屏");
-                        ui.selectable_value(&mut self.state.view_mode, ViewMode::Hybrid, "混合");
+                        ui.selectable_value(
+                            &mut self.state.view_mode,
+                            ViewMode::Hybrid,
+                            "所见即所得",
+                        );
                         ui.selectable_value(&mut self.state.view_mode, ViewMode::Preview, "预览");
 
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2151,7 +2157,10 @@ impl RuporaApp {
             ("关于 RUPORA", AppCommand::About),
             ("切换到编辑模式", AppCommand::SetView(ViewMode::Edit)),
             ("切换到分屏模式", AppCommand::SetView(ViewMode::Split)),
-            ("切换到混合模式", AppCommand::SetView(ViewMode::Hybrid)),
+            (
+                "切换到所见即所得模式",
+                AppCommand::SetView(ViewMode::Hybrid),
+            ),
             ("切换到预览模式", AppCommand::SetView(ViewMode::Preview)),
             ("格式：粗体", AppCommand::Format(MarkdownCommand::Bold)),
             ("格式：斜体", AppCommand::Format(MarkdownCommand::Italic)),
@@ -2175,7 +2184,7 @@ impl RuporaApp {
                 let response = ui.add_sized(
                     [ui.available_width(), 28.0],
                     TextEdit::singleline(&mut self.command_query)
-                        .hint_text("输入命令，例如：保存、混合、粗体"),
+                        .hint_text("输入命令，例如：保存、所见即所得、粗体"),
                 );
                 if self.command_focus_requested {
                     response.request_focus();
@@ -2943,15 +2952,10 @@ impl RuporaApp {
             render_math_widget(ui, &mut svg_cache.borrow_mut(), math, inline, dark);
         };
 
-        let mut pending_local = None;
-        if let Some(cursor_range) = self.pending_editor_cursor.take() {
-            let [selection_start, selection_end] = cursor_range.sorted_cursors();
+        let mut pending_source_cursor = self.pending_editor_cursor.take();
+        if let Some(cursor_range) = pending_source_cursor {
+            let [selection_start, _] = cursor_range.sorted_cursors();
             let selected_block = block_for_char_index(&source, &blocks, selection_start.index.0);
-            let block_char_start = source[..selected_block.range.start].chars().count();
-            pending_local = Some(CCursorRange::two(
-                CCursor::new(selection_start.index.0.saturating_sub(block_char_start)),
-                CCursor::new(selection_end.index.0.saturating_sub(block_char_start)),
-            ));
             self.hybrid_active = Some((index, selected_block.id));
         }
 
@@ -2992,49 +2996,90 @@ impl RuporaApp {
                                         if Some(block.id) == active_id {
                                             let edit_range =
                                                 hybrid_edit_range(&source, &blocks, block.id);
-                                            let mut block_content =
+                                            let original_block =
                                                 source[edit_range.clone()].to_owned();
-                                            let original_block = block_content.clone();
+                                            let projection =
+                                                VisualProjection::from_markdown(&original_block);
+                                            let mut visual_content = projection.text().to_owned();
                                             let block_char_start =
                                                 source[..edit_range.start].chars().count();
-                                            let local_selection_before =
+                                            let local_source_selection_before =
                                                 selection_before.as_ref().map(|selection| {
                                                     selection.start.saturating_sub(block_char_start)
                                                         ..selection
                                                             .end
                                                             .saturating_sub(block_char_start)
                                                 });
+                                            let visual_selection_before =
+                                                local_source_selection_before.as_ref().map(
+                                                    |selection| {
+                                                        projection.visual_char_range(
+                                                            &original_block,
+                                                            selection.clone(),
+                                                        )
+                                                    },
+                                                );
                                             let editor_id = ui.make_persistent_id((
                                                 "hybrid-editor",
                                                 index,
                                                 block.id,
                                             ));
-                                            if let Some(cursor_range) = pending_local.take() {
+                                            if let Some(cursor_range) = pending_source_cursor.take()
+                                            {
+                                                let [selection_start, selection_end] =
+                                                    cursor_range.sorted_cursors();
+                                                let local_source = selection_start
+                                                    .index
+                                                    .0
+                                                    .saturating_sub(block_char_start)
+                                                    ..selection_end
+                                                        .index
+                                                        .0
+                                                        .saturating_sub(block_char_start);
+                                                let local_visual = projection.visual_char_range(
+                                                    &original_block,
+                                                    local_source,
+                                                );
                                                 let mut state =
                                                     TextEdit::load_state(ui.ctx(), editor_id)
                                                         .unwrap_or_default();
-                                                state.cursor.set_char_range(Some(cursor_range));
+                                                state.cursor.set_char_range(Some(
+                                                    CCursorRange::two(
+                                                        CCursor::new(local_visual.start),
+                                                        CCursor::new(local_visual.end),
+                                                    ),
+                                                ));
                                                 state.store(ui.ctx(), editor_id);
                                                 ui.memory_mut(|memory| {
                                                     memory.request_focus(editor_id)
                                                 });
                                             }
 
-                                            let editor_style =
-                                                hybrid_editor_text_style(&block_content);
                                             let block_is_code =
-                                                is_fenced_code_block(&block_content);
+                                                is_fenced_code_block(&original_block);
                                             let frame = egui::Frame::new()
                                                 .inner_margin(Margin::symmetric(0, 3));
                                             let editor_frame = frame.show(ui, |ui| {
                                                 let desired_rows =
-                                                    multiline_edit_rows(&block_content);
+                                                    multiline_edit_rows(&visual_content);
                                                 let input_action = editor_input_action(ui);
+                                                let mut layouter =
+                                                    |ui: &Ui,
+                                                     buffer: &dyn egui::TextBuffer,
+                                                     wrap_width: f32| {
+                                                        wysiwyg_layout(
+                                                            ui,
+                                                            buffer.as_str(),
+                                                            &projection,
+                                                            wrap_width,
+                                                            palette,
+                                                        )
+                                                    };
                                                 let mut editor =
-                                                    TextEdit::multiline(&mut block_content)
+                                                    TextEdit::multiline(&mut visual_content)
                                                         .id(editor_id)
-                                                        .font(editor_style)
                                                         .frame(egui::Frame::NONE)
+                                                        .layouter(&mut layouter)
                                                         .desired_width(f32::INFINITY)
                                                         .desired_rows(desired_rows)
                                                         .lock_focus(true);
@@ -3046,90 +3091,112 @@ impl RuporaApp {
                                                     ui.ctx(),
                                                     editor_id,
                                                     format!(
-                                                        "从第 {} 行开始的 Markdown 块",
+                                                        "从第 {} 行开始的所见即所得编辑块",
                                                         block.line
                                                     ),
                                                 );
-                                                let mut local_selection_after = output
+                                                let mut visual_selection_after = output
                                                     .cursor_range
                                                     .map(cursor_range_to_char_range);
                                                 let focused = output.response.has_focus();
                                                 let mut changed = output.response.changed();
                                                 let mut kind = EditKind::Typing;
+                                                let mut source_update = None;
 
                                                 if focused
                                                     && let (Some(url), Some(selection)) = (
                                                         input_action.pasted_url.as_deref(),
-                                                        local_selection_before.clone(),
+                                                        visual_selection_before.clone(),
                                                     )
                                                     && !selection.is_empty()
                                                 {
-                                                    block_content.clone_from(&original_block);
+                                                    let source_selection = projection
+                                                        .source_char_range(
+                                                            &original_block,
+                                                            selection,
+                                                        );
+                                                    let mut updated = original_block.clone();
                                                     if let Some(next) =
                                                         editing::paste_url_as_markdown_link(
-                                                            &mut block_content,
-                                                            selection,
+                                                            &mut updated,
+                                                            source_selection,
                                                             url,
                                                         )
                                                     {
-                                                        local_selection_after = Some(next);
+                                                        source_update = Some((updated, next));
                                                         kind = EditKind::Other;
                                                         changed = true;
                                                         cursor_adjusted = true;
                                                     }
                                                 } else if focused && input_action.tab {
-                                                    block_content.clone_from(&original_block);
-                                                    let selection = local_selection_before
+                                                    let selection = visual_selection_before
                                                         .clone()
                                                         .unwrap_or_else(|| {
                                                             let end =
-                                                                original_block.chars().count();
+                                                                visual_content.chars().count();
                                                             end..end
                                                         });
-                                                    local_selection_after =
-                                                        Some(editing::indent_selected_lines(
-                                                            &mut block_content,
+                                                    let source_selection = projection
+                                                        .source_char_range(
+                                                            &original_block,
                                                             selection,
-                                                            input_action.shift,
-                                                        ));
+                                                        );
+                                                    let mut updated = original_block.clone();
+                                                    let next = editing::indent_selected_lines(
+                                                        &mut updated,
+                                                        source_selection,
+                                                        input_action.shift,
+                                                    );
+                                                    source_update = Some((updated, next));
                                                     kind = EditKind::Other;
                                                     changed = true;
                                                     cursor_adjusted = true;
                                                 } else if focused
                                                     && let (Some(typed), Some(selection)) = (
                                                         input_action.typed_text.as_deref(),
-                                                        local_selection_before.clone(),
+                                                        visual_selection_before.clone(),
                                                     )
                                                 {
-                                                    let mut paired = original_block.clone();
+                                                    let mut paired = projection.text().to_owned();
                                                     if let Some(next) = editing::apply_smart_pair(
                                                         &mut paired,
                                                         selection,
                                                         typed,
                                                     ) {
-                                                        changed = paired != original_block;
-                                                        block_content = paired;
-                                                        local_selection_after = Some(next);
+                                                        changed = paired != projection.text();
+                                                        visual_content = paired;
+                                                        visual_selection_after = Some(next);
                                                         kind = EditKind::Other;
                                                         cursor_adjusted = true;
                                                     }
-                                                } else if focused
-                                                    && changed
-                                                    && input_action.enter
-                                                    && let Some(cursor) = local_selection_after
-                                                        .as_ref()
-                                                        .map(|range| range.end)
-                                                    && let Some(next) =
-                                                        editing::continue_markdown_line(
-                                                            &mut block_content,
-                                                            cursor,
-                                                        )
-                                                {
-                                                    local_selection_after = Some(next);
-                                                    cursor_adjusted = true;
                                                 }
 
-                                                if let Some(selection) = local_selection_after {
+                                                if source_update.is_none()
+                                                    && changed
+                                                    && let Some(selection) =
+                                                        visual_selection_after.clone()
+                                                    && let Some(mut update) = projection.apply_edit(
+                                                        &original_block,
+                                                        &visual_content,
+                                                        selection,
+                                                    )
+                                                {
+                                                    if focused
+                                                        && input_action.enter
+                                                        && let Some(next) =
+                                                            editing::continue_markdown_line(
+                                                                &mut update.source,
+                                                                update.selection.end,
+                                                            )
+                                                    {
+                                                        update.selection = next;
+                                                    }
+                                                    cursor_adjusted = true;
+                                                    source_update =
+                                                        Some((update.source, update.selection));
+                                                }
+
+                                                if let Some((updated, selection)) = source_update {
                                                     next_global_cursor = Some(CCursorRange::two(
                                                         CCursor::new(
                                                             block_char_start + selection.start,
@@ -3138,12 +3205,24 @@ impl RuporaApp {
                                                             block_char_start + selection.end,
                                                         ),
                                                     ));
-                                                }
-                                                if changed {
-                                                    pending_edit = Some((
-                                                        edit_range.clone(),
-                                                        block_content.clone(),
-                                                        kind,
+                                                    pending_edit =
+                                                        Some((edit_range.clone(), updated, kind));
+                                                } else if let Some(selection) =
+                                                    visual_selection_after
+                                                {
+                                                    let source_selection = projection
+                                                        .source_char_range(
+                                                            &original_block,
+                                                            selection,
+                                                        );
+                                                    next_global_cursor = Some(CCursorRange::two(
+                                                        CCursor::new(
+                                                            block_char_start
+                                                                + source_selection.start,
+                                                        ),
+                                                        CCursor::new(
+                                                            block_char_start + source_selection.end,
+                                                        ),
                                                     ));
                                                 }
                                             });
@@ -3466,7 +3545,7 @@ fn toolbar_toggle_button(
 
 fn view_mode_selector(ui: &mut Ui, mode: &mut ViewMode, palette: AppPalette) {
     ui.allocate_ui_with_layout(
-        Vec2::new(152.0, 28.0),
+        Vec2::new(218.0, 28.0),
         Layout::left_to_right(Align::Center),
         |ui| {
             egui::Frame::new()
@@ -3476,10 +3555,10 @@ fn view_mode_selector(ui: &mut Ui, mode: &mut ViewMode, palette: AppPalette) {
                 .inner_margin(1)
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    for (value, label, tooltip) in [
-                        (ViewMode::Hybrid, "即时", "即时排版编辑"),
-                        (ViewMode::Edit, "源码", "Markdown 源码编辑"),
-                        (ViewMode::Preview, "预览", "只读排版预览"),
+                    for (value, label, tooltip, width) in [
+                        (ViewMode::Hybrid, "所见即所得", "视觉排版编辑", 108.0),
+                        (ViewMode::Edit, "源码", "Markdown 源码编辑", 52.0),
+                        (ViewMode::Preview, "预览", "只读排版预览", 52.0),
                     ] {
                         let selected = *mode == value;
                         let text_color = if selected {
@@ -3496,7 +3575,7 @@ fn view_mode_selector(ui: &mut Ui, mode: &mut ViewMode, palette: AppPalette) {
                                         Color32::TRANSPARENT
                                     })
                                     .stroke(Stroke::NONE)
-                                    .min_size(Vec2::new(48.0, 24.0)),
+                                    .min_size(Vec2::new(width, 24.0)),
                             )
                             .on_hover_text(tooltip)
                             .clicked()
@@ -3577,27 +3656,84 @@ fn multiline_edit_rows(source: &str) -> usize {
     source.bytes().filter(|byte| *byte == b'\n').count() + 1
 }
 
-fn hybrid_editor_text_style(source: &str) -> TextStyle {
-    if is_fenced_code_block(source) {
-        return TextStyle::Monospace;
+fn wysiwyg_layout(
+    ui: &Ui,
+    text: &str,
+    projection: &VisualProjection,
+    wrap_width: f32,
+    palette: AppPalette,
+) -> Arc<egui::Galley> {
+    let runs = projection.runs_for(text);
+    if runs.is_empty() {
+        let mut job = LayoutJob::simple(
+            text.to_owned(),
+            FontId::new(14.0, FontFamily::Proportional),
+            palette.text,
+            wrap_width,
+        );
+        job.keep_trailing_whitespace = true;
+        return ui.fonts_mut(|fonts| fonts.layout_job(job));
     }
-    let trimmed = source.trim_start();
-    let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
-    if !(1..=6).contains(&level)
-        || !trimmed
-            .as_bytes()
-            .get(level)
-            .is_some_and(u8::is_ascii_whitespace)
-    {
-        return TextStyle::Body;
+
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    job.keep_trailing_whitespace = true;
+    for run in runs {
+        let start = char_to_byte(text, run.range.start);
+        let end = char_to_byte(text, run.range.end);
+        let format = visual_text_format(run.style, palette);
+        job.append(&text[start..end], 0.0, format);
     }
-    let name = match level {
-        1 => "rupora-title",
-        2 => "rupora-h2",
-        3 => "rupora-h3",
-        _ => "rupora-h4",
+    ui.fonts_mut(|fonts| fonts.layout_job(job))
+}
+
+fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
+    let size = match style.heading {
+        1 => 30.0,
+        2 => 24.0,
+        3 => 20.0,
+        4 => 17.0,
+        _ => 14.0,
     };
-    TextStyle::Name(name.into())
+    let family = if style.code {
+        FontFamily::Monospace
+    } else if style.strong || style.heading > 0 {
+        FontFamily::Name(WYSIWYG_STRONG_FAMILY.into())
+    } else {
+        FontFamily::Proportional
+    };
+    let mut format = TextFormat::simple(
+        FontId::new(size, family),
+        if style.marker || style.quote {
+            palette.secondary
+        } else if style.link {
+            palette.accent
+        } else {
+            palette.text
+        },
+    );
+    format.line_height = Some(match style.heading {
+        1 => 38.0,
+        2 => 32.0,
+        3 => 28.0,
+        4 => 25.0,
+        _ => 24.0,
+    });
+    if style.strong || style.heading > 0 {
+        format.extra_letter_spacing = 0.2;
+    }
+    format.italics = style.emphasis;
+    if style.strikethrough {
+        format.strikethrough = Stroke::new(1.0, format.color);
+    }
+    if style.link {
+        format.underline = Stroke::new(1.0, palette.accent);
+    }
+    if style.code {
+        format.background = palette.hover;
+        format.expand_bg = 2.0;
+    }
+    format
 }
 
 fn parse_shortcut(specification: &str) -> Option<egui::KeyboardShortcut> {
@@ -3957,26 +4093,67 @@ fn apply_theme(ctx: &Context, dark: bool) {
 }
 
 fn install_fonts(ctx: &Context) {
-    let Some((path, bytes)) = export::cjk_font_candidates()
+    let regular_font = export::cjk_font_candidates()
+        .into_iter()
+        .find_map(|path| fs::read(&path).ok().map(|bytes| (path, bytes)));
+    let mut fonts = FontDefinitions::default();
+    if let Some((path, bytes)) = regular_font {
+        let font_name = format!("rupora-cjk-{}", path.display());
+        fonts
+            .font_data
+            .insert(font_name.clone(), Arc::new(FontData::from_owned(bytes)));
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, font_name.clone());
+        let monospace = fonts.families.entry(FontFamily::Monospace).or_default();
+        monospace.insert(monospace.len().min(1), font_name);
+    }
+    let mut strong_fonts = Vec::new();
+    if let Some((bold_path, bold_bytes)) = cjk_bold_font_candidates()
         .into_iter()
         .find_map(|path| fs::read(&path).ok().map(|bytes| (path, bytes)))
-    else {
-        return;
-    };
-
-    let mut fonts = FontDefinitions::default();
-    let font_name = format!("rupora-cjk-{}", path.display());
-    fonts
-        .font_data
-        .insert(font_name.clone(), Arc::new(FontData::from_owned(bytes)));
+    {
+        let bold_name = format!("rupora-cjk-bold-{}", bold_path.display());
+        fonts.font_data.insert(
+            bold_name.clone(),
+            Arc::new(FontData::from_owned(bold_bytes)),
+        );
+        strong_fonts.push(bold_name);
+    }
+    strong_fonts.extend(
+        fonts
+            .families
+            .get(&FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default(),
+    );
     fonts
         .families
-        .entry(FontFamily::Proportional)
-        .or_default()
-        .insert(0, font_name.clone());
-    let monospace = fonts.families.entry(FontFamily::Monospace).or_default();
-    monospace.insert(monospace.len().min(1), font_name);
+        .insert(FontFamily::Name(WYSIWYG_STRONG_FAMILY.into()), strong_fonts);
     ctx.set_fonts(fonts);
+}
+
+fn cjk_bold_font_candidates() -> Vec<PathBuf> {
+    if cfg!(target_os = "windows") {
+        vec![
+            PathBuf::from(r"C:\Windows\Fonts\msyhbd.ttc"),
+            PathBuf::from(r"C:\Windows\Fonts\msyhbd.ttf"),
+            PathBuf::from(r"C:\Windows\Fonts\simhei.ttf"),
+        ]
+    } else if cfg!(target_os = "macos") {
+        vec![
+            PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
+            PathBuf::from("/System/Library/Fonts/STHeiti Medium.ttc"),
+        ]
+    } else {
+        vec![
+            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
+            PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc"),
+            PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -4146,24 +4323,18 @@ mod tests {
     }
 
     #[test]
-    fn instant_editor_matches_editing_typography_to_markdown_blocks() {
-        assert_eq!(hybrid_editor_text_style("plain paragraph"), TextStyle::Body);
-        assert_eq!(
-            hybrid_editor_text_style("```rust\nfn main() {}\n```"),
-            TextStyle::Monospace
-        );
-        assert!(matches!(
-            hybrid_editor_text_style("# Title"),
-            TextStyle::Name(name) if name.as_ref() == "rupora-title"
-        ));
-        assert!(matches!(
-            hybrid_editor_text_style("### Section"),
-            TextStyle::Name(name) if name.as_ref() == "rupora-h3"
-        ));
+    fn wysiwyg_editor_matches_editing_typography_to_markdown_blocks() {
+        let heading = VisualProjection::from_markdown("# Title");
+        assert_eq!(heading.text(), "Title");
+        assert!(heading.runs_for(heading.text())[0].style.heading == 1);
+
+        let code = VisualProjection::from_markdown("```rust\nfn main() {}\n```");
+        assert_eq!(code.text(), "fn main() {}");
+        assert!(code.runs_for(code.text())[0].style.code);
     }
 
     #[test]
-    fn instant_editor_keeps_trailing_newlines_inside_the_active_range() {
+    fn wysiwyg_editor_keeps_trailing_newlines_inside_the_active_range() {
         let source = "第一段\n\n第二段";
         let blocks = markdown::blocks(source);
         let first_range = hybrid_edit_range(source, &blocks, blocks[0].id);

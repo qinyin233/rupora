@@ -15,5 +15,6 @@ pub mod source_map;
 pub mod table;
 pub mod updater;
 pub mod workspace;
+mod wysiwyg;
 
 pub use app::RuporaApp;

@@ -125,7 +125,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_the_single_canvas_instant_editor() {
+    fn defaults_to_the_single_canvas_wysiwyg_editor() {
         let state = PersistedState::default();
         assert_eq!(state.view_mode, ViewMode::Hybrid);
         assert!(state.show_sidebar);
