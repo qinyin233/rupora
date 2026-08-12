@@ -80,6 +80,10 @@ impl VisualProjection {
             let selection = clamp_range(selection, source.chars().count());
             char_to_byte(source, selection.start)..char_to_byte(source, selection.end)
         });
+        let collapsed_source_cursor = source_selection
+            .as_ref()
+            .filter(|selection| selection.is_empty())
+            .map(|selection| selection.start);
 
         for (event, range) in Parser::new_ext(source, parser_options()).into_offset_iter() {
             match event {
@@ -94,6 +98,13 @@ impl VisualProjection {
                     match tag {
                         Tag::Heading { level, .. } => format.heading = heading_level(level),
                         Tag::BlockQuote(_) => format.quote += 1,
+                        Tag::CodeBlock(CodeBlockKind::Fenced(_)) => {
+                            format.code += 1;
+                            builder.set_current_boundary(fenced_code_content_start(
+                                source,
+                                range.start,
+                            ));
+                        }
                         Tag::CodeBlock(_) | Tag::HtmlBlock => format.code += 1,
                         Tag::Item => {
                             builder.ensure_line_break(range.start, format.visual());
@@ -227,7 +238,12 @@ impl VisualProjection {
         }
 
         builder.append_trailing_container_line(source);
-        builder.finish(source, trailing_container_block, trailing_fenced_code_block)
+        let mut projection =
+            builder.finish(source, trailing_container_block, trailing_fenced_code_block);
+        if let Some(source_byte) = collapsed_source_cursor {
+            projection.anchor_source_cursor(source_byte);
+        }
+        projection
     }
 
     pub fn text(&self) -> &str {
@@ -330,6 +346,13 @@ impl VisualProjection {
         self.source_boundaries.len().saturating_sub(1)
     }
 
+    fn anchor_source_cursor(&mut self, source_byte: usize) {
+        let visual_index = self.visual_char_for_source_byte(source_byte);
+        if let Some(boundary) = self.source_boundaries.get_mut(visual_index) {
+            *boundary = source_byte;
+        }
+    }
+
     fn style_at(&self, index: usize) -> VisualStyle {
         self.runs
             .iter()
@@ -386,6 +409,41 @@ pub fn complete_visual_enter(
     } else {
         crate::editing::continue_markdown_line(source, selection.end).unwrap_or(selection)
     }
+}
+
+pub fn complete_fenced_code_on_enter(
+    source: &mut String,
+    selection: Range<usize>,
+) -> Option<Range<usize>> {
+    if !selection.is_empty() {
+        return None;
+    }
+    let cursor_byte = char_to_byte(source, selection.end);
+    if cursor_byte != source.len() {
+        return None;
+    }
+    let before = source.get(..cursor_byte)?;
+    let newline_start = newline_start_before_cursor(source, cursor_byte)?;
+    let line_start = before[..newline_start]
+        .rfind(['\n', '\r'])
+        .map_or(0, |index| index + 1);
+    let line = &before[line_start..newline_start];
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let fence_character = trimmed.chars().next()?;
+    if !matches!(fence_character, '`' | '~') {
+        return None;
+    }
+    let fence_length = trimmed
+        .chars()
+        .take_while(|character| *character == fence_character)
+        .count();
+    if fence_length < 3 {
+        return None;
+    }
+    let indentation = &line[..line.len() - trimmed.len()];
+    let closing = fence_character.to_string().repeat(fence_length);
+    source.insert_str(cursor_byte, &format!("\n{indentation}{closing}"));
+    Some(selection)
 }
 
 fn ensure_hard_break_before_cursor(source: &mut String, cursor: usize) -> usize {
@@ -787,6 +845,12 @@ fn selection_reveals_inline_code(
     source_selection.start <= content_range.end && source_selection.end >= content_range.start
 }
 
+fn fenced_code_content_start(source: &str, block_start: usize) -> usize {
+    source[block_start..]
+        .find('\n')
+        .map_or(source.len(), |offset| block_start + offset + 1)
+}
+
 #[derive(Clone, Debug)]
 struct TextChange {
     old: Range<usize>,
@@ -1041,6 +1105,24 @@ mod tests {
                 "cursor: {cursor}"
             );
         }
+    }
+
+    #[test]
+    fn collapsed_inline_code_keeps_edits_on_the_caret_side() {
+        let source = "`abc`";
+
+        let before = VisualProjection::from_markdown_with_selection(source, Some(0..0));
+        assert_eq!(before.text(), "abc");
+        assert_eq!(before.source_char_range(source, 0..0), 0..0);
+        let inserted_before = before.apply_edit(source, "Xabc", 1..1).unwrap();
+        assert_eq!(inserted_before.source, "X`abc`");
+
+        let after = VisualProjection::from_markdown_with_selection(source, Some(5..5));
+        assert_eq!(after.text(), "abc");
+        assert_eq!(after.source_char_range(source, 3..3), 5..5);
+        let inserted_after = after.apply_edit(source, "abcX", 4..4).unwrap();
+        assert_eq!(inserted_after.source, "`abc`X");
+        assert_eq!(inserted_after.selection, 6..6);
     }
 
     #[test]
@@ -1323,6 +1405,45 @@ mod tests {
                 "source: {source:?}"
             );
         }
+    }
+
+    #[test]
+    fn unfinished_fence_has_an_editable_anchor_and_enter_completes_the_block() {
+        let source = "```";
+        let projection = VisualProjection::from_markdown(source);
+        assert_eq!(projection.text(), "");
+        assert_eq!(projection.source_boundaries, vec![source.len()]);
+
+        let mut update = projection.apply_edit(source, "\n", 1..1).unwrap();
+        assert_eq!(update.source, "```\n");
+        assert_eq!(update.selection, 4..4);
+        update.selection =
+            complete_fenced_code_on_enter(&mut update.source, update.selection.clone()).unwrap();
+        assert_eq!(update.source, "```\n\n```");
+        assert_eq!(update.selection, 4..4);
+
+        let completed = VisualProjection::from_markdown(&update.source);
+        assert_eq!(completed.text(), "");
+        let code = completed.apply_edit(&update.source, "value", 5..5).unwrap();
+        assert_eq!(code.source, "```\nvalue\n```");
+    }
+
+    #[test]
+    fn completing_a_fence_preserves_language_length_and_indentation() {
+        for (before, after) in [
+            ("```rust\n", "```rust\n\n```"),
+            ("  ~~~~text\n", "  ~~~~text\n\n  ~~~~"),
+        ] {
+            let mut source = before.to_owned();
+            let cursor = source.chars().count();
+            let selection = complete_fenced_code_on_enter(&mut source, cursor..cursor).unwrap();
+            assert_eq!(source, after);
+            assert_eq!(selection, cursor..cursor);
+        }
+
+        let mut plain = "ordinary\n".to_owned();
+        let cursor = plain.chars().count();
+        assert!(complete_fenced_code_on_enter(&mut plain, cursor..cursor).is_none());
     }
 
     #[test]

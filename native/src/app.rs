@@ -28,7 +28,9 @@ use crate::{
     table::{self, MarkdownTable},
     updater::{self, UpdateInfo, UpdateStatus},
     workspace::{Workspace, WorkspaceEntry},
-    wysiwyg::{VisualProjection, VisualStyle, complete_visual_enter},
+    wysiwyg::{
+        VisualProjection, VisualStyle, complete_fenced_code_on_enter, complete_visual_enter,
+    },
 };
 use eframe::{
     CreationContext, Frame, Storage,
@@ -3347,11 +3349,22 @@ impl RuporaApp {
 
                                             let block_is_code =
                                                 is_fenced_code_block(&original_block);
-                                            let frame = egui::Frame::new()
-                                                .inner_margin(Margin::symmetric(0, 3));
+                                            let frame = if block_is_code {
+                                                egui::Frame::new()
+                                                    .fill(palette.hover)
+                                                    .stroke(Stroke::new(1.0, palette.border))
+                                                    .corner_radius(8)
+                                                    .inner_margin(Margin::symmetric(14, 10))
+                                            } else {
+                                                egui::Frame::new()
+                                                    .inner_margin(Margin::symmetric(0, 3))
+                                            };
                                             let editor_frame = frame.show(ui, |ui| {
-                                                let desired_rows =
-                                                    multiline_edit_rows(&visual_content);
+                                                let desired_rows = if block_is_code {
+                                                    multiline_edit_rows(&visual_content).max(2)
+                                                } else {
+                                                    multiline_edit_rows(&visual_content)
+                                                };
                                                 let input_action = editor_input_action(ui);
                                                 let mut layouter =
                                                     |ui: &Ui,
@@ -3370,7 +3383,11 @@ impl RuporaApp {
                                                         .id(editor_id)
                                                         .frame(egui::Frame::NONE)
                                                         .layouter(&mut layouter)
-                                                        .hint_text("开始写作…")
+                                                        .hint_text(if block_is_code {
+                                                            "输入代码…"
+                                                        } else {
+                                                            "开始写作…"
+                                                        })
                                                         .desired_width(f32::INFINITY)
                                                         .desired_rows(desired_rows)
                                                         .lock_focus(true);
@@ -3393,6 +3410,7 @@ impl RuporaApp {
                                                 let mut changed = output.response.changed();
                                                 let mut kind = EditKind::Typing;
                                                 let mut source_update = None;
+                                                let mut boundary_backspace_handled = false;
                                                 let defer_ime = focused
                                                     && (ime_action == ImeFrameAction::Preedit
                                                         || had_ime_session
@@ -3480,9 +3498,36 @@ impl RuporaApp {
                                                         kind = EditKind::Other;
                                                         cursor_adjusted = true;
                                                     }
+                                                } else if !defer_ime
+                                                    && focused
+                                                    && input_action.backspace
+                                                    && !changed
+                                                    && visual_selection_before.as_ref().is_some_and(
+                                                        |selection| {
+                                                            selection.is_empty()
+                                                                && selection.start == 0
+                                                        },
+                                                    )
+                                                    && let Some((replacement_range, cursor)) =
+                                                        boundary_backspace_edit(
+                                                            &source,
+                                                            edit_range.clone(),
+                                                        )
+                                                {
+                                                    pending_edit = Some((
+                                                        replacement_range,
+                                                        original_block.clone(),
+                                                        EditKind::Typing,
+                                                    ));
+                                                    next_global_cursor = Some(CCursorRange::one(
+                                                        CCursor::new(cursor),
+                                                    ));
+                                                    cursor_adjusted = true;
+                                                    boundary_backspace_handled = true;
                                                 }
 
-                                                if !defer_ime
+                                                if !boundary_backspace_handled
+                                                    && !defer_ime
                                                     && source_update.is_none()
                                                     && changed
                                                     && let Some(selection) =
@@ -3494,11 +3539,22 @@ impl RuporaApp {
                                                     )
                                                 {
                                                     if focused && input_action.enter {
-                                                        update.selection = complete_visual_enter(
-                                                            &mut update.source,
-                                                            update.selection,
-                                                            input_action.shift,
-                                                        );
+                                                        if !input_action.shift
+                                                            && let Some(selection) =
+                                                                complete_fenced_code_on_enter(
+                                                                    &mut update.source,
+                                                                    update.selection.clone(),
+                                                                )
+                                                        {
+                                                            update.selection = selection;
+                                                        } else {
+                                                            update.selection =
+                                                                complete_visual_enter(
+                                                                    &mut update.source,
+                                                                    update.selection,
+                                                                    input_action.shift,
+                                                                );
+                                                        }
                                                     }
                                                     cursor_adjusted = true;
                                                     source_update =
@@ -3516,8 +3572,9 @@ impl RuporaApp {
                                                         base_source: original_block,
                                                         visual_content,
                                                     });
-                                                } else if let Some((updated, selection)) =
-                                                    source_update
+                                                } else if !boundary_backspace_handled
+                                                    && let Some((updated, selection)) =
+                                                        source_update
                                                 {
                                                     next_global_cursor = Some(CCursorRange::two(
                                                         CCursor::new(
@@ -3529,12 +3586,15 @@ impl RuporaApp {
                                                     ));
                                                     pending_edit =
                                                         Some((edit_range.clone(), updated, kind));
-                                                } else if let Some(selection) =
-                                                    visual_selection_after
+                                                } else if !boundary_backspace_handled
+                                                    && let Some(selection) = visual_selection_after
                                                 {
-                                                    let source_selection = projection
-                                                        .source_char_range(
+                                                    let source_selection =
+                                                        source_selection_after_visual_input(
+                                                            &projection,
                                                             &original_block,
+                                                            local_source_selection_before.as_ref(),
+                                                            visual_selection_before.as_ref(),
                                                             selection,
                                                         );
                                                     next_global_cursor = Some(CCursorRange::two(
@@ -4169,6 +4229,41 @@ fn cursor_range_to_char_range(range: CCursorRange) -> std::ops::Range<usize> {
     start.index.0..end.index.0
 }
 
+fn source_selection_after_visual_input(
+    projection: &VisualProjection,
+    source: &str,
+    previous_source_selection: Option<&std::ops::Range<usize>>,
+    previous_visual_selection: Option<&std::ops::Range<usize>>,
+    visual_selection: std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    if previous_visual_selection == Some(&visual_selection)
+        && let Some(previous) = previous_source_selection
+    {
+        return previous.clone();
+    }
+    projection.source_char_range(source, visual_selection)
+}
+
+fn line_break_before(source: &str, byte_index: usize) -> Option<std::ops::Range<usize>> {
+    let before = source.get(..byte_index)?;
+    if before.ends_with("\r\n") {
+        Some(byte_index - 2..byte_index)
+    } else if before.ends_with(['\n', '\r']) {
+        Some(byte_index - 1..byte_index)
+    } else {
+        None
+    }
+}
+
+fn boundary_backspace_edit(
+    source: &str,
+    edit_range: std::ops::Range<usize>,
+) -> Option<(std::ops::Range<usize>, usize)> {
+    let line_break = line_break_before(source, edit_range.start)?;
+    let cursor = source[..line_break.start].chars().count();
+    Some((line_break.start..edit_range.end, cursor))
+}
+
 fn scroll_ratio(scroll: PaneScroll) -> f32 {
     if scroll.maximum <= f32::EPSILON {
         0.0
@@ -4393,6 +4488,7 @@ fn duplicate_shortcuts(bindings: &KeyBindings) -> bool {
 
 #[derive(Default)]
 struct EditorInputAction {
+    backspace: bool,
     enter: bool,
     tab: bool,
     shift: bool,
@@ -4402,6 +4498,7 @@ struct EditorInputAction {
 
 fn editor_input_action(ui: &Ui) -> EditorInputAction {
     ui.input(|input| EditorInputAction {
+        backspace: input.key_pressed(Key::Backspace),
         enter: input.key_pressed(Key::Enter),
         tab: input.key_pressed(Key::Tab),
         shift: input.modifiers.shift,
@@ -4927,6 +5024,57 @@ mod tests {
         let updated_range = hybrid_edit_range(&trailing, &updated_blocks, updated_blocks[0].id);
         assert_eq!(&trailing[updated_range], "换句话\n");
         assert_eq!(multiline_edit_rows(&trailing), 2);
+    }
+
+    #[test]
+    fn hidden_inline_code_boundaries_preserve_the_outside_cursor_side() {
+        let source = "`abc`";
+        let projection = VisualProjection::from_markdown(source);
+        let previous_source = 5..5;
+        let previous_visual = projection.visual_char_range(source, previous_source.clone());
+        assert_eq!(previous_visual, 3..3);
+
+        assert_eq!(
+            source_selection_after_visual_input(
+                &projection,
+                source,
+                Some(&previous_source),
+                Some(&previous_visual),
+                previous_visual.clone(),
+            ),
+            previous_source
+        );
+        assert_eq!(
+            source_selection_after_visual_input(
+                &projection,
+                source,
+                Some(&(5..5)),
+                Some(&(3..3)),
+                2..2,
+            ),
+            3..3
+        );
+    }
+
+    #[test]
+    fn block_boundary_backspace_can_remove_one_blank_line_at_a_time() {
+        let mut source = "`a\n\n\n`".to_owned();
+        for expected in ["`a\n\n`", "`a\n`"] {
+            let blocks = markdown::blocks(&source);
+            let closing = source.chars().count() - 1;
+            let block = block_for_char_index(&source, &blocks, closing);
+            let edit_range = hybrid_edit_range(&source, &blocks, block.id);
+            assert_eq!(&source[edit_range.clone()], "`");
+
+            let original_block = source[edit_range.clone()].to_owned();
+            let (replacement_range, cursor) = boundary_backspace_edit(&source, edit_range).unwrap();
+            source.replace_range(replacement_range, &original_block);
+            assert_eq!(source, expected);
+            assert_eq!(cursor, expected.chars().count() - 1);
+        }
+
+        assert_eq!(line_break_before("one\r\ntwo", 5), Some(3..5));
+        assert_eq!(line_break_before("one two", 4), None);
     }
 
     #[test]
