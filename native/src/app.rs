@@ -62,29 +62,29 @@ struct AppPalette {
 fn app_palette(dark: bool) -> AppPalette {
     if dark {
         AppPalette {
-            canvas: Color32::from_rgb(28, 28, 30),
-            surface: Color32::from_rgb(36, 36, 38),
-            toolbar: Color32::from_rgb(31, 31, 33),
-            sidebar: Color32::from_rgb(32, 32, 34),
-            text: Color32::from_rgb(245, 245, 247),
-            secondary: Color32::from_rgb(161, 161, 166),
-            border: Color32::from_rgb(58, 58, 60),
-            accent: Color32::from_rgb(10, 132, 255),
-            accent_soft: Color32::from_rgb(22, 59, 99),
-            hover: Color32::from_rgb(44, 44, 46),
+            canvas: Color32::from_rgb(30, 30, 30),
+            surface: Color32::from_rgb(30, 30, 30),
+            toolbar: Color32::from_rgb(24, 24, 24),
+            sidebar: Color32::from_rgb(37, 37, 38),
+            text: Color32::from_rgb(212, 212, 212),
+            secondary: Color32::from_rgb(150, 150, 150),
+            border: Color32::from_rgb(43, 43, 43),
+            accent: Color32::from_rgb(0, 122, 204),
+            accent_soft: Color32::from_rgb(4, 57, 94),
+            hover: Color32::from_rgb(42, 45, 46),
         }
     } else {
         AppPalette {
-            canvas: Color32::from_rgb(245, 245, 247),
+            canvas: Color32::WHITE,
             surface: Color32::WHITE,
-            toolbar: Color32::from_rgb(251, 251, 253),
-            sidebar: Color32::from_rgb(242, 242, 244),
-            text: Color32::from_rgb(29, 29, 31),
-            secondary: Color32::from_rgb(110, 110, 115),
-            border: Color32::from_rgb(210, 210, 215),
-            accent: Color32::from_rgb(0, 122, 255),
-            accent_soft: Color32::from_rgb(232, 242, 255),
-            hover: Color32::from_rgb(232, 232, 237),
+            toolbar: Color32::from_rgb(243, 243, 243),
+            sidebar: Color32::from_rgb(243, 243, 243),
+            text: Color32::from_rgb(31, 31, 31),
+            secondary: Color32::from_rgb(97, 97, 97),
+            border: Color32::from_rgb(212, 212, 212),
+            accent: Color32::from_rgb(0, 122, 204),
+            accent_soft: Color32::from_rgb(232, 243, 252),
+            hover: Color32::from_rgb(232, 232, 232),
         }
     }
 }
@@ -1741,17 +1741,12 @@ impl RuporaApp {
             .map(|service| service.name.clone())
             .collect::<Vec<_>>();
         let palette = app_palette(self.state.dark);
-        let active_document = self.active.and_then(|index| self.documents.get(index));
-        let document_title = active_document
-            .map(Document::title)
-            .unwrap_or_else(|| "RUPORA".to_owned());
-        let document_dirty = active_document.is_some_and(|document| document.dirty);
         let toolbar_frame = egui::Frame::new()
             .fill(palette.toolbar)
-            .inner_margin(Margin::symmetric(14, 9))
+            .inner_margin(Margin::symmetric(10, 5))
             .stroke(Stroke::new(1.0, palette.border));
         Panel::top("toolbar")
-            .exact_size(60.0)
+            .exact_size(48.0)
             .frame(toolbar_frame)
             .show(root, |ui| {
                 ui.horizontal(|ui| {
@@ -1761,8 +1756,8 @@ impl RuporaApp {
                     if ui
                         .add(
                             Button::new("打开")
-                                .fill(palette.surface)
-                                .stroke(Stroke::new(1.0, palette.border)),
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE),
                         )
                         .on_hover_text("打开 Markdown · Ctrl+O")
                         .clicked()
@@ -1772,8 +1767,8 @@ impl RuporaApp {
                     if ui
                         .add_enabled(
                             self.active.is_some(),
-                            Button::new(RichText::new("保存").color(Color32::WHITE))
-                                .fill(palette.accent)
+                            Button::new("保存")
+                                .fill(Color32::TRANSPARENT)
                                 .stroke(Stroke::NONE),
                         )
                         .on_hover_text("保存当前文档 · Ctrl+S")
@@ -2005,20 +2000,6 @@ impl RuporaApp {
                             ui.checkbox(&mut self.state.show_sidebar, "文档");
                         });
                     });
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-                    let title = if document_dirty {
-                        format!("{document_title}  •")
-                    } else {
-                        document_title.to_owned()
-                    };
-                    ui.add_sized(
-                        [150.0, 32.0],
-                        egui::Label::new(RichText::new(title).strong()).truncate(),
-                    )
-                    .on_hover_text(document_title);
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let theme_symbol = if self.state.dark { "亮" } else { "暗" };
@@ -2281,16 +2262,19 @@ impl RuporaApp {
 
         let palette = app_palette(self.state.dark);
         Panel::left("documents")
-            .default_size(248.0)
-            .size_range(190.0..=420.0)
+            .default_size(240.0)
+            .size_range(180.0..=420.0)
             .resizable(true)
             .frame(
                 egui::Frame::new()
                     .fill(palette.sidebar)
-                    .inner_margin(Margin::symmetric(14, 12))
+                    .inner_margin(Margin::symmetric(10, 8))
                     .stroke(Stroke::new(1.0, palette.border)),
             )
             .show(root, |ui| {
+                ui.label(RichText::new("资源管理器").small().strong());
+                ui.add_space(3.0);
+                ui.separator();
                 let mut workspace_file_to_open = None;
                 let mut refresh_workspace = false;
                 let mut close_workspace = false;
@@ -2341,7 +2325,7 @@ impl RuporaApp {
 
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("文稿")
+                        RichText::new("打开的编辑器")
                             .small()
                             .strong()
                             .color(palette.secondary),
@@ -2437,12 +2421,12 @@ impl RuporaApp {
             .frame(
                 egui::Frame::new()
                     .fill(palette.sidebar)
-                    .inner_margin(Margin::symmetric(14, 12))
+                    .inner_margin(Margin::symmetric(10, 8))
                     .stroke(Stroke::new(1.0, palette.border)),
             )
             .show(root, |ui| {
                 ui.label(
-                    RichText::new("内容大纲")
+                    RichText::new("大纲")
                         .small()
                         .strong()
                         .color(palette.secondary),
@@ -2466,6 +2450,80 @@ impl RuporaApp {
         }
     }
 
+    fn editor_tabs(&mut self, root: &mut Ui) {
+        if self.documents.is_empty() {
+            return;
+        }
+        let tabs = self
+            .documents
+            .iter()
+            .map(|document| (document.title(), document.dirty))
+            .collect::<Vec<_>>();
+        let palette = app_palette(self.state.dark);
+        let mut activate = None;
+        let mut close = None;
+        Panel::top("editor-tabs")
+            .exact_size(35.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.toolbar)
+                    .stroke(Stroke::new(1.0, palette.border)),
+            )
+            .show(root, |ui| {
+                ScrollArea::horizontal()
+                    .id_salt("editor-tabs-scroll")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            for (index, (title, dirty)) in tabs.iter().enumerate() {
+                                let selected = self.active == Some(index);
+                                egui::Frame::new()
+                                    .fill(if selected {
+                                        palette.canvas
+                                    } else {
+                                        palette.toolbar
+                                    })
+                                    .stroke(Stroke::new(1.0, palette.border))
+                                    .inner_margin(Margin::symmetric(8, 2))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let label = if *dirty {
+                                                format!("● {title}")
+                                            } else {
+                                                title.clone()
+                                            };
+                                            if ui
+                                                .add(
+                                                    Button::new(label)
+                                                        .frame(false)
+                                                        .truncate()
+                                                        .min_size(Vec2::new(112.0, 27.0)),
+                                                )
+                                                .clicked()
+                                            {
+                                                activate = Some(index);
+                                            }
+                                            if ui
+                                                .add(Button::new("×").frame(false).small())
+                                                .on_hover_text("关闭编辑器")
+                                                .clicked()
+                                            {
+                                                close = Some(index);
+                                            }
+                                        });
+                                    });
+                            }
+                        });
+                    });
+            });
+        if let Some(index) = activate {
+            self.activate_document(index);
+        }
+        if let Some(index) = close {
+            self.close_document(index);
+        }
+    }
+
     fn editor(&mut self, root: &mut Ui) {
         let palette = app_palette(self.state.dark);
         CentralPanel::default()
@@ -2474,9 +2532,9 @@ impl RuporaApp {
                 let Some(index) = self.active else {
                     ui.centered_and_justified(|ui| {
                         egui::Frame::new()
-                            .fill(palette.surface)
-                            .stroke(Stroke::new(1.0, palette.border))
-                            .corner_radius(18)
+                            .fill(palette.canvas)
+                            .stroke(Stroke::NONE)
+                            .corner_radius(2)
                             .inner_margin(Margin::symmetric(48, 40))
                             .show(ui, |ui| {
                                 ui.vertical_centered(|ui| {
@@ -2582,19 +2640,12 @@ impl RuporaApp {
             ui.horizontal(|ui| {
                 ui.add_space(side_margin);
                 egui::Frame::new()
-                    .fill(palette.surface)
-                    .stroke(Stroke::new(1.0, palette.border))
-                    .corner_radius(16)
-                    .inner_margin(Margin::symmetric(42, 34))
-                    .shadow(egui::Shadow {
-                        offset: [0, 6],
-                        blur: 22,
-                        spread: 0,
-                        color: Color32::from_black_alpha(if self.state.dark { 72 } else { 20 }),
-                    })
+                    .fill(palette.canvas)
+                    .stroke(Stroke::NONE)
+                    .inner_margin(Margin::symmetric(48, 24))
                     .show(ui, |ui| {
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            ui.set_width((page_width - 84.0).max(200.0));
+                            ui.set_width((page_width - 96.0).max(200.0));
                             let available =
                                 Vec2::new(ui.available_width(), (viewport.y - 116.0).max(360.0));
                             let row_height =
@@ -2812,19 +2863,12 @@ impl RuporaApp {
                     .horizontal(|ui| {
                         ui.add_space(side_margin);
                         egui::Frame::new()
-                            .fill(palette.surface)
-                            .stroke(Stroke::new(1.0, palette.border))
-                            .corner_radius(16)
-                            .inner_margin(Margin::symmetric(42, 34))
-                            .shadow(egui::Shadow {
-                                offset: [0, 6],
-                                blur: 22,
-                                spread: 0,
-                                color: Color32::from_black_alpha(if dark { 72 } else { 20 }),
-                            })
+                            .fill(palette.canvas)
+                            .stroke(Stroke::NONE)
+                            .inner_margin(Margin::symmetric(48, 24))
                             .show(ui, |ui| {
                                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                                    ui.set_width((page_width - 84.0).max(200.0));
+                                    ui.set_width((page_width - 96.0).max(200.0));
                                     ui.set_min_height((viewport_height - 118.0).max(480.0));
                                     CommonMarkViewer::new()
                                         .default_implicit_uri_scheme(base_uri)
@@ -2936,28 +2980,23 @@ impl RuporaApp {
                 ui.horizontal(|ui| {
                     ui.add_space(side_margin);
                     let page = egui::Frame::new()
-                        .fill(palette.surface)
-                        .stroke(Stroke::new(1.0, palette.border))
-                        .corner_radius(16)
-                        .inner_margin(Margin::symmetric(42, 34))
-                        .shadow(egui::Shadow {
-                            offset: [0, 6],
-                            blur: 22,
-                            spread: 0,
-                            color: Color32::from_black_alpha(if self.state.dark { 72 } else { 20 }),
-                        })
+                        .fill(palette.canvas)
+                        .stroke(Stroke::NONE)
+                        .inner_margin(Margin::symmetric(48, 24))
                         .show(ui, |ui| {
                             ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                                ui.set_width((page_width - 84.0).max(280.0));
+                                ui.set_width((page_width - 96.0).max(280.0));
                                 ui.set_min_height((viewport_height - 118.0).max(480.0));
                                 for block in &blocks {
                                     ui.push_id(("hybrid-block", block.id), |ui| {
                                         if Some(block.id) == active_id {
+                                            let edit_range =
+                                                hybrid_edit_range(&source, &blocks, block.id);
                                             let mut block_content =
-                                                source[block.range.clone()].to_owned();
+                                                source[edit_range.clone()].to_owned();
                                             let original_block = block_content.clone();
                                             let block_char_start =
-                                                source[..block.range.start].chars().count();
+                                                source[..edit_range.start].chars().count();
                                             let local_selection_before =
                                                 selection_before.as_ref().map(|selection| {
                                                     selection.start.saturating_sub(block_char_start)
@@ -2986,18 +3025,16 @@ impl RuporaApp {
                                             let block_is_code =
                                                 is_fenced_code_block(&block_content);
                                             let frame = egui::Frame::new()
-                                                .fill(palette.accent_soft)
-                                                .inner_margin(Margin::symmetric(14, 10))
-                                                .corner_radius(10)
-                                                .stroke(Stroke::new(1.0, palette.accent));
+                                                .inner_margin(Margin::symmetric(0, 3));
                                             let editor_frame = frame.show(ui, |ui| {
                                                 let desired_rows =
-                                                    block_content.lines().count().max(1);
+                                                    multiline_edit_rows(&block_content);
                                                 let input_action = editor_input_action(ui);
                                                 let mut editor =
                                                     TextEdit::multiline(&mut block_content)
                                                         .id(editor_id)
                                                         .font(editor_style)
+                                                        .frame(egui::Frame::NONE)
                                                         .desired_width(f32::INFINITY)
                                                         .desired_rows(desired_rows)
                                                         .lock_focus(true);
@@ -3104,7 +3141,7 @@ impl RuporaApp {
                                                 }
                                                 if changed {
                                                     pending_edit = Some((
-                                                        block.range.clone(),
+                                                        edit_range.clone(),
                                                         block_content.clone(),
                                                         kind,
                                                     ));
@@ -3137,14 +3174,6 @@ impl RuporaApp {
                                                     "点击编辑第 {} 行开始的 Markdown 块",
                                                     block.line
                                                 ));
-                                            if response.hovered() {
-                                                ui.painter().rect_stroke(
-                                                    response.rect.expand(5.0),
-                                                    9.0,
-                                                    Stroke::new(1.0, palette.border),
-                                                    egui::StrokeKind::Outside,
-                                                );
-                                            }
                                             if response.clicked() {
                                                 let local_source_byte = response
                                                     .interact_pointer_pos()
@@ -3203,8 +3232,17 @@ impl RuporaApp {
                 selection_after,
                 kind,
             );
-            if let Some(active_id) = active_id {
-                self.hybrid_active = Some((index, active_id));
+            let cursor_block_id = next_global_cursor.map(|cursor_range| {
+                let cursor = cursor_range.sorted_cursors()[1].index.0;
+                let updated_source = self.documents[index].content.clone();
+                let updated_blocks = self.documents[index].blocks().to_vec();
+                block_for_char_index(&updated_source, &updated_blocks, cursor).id
+            });
+            if let Some(next_active_id) = cursor_block_id.or(active_id) {
+                self.hybrid_active = Some((index, next_active_id));
+                if cursor_block_id != active_id {
+                    self.pending_editor_cursor = next_global_cursor;
+                }
             }
             self.status = "已更新当前 Markdown 块".to_owned();
         }
@@ -3297,22 +3335,18 @@ impl RuporaApp {
 
         let palette = app_palette(self.state.dark);
         Panel::bottom("status")
-            .exact_size(30.0)
+            .exact_size(24.0)
             .frame(
                 egui::Frame::new()
-                    .fill(palette.toolbar)
-                    .inner_margin(Margin::symmetric(10, 5))
-                    .stroke(Stroke::new(1.0, palette.border)),
+                    .fill(palette.accent)
+                    .inner_margin(Margin::symmetric(8, 3))
+                    .stroke(Stroke::NONE),
             )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&self.status).small().color(palette.secondary));
+                    ui.label(RichText::new(&self.status).small().color(Color32::WHITE));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(document_info)
-                                .small()
-                                .color(palette.secondary),
-                        );
+                        ui.label(RichText::new(document_info).small().color(Color32::WHITE));
                     });
                 });
             });
@@ -3373,6 +3407,7 @@ impl eframe::App for RuporaApp {
         self.status_bar(ui);
         self.sidebar(ui);
         self.outline(ui);
+        self.editor_tabs(ui);
         self.editor(ui);
     }
 
@@ -3404,9 +3439,9 @@ impl eframe::App for RuporaApp {
 
 fn toolbar_symbol_button(ui: &mut Ui, symbol: &str, tooltip: &str) -> egui::Response {
     ui.add(
-        Button::new(RichText::new(symbol).size(18.0))
+        Button::new(RichText::new(symbol).size(16.0))
             .frame(false)
-            .min_size(Vec2::splat(34.0)),
+            .min_size(Vec2::splat(28.0)),
     )
     .on_hover_text(tooltip)
 }
@@ -3424,25 +3459,21 @@ fn toolbar_toggle_button(
         } else {
             Color32::TRANSPARENT
         })
-        .stroke(if selected {
-            Stroke::new(1.0, palette.accent)
-        } else {
-            Stroke::NONE
-        })
-        .min_size(Vec2::splat(34.0));
+        .stroke(Stroke::NONE)
+        .min_size(Vec2::splat(28.0));
     ui.add(button).on_hover_text(tooltip)
 }
 
 fn view_mode_selector(ui: &mut Ui, mode: &mut ViewMode, palette: AppPalette) {
     ui.allocate_ui_with_layout(
-        Vec2::new(158.0, 32.0),
+        Vec2::new(152.0, 28.0),
         Layout::left_to_right(Align::Center),
         |ui| {
             egui::Frame::new()
-                .fill(palette.canvas)
+                .fill(palette.toolbar)
                 .stroke(Stroke::new(1.0, palette.border))
-                .corner_radius(10)
-                .inner_margin(2)
+                .corner_radius(3)
+                .inner_margin(1)
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     for (value, label, tooltip) in [
@@ -3460,12 +3491,12 @@ fn view_mode_selector(ui: &mut Ui, mode: &mut ViewMode, palette: AppPalette) {
                             .add(
                                 Button::new(RichText::new(label).color(text_color))
                                     .fill(if selected {
-                                        palette.surface
+                                        palette.accent_soft
                                     } else {
                                         Color32::TRANSPARENT
                                     })
                                     .stroke(Stroke::NONE)
-                                    .min_size(Vec2::new(48.0, 28.0)),
+                                    .min_size(Vec2::new(48.0, 24.0)),
                             )
                             .on_hover_text(tooltip)
                             .clicked()
@@ -3524,6 +3555,26 @@ fn scroll_ratio(scroll: PaneScroll) -> f32 {
 fn is_fenced_code_block(source: &str) -> bool {
     let trimmed = source.trim_start();
     trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+fn hybrid_edit_range(
+    source: &str,
+    blocks: &[markdown::MarkdownBlock],
+    active_id: BlockId,
+) -> std::ops::Range<usize> {
+    let index = blocks
+        .iter()
+        .position(|block| block.id == active_id)
+        .expect("active Markdown block must still exist");
+    let start = blocks[index].range.start;
+    let end = blocks
+        .get(index + 1)
+        .map_or(source.len(), |block| block.range.start);
+    start..end
+}
+
+fn multiline_edit_rows(source: &str) -> usize {
+    source.bytes().filter(|byte| *byte == b'\n').count() + 1
 }
 
 fn hybrid_editor_text_style(source: &str) -> TextStyle {
@@ -3817,8 +3868,8 @@ fn apply_theme(ctx: &Context, dark: bool) {
     visuals.panel_fill = palette.canvas;
     visuals.window_fill = palette.surface;
     visuals.window_stroke = Stroke::new(1.0, palette.border);
-    visuals.window_corner_radius = egui::CornerRadius::same(14);
-    visuals.menu_corner_radius = egui::CornerRadius::same(12);
+    visuals.window_corner_radius = egui::CornerRadius::same(4);
+    visuals.menu_corner_radius = egui::CornerRadius::same(4);
     visuals.faint_bg_color = palette.hover;
     visuals.extreme_bg_color = palette.surface;
     visuals.text_edit_bg_color = Some(palette.surface);
@@ -3838,26 +3889,26 @@ fn apply_theme(ctx: &Context, dark: bool) {
     visuals.widgets.noninteractive.weak_bg_fill = palette.surface;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.border);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette.text);
-    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(10);
+    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(2);
 
     visuals.widgets.inactive.bg_fill = palette.surface;
     visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
     visuals.widgets.inactive.bg_stroke = Stroke::NONE;
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, palette.text);
-    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(9);
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
 
     visuals.widgets.hovered.bg_fill = palette.hover;
     visuals.widgets.hovered.weak_bg_fill = palette.hover;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, palette.border);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, palette.text);
-    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(9);
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(2);
     visuals.widgets.hovered.expansion = 0.0;
 
     visuals.widgets.active.bg_fill = palette.accent_soft;
     visuals.widgets.active.weak_bg_fill = palette.accent_soft;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, palette.accent);
+    visuals.widgets.active.bg_stroke = Stroke::NONE;
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, palette.text);
-    visuals.widgets.active.corner_radius = egui::CornerRadius::same(9);
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(2);
     visuals.widgets.active.expansion = 0.0;
     visuals.widgets.open = visuals.widgets.active;
 
@@ -3868,34 +3919,34 @@ fn apply_theme(ctx: &Context, dark: bool) {
     });
     ctx.global_style_mut(|style| {
         style.visuals = visuals;
-        style.spacing.item_spacing = Vec2::new(8.0, 7.0);
-        style.spacing.button_padding = Vec2::new(10.0, 6.0);
-        style.spacing.interact_size = Vec2::new(36.0, 32.0);
-        style.spacing.window_margin = Margin::same(18);
+        style.spacing.item_spacing = Vec2::new(6.0, 4.0);
+        style.spacing.button_padding = Vec2::new(8.0, 4.0);
+        style.spacing.interact_size = Vec2::new(32.0, 28.0);
+        style.spacing.window_margin = Margin::same(12);
         style.text_styles.insert(
             TextStyle::Heading,
-            FontId::new(28.0, FontFamily::Proportional),
+            FontId::new(24.0, FontFamily::Proportional),
         );
         style
             .text_styles
-            .insert(TextStyle::Body, FontId::new(16.0, FontFamily::Proportional));
+            .insert(TextStyle::Body, FontId::new(14.0, FontFamily::Proportional));
         style.text_styles.insert(
             TextStyle::Button,
-            FontId::new(14.0, FontFamily::Proportional),
+            FontId::new(13.0, FontFamily::Proportional),
         );
         style.text_styles.insert(
             TextStyle::Small,
-            FontId::new(12.5, FontFamily::Proportional),
+            FontId::new(12.0, FontFamily::Proportional),
         );
         style.text_styles.insert(
             TextStyle::Monospace,
-            FontId::new(14.5, FontFamily::Monospace),
+            FontId::new(14.0, FontFamily::Monospace),
         );
         for (name, size) in [
-            ("rupora-title", 34.0),
-            ("rupora-h2", 27.0),
-            ("rupora-h3", 22.0),
-            ("rupora-h4", 18.0),
+            ("rupora-title", 30.0),
+            ("rupora-h2", 24.0),
+            ("rupora-h3", 20.0),
+            ("rupora-h4", 17.0),
         ] {
             style.text_styles.insert(
                 TextStyle::Name(name.into()),
@@ -4109,5 +4160,24 @@ mod tests {
             hybrid_editor_text_style("### Section"),
             TextStyle::Name(name) if name.as_ref() == "rupora-h3"
         ));
+    }
+
+    #[test]
+    fn instant_editor_keeps_trailing_newlines_inside_the_active_range() {
+        let source = "第一段\n\n第二段";
+        let blocks = markdown::blocks(source);
+        let first_range = hybrid_edit_range(source, &blocks, blocks[0].id);
+        assert_eq!(&source[first_range], "第一段\n\n");
+
+        let mut trailing = "换句话".to_owned();
+        let original_blocks = markdown::blocks(&trailing);
+        let original_range = hybrid_edit_range(&trailing, &original_blocks, original_blocks[0].id);
+        let replacement = format!("{}\n", &trailing[original_range.clone()]);
+        trailing.replace_range(original_range, &replacement);
+
+        let updated_blocks = markdown::blocks(&trailing);
+        let updated_range = hybrid_edit_range(&trailing, &updated_blocks, updated_blocks[0].id);
+        assert_eq!(&trailing[updated_range], "换句话\n");
+        assert_eq!(multiline_edit_rows(&trailing), 2);
     }
 }
