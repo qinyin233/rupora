@@ -44,7 +44,7 @@ use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, Messag
 
 const APP_STATE_KEY: &str = "rupora-native-state";
 const UI_EXPERIENCE_KEY: &str = "rupora-native-ui-experience";
-const CURRENT_UI_EXPERIENCE: u32 = 1;
+const CURRENT_UI_EXPERIENCE: u32 = 2;
 const WYSIWYG_STRONG_FAMILY: &str = "rupora-wysiwyg-strong";
 
 #[derive(Clone, Copy)]
@@ -64,29 +64,29 @@ struct AppPalette {
 fn app_palette(dark: bool) -> AppPalette {
     if dark {
         AppPalette {
-            canvas: Color32::from_rgb(30, 30, 30),
-            surface: Color32::from_rgb(30, 30, 30),
-            toolbar: Color32::from_rgb(24, 24, 24),
-            sidebar: Color32::from_rgb(37, 37, 38),
-            text: Color32::from_rgb(212, 212, 212),
-            secondary: Color32::from_rgb(150, 150, 150),
-            border: Color32::from_rgb(43, 43, 43),
-            accent: Color32::from_rgb(0, 122, 204),
-            accent_soft: Color32::from_rgb(4, 57, 94),
-            hover: Color32::from_rgb(42, 45, 46),
+            canvas: Color32::from_rgb(24, 25, 30),
+            surface: Color32::from_rgb(30, 31, 38),
+            toolbar: Color32::from_rgb(27, 28, 34),
+            sidebar: Color32::from_rgb(31, 32, 39),
+            text: Color32::from_rgb(232, 233, 239),
+            secondary: Color32::from_rgb(146, 150, 165),
+            border: Color32::from_rgb(51, 53, 64),
+            accent: Color32::from_rgb(139, 148, 255),
+            accent_soft: Color32::from_rgb(50, 52, 81),
+            hover: Color32::from_rgb(42, 44, 53),
         }
     } else {
         AppPalette {
-            canvas: Color32::WHITE,
+            canvas: Color32::from_rgb(246, 247, 250),
             surface: Color32::WHITE,
-            toolbar: Color32::from_rgb(243, 243, 243),
-            sidebar: Color32::from_rgb(243, 243, 243),
-            text: Color32::from_rgb(31, 31, 31),
-            secondary: Color32::from_rgb(97, 97, 97),
-            border: Color32::from_rgb(212, 212, 212),
-            accent: Color32::from_rgb(0, 122, 204),
-            accent_soft: Color32::from_rgb(232, 243, 252),
-            hover: Color32::from_rgb(232, 232, 232),
+            toolbar: Color32::from_rgb(250, 250, 252),
+            sidebar: Color32::from_rgb(242, 244, 247),
+            text: Color32::from_rgb(30, 32, 38),
+            secondary: Color32::from_rgb(102, 108, 121),
+            border: Color32::from_rgb(222, 225, 232),
+            accent: Color32::from_rgb(91, 95, 235),
+            accent_soft: Color32::from_rgb(235, 236, 255),
+            hover: Color32::from_rgb(234, 237, 243),
         }
     }
 }
@@ -108,6 +108,23 @@ struct PaneScroll {
 struct TableEditorState {
     document: usize,
     table: MarkdownTable,
+}
+
+#[derive(Clone, Debug)]
+struct HybridImeSession {
+    document_id: u64,
+    block_id: BlockId,
+    base_source: String,
+    visual_content: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ImeFrameAction {
+    #[default]
+    None,
+    Preedit,
+    Commit,
+    Cancel,
 }
 
 struct ExtensionJobResult {
@@ -143,6 +160,7 @@ pub struct RuporaApp {
     find_focus_requested: bool,
     workspace: Option<Workspace>,
     hybrid_active: Option<(usize, BlockId)>,
+    hybrid_ime_session: Option<HybridImeSession>,
     external_conflicts: HashSet<PathBuf>,
     last_external_check: Instant,
     external_scan_error_reported: bool,
@@ -239,6 +257,7 @@ impl RuporaApp {
             find_focus_requested: false,
             workspace,
             hybrid_active: None,
+            hybrid_ime_session: None,
             external_conflicts: HashSet::new(),
             last_external_check: Instant::now(),
             external_scan_error_reported: false,
@@ -380,6 +399,7 @@ impl RuporaApp {
         self.store_active_view_state();
         self.active = Some(index);
         self.hybrid_active = None;
+        self.hybrid_ime_session = None;
         self.split_scroll_document = Some(index);
         self.restore_active_view_state();
     }
@@ -393,6 +413,7 @@ impl RuporaApp {
         self.editor_cursor = None;
         self.pending_editor_cursor = None;
         self.hybrid_active = None;
+        self.hybrid_ime_session = None;
         self.status = "已新建文档".to_owned();
     }
 
@@ -769,6 +790,8 @@ impl RuporaApp {
         };
         self.editor_cursor = None;
         self.pending_editor_cursor = None;
+        self.hybrid_active = None;
+        self.hybrid_ime_session = None;
         self.restore_active_view_state();
         if self.documents.is_empty() {
             self.new_document();
@@ -875,7 +898,12 @@ impl RuporaApp {
             AppCommand::OpenReleasePage => self.open_release_page(),
             AppCommand::About => self.about_open = true,
             AppCommand::Format(command) => self.apply_format(command),
-            AppCommand::SetView(mode) => self.state.view_mode = mode,
+            AppCommand::SetView(mode) => {
+                self.state.view_mode = mode;
+                if mode != ViewMode::Hybrid {
+                    self.hybrid_ime_session = None;
+                }
+            }
         }
     }
 
@@ -1451,6 +1479,7 @@ impl RuporaApp {
                 self.editor_cursor = None;
                 self.pending_editor_cursor = None;
                 self.hybrid_active = None;
+                self.hybrid_ime_session = None;
             }
             self.status = format!("已自动重新加载外部修改：{}", path.display());
         }
@@ -1516,6 +1545,7 @@ impl RuporaApp {
                         self.editor_cursor = None;
                         self.pending_editor_cursor = None;
                         self.hybrid_active = None;
+                        self.hybrid_ime_session = None;
                         self.status = if conflicts == 0 {
                             "已重新关联移动后的文件".to_owned()
                         } else {
@@ -1537,6 +1567,7 @@ impl RuporaApp {
                     self.editor_cursor = None;
                     self.pending_editor_cursor = None;
                     self.hybrid_active = None;
+                    self.hybrid_ime_session = None;
                     self.status = if conflicts == 0 {
                         "已自动合并外部修改".to_owned()
                     } else {
@@ -1561,6 +1592,7 @@ impl RuporaApp {
                         self.editor_cursor = None;
                         self.pending_editor_cursor = None;
                         self.hybrid_active = None;
+                        self.hybrid_ime_session = None;
                         self.status = format!("已从磁盘重新加载：{}", path.display());
                     }
                     Err(error) => self.show_error("重新加载失败", &error),
@@ -1736,6 +1768,7 @@ impl RuporaApp {
     }
 
     fn top_bar(&mut self, root: &mut Ui) {
+        let previous_view_mode = self.state.view_mode;
         let extension_names = self
             .extension_registry
             .services()
@@ -1745,40 +1778,58 @@ impl RuporaApp {
         let palette = app_palette(self.state.dark);
         let toolbar_frame = egui::Frame::new()
             .fill(palette.toolbar)
-            .inner_margin(Margin::symmetric(10, 5))
+            .inner_margin(Margin::symmetric(10, 6))
             .stroke(Stroke::new(1.0, palette.border));
         Panel::top("toolbar")
-            .exact_size(48.0)
+            .exact_size(46.0)
             .frame(toolbar_frame)
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    if toolbar_symbol_button(ui, "＋", "新建文档 · Ctrl+N").clicked() {
+                    ui.add(
+                        Button::new(RichText::new("R").strong().color(palette.accent))
+                            .fill(palette.accent_soft)
+                            .stroke(Stroke::NONE)
+                            .corner_radius(7)
+                            .min_size(Vec2::splat(28.0)),
+                    )
+                    .on_hover_text("RUPORA · 原生 Markdown 编辑器");
+                    ui.label(
+                        RichText::new("RUPORA")
+                            .size(12.5)
+                            .strong()
+                            .color(palette.text),
+                    );
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    if app_icon_button(ui, AppIcon::New, false, "新建文档 · Ctrl+N", palette)
+                        .clicked()
+                    {
                         self.execute(AppCommand::New);
                     }
-                    if ui
-                        .add(
-                            Button::new("打开")
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE),
-                        )
-                        .on_hover_text("打开 Markdown · Ctrl+O")
-                        .clicked()
+                    if app_icon_button(
+                        ui,
+                        AppIcon::Folder,
+                        false,
+                        "打开 Markdown · Ctrl+O",
+                        palette,
+                    )
+                    .clicked()
                     {
                         self.execute(AppCommand::Open);
                     }
                     if ui
                         .add_enabled(
                             self.active.is_some(),
-                            Button::new("保存")
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE),
+                            icon_button_widget(AppIcon::Save, false, palette),
                         )
                         .on_hover_text("保存当前文档 · Ctrl+S")
                         .clicked()
                     {
                         self.execute(AppCommand::Save);
                     }
-                    ui.menu_button(RichText::new("•••").size(16.0), |ui| {
+                    ui.menu_button(RichText::new("···").size(17.0), |ui| {
                         ui.set_min_width(180.0);
                         ui.label(RichText::new("全部操作").small().color(palette.secondary));
                         ui.separator();
@@ -2007,40 +2058,36 @@ impl RuporaApp {
                         });
                     });
 
+                    ui.add_space(10.0);
+                    let command_width = (ui.available_width() - 252.0).clamp(0.0, 360.0);
+                    if command_width >= 170.0
+                        && ui
+                            .add_sized(
+                                [command_width, 29.0],
+                                Button::new(
+                                    RichText::new("⌕  搜索命令或打开文件…    Ctrl+Shift+P")
+                                        .size(11.5)
+                                        .color(palette.secondary),
+                                )
+                                .fill(palette.surface)
+                                .stroke(Stroke::new(1.0, palette.border))
+                                .corner_radius(7),
+                            )
+                            .on_hover_text("打开命令面板")
+                            .clicked()
+                    {
+                        self.command_palette_open = true;
+                        self.command_focus_requested = true;
+                    }
+
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let theme_symbol = if self.state.dark { "亮" } else { "暗" };
-                        if toolbar_symbol_button(ui, theme_symbol, "切换浅色 / 深色外观").clicked()
-                        {
-                            self.state.dark = !self.state.dark;
-                            apply_theme(ui.ctx(), self.state.dark);
-                        }
-                        if toolbar_toggle_button(
-                            ui,
-                            "纲",
-                            self.state.show_outline,
-                            "显示 / 隐藏大纲",
-                            palette,
-                        )
-                        .clicked()
-                        {
-                            self.state.show_outline = !self.state.show_outline;
-                        }
-                        if toolbar_toggle_button(
-                            ui,
-                            "栏",
-                            self.state.show_sidebar,
-                            "显示 / 隐藏文档栏",
-                            palette,
-                        )
-                        .clicked()
-                        {
-                            self.state.show_sidebar = !self.state.show_sidebar;
-                        }
-                        ui.add_space(6.0);
                         view_mode_selector(ui, &mut self.state.view_mode, palette);
                     });
                 });
             });
+        if self.state.view_mode != previous_view_mode && self.state.view_mode != ViewMode::Hybrid {
+            self.hybrid_ime_session = None;
+        }
     }
 
     fn find_bar(&mut self, root: &mut Ui) {
@@ -2265,24 +2312,80 @@ impl RuporaApp {
     }
 
     fn sidebar(&mut self, root: &mut Ui) {
+        let palette = app_palette(self.state.dark);
+        Panel::left("activity-rail")
+            .exact_size(46.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.toolbar)
+                    .inner_margin(Margin::symmetric(7, 8))
+                    .stroke(Stroke::new(1.0, palette.border)),
+            )
+            .show(root, |ui| {
+                ui.vertical_centered(|ui| {
+                    if app_icon_button(
+                        ui,
+                        AppIcon::Sidebar,
+                        self.state.show_sidebar,
+                        "资源管理器",
+                        palette,
+                    )
+                    .clicked()
+                    {
+                        self.state.show_sidebar = !self.state.show_sidebar;
+                    }
+                    ui.add_space(3.0);
+                    if app_icon_button(
+                        ui,
+                        AppIcon::Outline,
+                        self.state.show_outline,
+                        "文档大纲",
+                        palette,
+                    )
+                    .clicked()
+                    {
+                        self.state.show_outline = !self.state.show_outline;
+                    }
+                });
+                ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+                    if app_icon_button(ui, AppIcon::Theme, false, "切换浅色 / 深色外观", palette)
+                        .clicked()
+                    {
+                        self.state.dark = !self.state.dark;
+                        apply_theme(ui.ctx(), self.state.dark);
+                    }
+                });
+            });
+
         if !self.state.show_sidebar {
             return;
         }
 
-        let palette = app_palette(self.state.dark);
         Panel::left("documents")
-            .default_size(240.0)
-            .size_range(180.0..=420.0)
+            .default_size(224.0)
+            .size_range(190.0..=360.0)
             .resizable(true)
             .frame(
                 egui::Frame::new()
                     .fill(palette.sidebar)
-                    .inner_margin(Margin::symmetric(10, 8))
+                    .inner_margin(Margin::symmetric(12, 10))
                     .stroke(Stroke::new(1.0, palette.border)),
             )
             .show(root, |ui| {
-                ui.label(RichText::new("资源管理器").small().strong());
-                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("资源管理器")
+                            .size(11.5)
+                            .strong()
+                            .color(palette.secondary),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if app_icon_button(ui, AppIcon::New, false, "新建文档", palette).clicked()
+                        {
+                            self.new_document();
+                        }
+                    });
+                });
                 ui.separator();
                 let mut workspace_file_to_open = None;
                 let mut refresh_workspace = false;
@@ -2332,51 +2435,122 @@ impl RuporaApp {
                     self.open_paths([path]);
                 }
 
+                if self.workspace.is_none() {
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(palette.surface)
+                        .stroke(Stroke::new(1.0, palette.border))
+                        .corner_radius(8)
+                        .inner_margin(Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("尚未打开工作区")
+                                    .size(12.5)
+                                    .strong()
+                                    .color(palette.text),
+                            );
+                            ui.label(
+                                RichText::new("打开文件夹，快速浏览和管理 Markdown 文稿。")
+                                    .small()
+                                    .color(palette.secondary),
+                            );
+                            ui.add_space(7.0);
+                            if ui
+                                .add(
+                                    Button::new("打开文件夹")
+                                        .fill(palette.accent_soft)
+                                        .stroke(Stroke::NONE)
+                                        .corner_radius(6),
+                                )
+                                .clicked()
+                            {
+                                self.execute(AppCommand::OpenFolder);
+                            }
+                        });
+                    ui.add_space(10.0);
+                }
+
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("打开的编辑器")
-                            .small()
+                            .size(11.5)
                             .strong()
                             .color(palette.secondary),
                     );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if toolbar_symbol_button(ui, "＋", "新建文档").clicked() {
-                            self.new_document();
-                        }
-                    });
                 });
-                ui.separator();
+                ui.add_space(3.0);
 
                 let mut activate = None;
                 let mut close = None;
                 ScrollArea::vertical().show(ui, |ui| {
                     for (index, document) in self.documents.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            let title = if document.dirty {
-                                format!("● {}", document.title())
+                        let selected = self.active == Some(index);
+                        egui::Frame::new()
+                            .fill(if selected {
+                                palette.accent_soft
                             } else {
-                                document.title()
-                            };
-                            let selected = self.active == Some(index);
-                            let response = ui.selectable_label(selected, title).on_hover_text(
-                                document
-                                    .path
-                                    .as_deref()
-                                    .map(Path::display)
-                                    .map(|display| display.to_string())
-                                    .unwrap_or_else(|| "尚未保存".to_owned()),
-                            );
-                            if response.clicked() {
-                                activate = Some(index);
-                            }
-                            if ui
-                                .add(Button::new("×").frame(false).small())
-                                .on_hover_text("关闭")
-                                .clicked()
-                            {
-                                close = Some(index);
-                            }
-                        });
+                                Color32::TRANSPARENT
+                            })
+                            .corner_radius(6)
+                            .inner_margin(Margin::symmetric(5, 2))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let (icon_rect, _) = ui.allocate_exact_size(
+                                        Vec2::splat(16.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    paint_app_icon(
+                                        ui.painter(),
+                                        icon_rect.shrink(2.0),
+                                        AppIcon::File,
+                                        if selected {
+                                            palette.accent
+                                        } else {
+                                            palette.secondary
+                                        },
+                                    );
+                                    let title = if document.dirty {
+                                        format!("{}  •", document.title())
+                                    } else {
+                                        document.title()
+                                    };
+                                    let title_width = (ui.available_width() - 26.0).max(40.0);
+                                    let response = ui
+                                        .add_sized(
+                                            [title_width, 25.0],
+                                            Button::new(RichText::new(title).color(if selected {
+                                                palette.text
+                                            } else {
+                                                palette.secondary
+                                            }))
+                                            .frame(false)
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(
+                                            document
+                                                .path
+                                                .as_deref()
+                                                .map(Path::display)
+                                                .map(|display| display.to_string())
+                                                .unwrap_or_else(|| "尚未保存".to_owned()),
+                                        );
+                                    if response.clicked() {
+                                        activate = Some(index);
+                                    }
+                                    if ui
+                                        .add(AppIconButton {
+                                            icon: AppIcon::Close,
+                                            selected: false,
+                                            palette,
+                                            size: 22.0,
+                                        })
+                                        .on_hover_text("关闭")
+                                        .clicked()
+                                    {
+                                        close = Some(index);
+                                    }
+                                });
+                            });
                     }
                 });
 
@@ -2424,19 +2598,19 @@ impl RuporaApp {
         let mut jump_to_line = None;
         let palette = app_palette(self.state.dark);
         Panel::right("outline")
-            .default_size(236.0)
-            .size_range(180.0..=400.0)
+            .default_size(220.0)
+            .size_range(180.0..=340.0)
             .resizable(true)
             .frame(
                 egui::Frame::new()
                     .fill(palette.sidebar)
-                    .inner_margin(Margin::symmetric(10, 8))
+                    .inner_margin(Margin::symmetric(12, 10))
                     .stroke(Stroke::new(1.0, palette.border)),
             )
             .show(root, |ui| {
                 ui.label(
                     RichText::new("大纲")
-                        .small()
+                        .size(11.5)
                         .strong()
                         .color(palette.secondary),
                 );
@@ -2472,7 +2646,7 @@ impl RuporaApp {
         let mut activate = None;
         let mut close = None;
         Panel::top("editor-tabs")
-            .exact_size(35.0)
+            .exact_size(38.0)
             .frame(
                 egui::Frame::new()
                     .fill(palette.toolbar)
@@ -2486,34 +2660,52 @@ impl RuporaApp {
                             ui.spacing_mut().item_spacing.x = 0.0;
                             for (index, (title, dirty)) in tabs.iter().enumerate() {
                                 let selected = self.active == Some(index);
-                                egui::Frame::new()
+                                let tab = egui::Frame::new()
                                     .fill(if selected {
-                                        palette.canvas
+                                        palette.surface
                                     } else {
                                         palette.toolbar
                                     })
-                                    .stroke(Stroke::new(1.0, palette.border))
-                                    .inner_margin(Margin::symmetric(8, 2))
+                                    .stroke(Stroke::new(
+                                        1.0,
+                                        if selected {
+                                            palette.surface
+                                        } else {
+                                            palette.border
+                                        },
+                                    ))
+                                    .inner_margin(Margin::symmetric(9, 3))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             let label = if *dirty {
-                                                format!("● {title}")
+                                                format!("{title}  •")
                                             } else {
                                                 title.clone()
                                             };
                                             if ui
                                                 .add(
-                                                    Button::new(label)
-                                                        .frame(false)
-                                                        .truncate()
-                                                        .min_size(Vec2::new(112.0, 27.0)),
+                                                    Button::new(RichText::new(label).color(
+                                                        if selected {
+                                                            palette.text
+                                                        } else {
+                                                            palette.secondary
+                                                        },
+                                                    ))
+                                                    .frame(false)
+                                                    .truncate()
+                                                    .min_size(Vec2::new(112.0, 26.0)),
                                                 )
                                                 .clicked()
                                             {
                                                 activate = Some(index);
                                             }
                                             if ui
-                                                .add(Button::new("×").frame(false).small())
+                                                .add(AppIconButton {
+                                                    icon: AppIcon::Close,
+                                                    selected: false,
+                                                    palette,
+                                                    size: 21.0,
+                                                })
                                                 .on_hover_text("关闭编辑器")
                                                 .clicked()
                                             {
@@ -2521,6 +2713,27 @@ impl RuporaApp {
                                             }
                                         });
                                     });
+                                if selected {
+                                    ui.painter().line_segment(
+                                        [
+                                            tab.response.rect.left_top(),
+                                            tab.response.rect.right_top(),
+                                        ],
+                                        Stroke::new(2.0, palette.accent),
+                                    );
+                                }
+                            }
+                            ui.add_space(5.0);
+                            if app_icon_button(
+                                ui,
+                                AppIcon::New,
+                                false,
+                                "新建编辑器 · Ctrl+N",
+                                palette,
+                            )
+                            .clicked()
+                            {
+                                self.new_document();
                             }
                         });
                     });
@@ -2643,20 +2856,34 @@ impl RuporaApp {
         let output = scroll_area.show(ui, |ui| {
             let viewport = ui.available_size();
             ui.set_min_size(Vec2::new(viewport.x, viewport.y.max(420.0)));
-            ui.add_space(24.0);
-            let page_width = ui.available_width().min(920.0);
-            let side_margin = ((ui.available_width() - page_width) * 0.5).max(16.0);
+            ui.add_space(28.0);
+            let available_width = ui.available_width();
+            let page_width = (available_width - 48.0)
+                .clamp(280.0, 860.0)
+                .min(available_width);
+            let side_margin = ((available_width - page_width) * 0.5).max(0.0);
             ui.horizontal(|ui| {
                 ui.add_space(side_margin);
                 egui::Frame::new()
-                    .fill(palette.canvas)
-                    .stroke(Stroke::NONE)
-                    .inner_margin(Margin::symmetric(48, 24))
+                    .fill(palette.surface)
+                    .stroke(Stroke::new(1.0, palette.border))
+                    .corner_radius(12)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 4],
+                        blur: 18,
+                        spread: 0,
+                        color: if self.state.dark {
+                            Color32::from_black_alpha(48)
+                        } else {
+                            Color32::from_black_alpha(18)
+                        },
+                    })
+                    .inner_margin(Margin::symmetric(56, 38))
                     .show(ui, |ui| {
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            ui.set_width((page_width - 96.0).max(200.0));
+                            ui.set_width((page_width - 112.0).max(160.0));
                             let available =
-                                Vec2::new(ui.available_width(), (viewport.y - 116.0).max(360.0));
+                                Vec2::new(ui.available_width(), (viewport.y - 144.0).max(360.0));
                             let row_height =
                                 ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
                             let desired_rows = (available.y / row_height).max(20.0) as usize;
@@ -2865,20 +3092,34 @@ impl RuporaApp {
                 scroll_area = scroll_area.vertical_scroll_offset(offset);
             }
             scroll_area.show(ui, |ui| {
-                ui.add_space(24.0);
-                let page_width = ui.available_width().min(920.0);
-                let side_margin = ((ui.available_width() - page_width) * 0.5).max(16.0);
+                ui.add_space(28.0);
+                let available_width = ui.available_width();
+                let page_width = (available_width - 48.0)
+                    .clamp(280.0, 860.0)
+                    .min(available_width);
+                let side_margin = ((available_width - page_width) * 0.5).max(0.0);
                 let changed = ui
                     .horizontal(|ui| {
                         ui.add_space(side_margin);
                         egui::Frame::new()
-                            .fill(palette.canvas)
-                            .stroke(Stroke::NONE)
-                            .inner_margin(Margin::symmetric(48, 24))
+                            .fill(palette.surface)
+                            .stroke(Stroke::new(1.0, palette.border))
+                            .corner_radius(12)
+                            .shadow(egui::epaint::Shadow {
+                                offset: [0, 4],
+                                blur: 18,
+                                spread: 0,
+                                color: if self.state.dark {
+                                    Color32::from_black_alpha(48)
+                                } else {
+                                    Color32::from_black_alpha(18)
+                                },
+                            })
+                            .inner_margin(Margin::symmetric(56, 38))
                             .show(ui, |ui| {
                                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                                    ui.set_width((page_width - 96.0).max(200.0));
-                                    ui.set_min_height((viewport_height - 118.0).max(480.0));
+                                    ui.set_width((page_width - 112.0).max(160.0));
+                                    ui.set_min_height((viewport_height - 142.0).max(480.0));
                                     CommonMarkViewer::new()
                                         .default_implicit_uri_scheme(base_uri)
                                         .enable_scroll_to_heading(true)
@@ -2892,7 +3133,7 @@ impl RuporaApp {
                             .inner
                     })
                     .inner;
-                ui.add_space(32.0);
+                ui.add_space(40.0);
                 changed
             })
         };
@@ -2966,6 +3207,11 @@ impl RuporaApp {
             })
             .map(|(_, id)| id)
             .or_else(|| source.is_empty().then(|| blocks[0].id));
+        let document_id = self.documents[index].id();
+        let ime_action = ui.input(|input| ime_frame_action(&input.events));
+        let mut ime_session = self.hybrid_ime_session.take().filter(|session| {
+            session.document_id == document_id && Some(session.block_id) == active_id
+        });
 
         let mut pending_edit = None;
         let mut activate = None;
@@ -2978,29 +3224,55 @@ impl RuporaApp {
         ScrollArea::vertical()
             .id_salt(("hybrid-scroll", index))
             .show(ui, |ui| {
-                ui.add_space(24.0);
-                let page_width = ui.available_width().min(920.0);
-                let side_margin = ((ui.available_width() - page_width) * 0.5).max(16.0);
+                ui.add_space(28.0);
+                let available_width = ui.available_width();
+                let page_width = (available_width - 48.0)
+                    .clamp(280.0, 860.0)
+                    .min(available_width);
+                let side_margin = ((available_width - page_width) * 0.5).max(0.0);
                 ui.horizontal(|ui| {
                     ui.add_space(side_margin);
                     let page = egui::Frame::new()
-                        .fill(palette.canvas)
-                        .stroke(Stroke::NONE)
-                        .inner_margin(Margin::symmetric(48, 24))
+                        .fill(palette.surface)
+                        .stroke(Stroke::new(1.0, palette.border))
+                        .corner_radius(12)
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 4],
+                            blur: 18,
+                            spread: 0,
+                            color: if self.state.dark {
+                                Color32::from_black_alpha(48)
+                            } else {
+                                Color32::from_black_alpha(18)
+                            },
+                        })
+                        .inner_margin(Margin::symmetric(56, 38))
                         .show(ui, |ui| {
                             ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                                ui.set_width((page_width - 96.0).max(280.0));
-                                ui.set_min_height((viewport_height - 118.0).max(480.0));
+                                ui.set_width((page_width - 112.0).max(160.0));
+                                ui.set_min_height((viewport_height - 142.0).max(480.0));
                                 for block in &blocks {
                                     ui.push_id(("hybrid-block", block.id), |ui| {
                                         if Some(block.id) == active_id {
                                             let edit_range =
                                                 hybrid_edit_range(&source, &blocks, block.id);
-                                            let original_block =
-                                                source[edit_range.clone()].to_owned();
+                                            let (
+                                                original_block,
+                                                mut visual_content,
+                                                had_ime_session,
+                                            ) = if let Some(session) = ime_session.take() {
+                                                (session.base_source, session.visual_content, true)
+                                            } else {
+                                                let original =
+                                                    source[edit_range.clone()].to_owned();
+                                                let visual =
+                                                    VisualProjection::from_markdown(&original)
+                                                        .text()
+                                                        .to_owned();
+                                                (original, visual, false)
+                                            };
                                             let projection =
                                                 VisualProjection::from_markdown(&original_block);
-                                            let mut visual_content = projection.text().to_owned();
                                             let block_char_start =
                                                 source[..edit_range.start].chars().count();
                                             let local_source_selection_before =
@@ -3080,6 +3352,7 @@ impl RuporaApp {
                                                         .id(editor_id)
                                                         .frame(egui::Frame::NONE)
                                                         .layouter(&mut layouter)
+                                                        .hint_text("开始写作…")
                                                         .desired_width(f32::INFINITY)
                                                         .desired_rows(desired_rows)
                                                         .lock_focus(true);
@@ -3102,8 +3375,26 @@ impl RuporaApp {
                                                 let mut changed = output.response.changed();
                                                 let mut kind = EditKind::Typing;
                                                 let mut source_update = None;
+                                                let defer_ime = focused
+                                                    && (ime_action == ImeFrameAction::Preedit
+                                                        || had_ime_session
+                                                            && ime_action == ImeFrameAction::None);
 
-                                                if focused
+                                                if defer_ime {
+                                                    changed = false;
+                                                } else if had_ime_session
+                                                    && ime_action == ImeFrameAction::Cancel
+                                                {
+                                                    ime_session = None;
+                                                    changed = false;
+                                                } else if had_ime_session
+                                                    && ime_action == ImeFrameAction::Commit
+                                                {
+                                                    ime_session = None;
+                                                }
+
+                                                if !defer_ime
+                                                    && focused
                                                     && let (Some(url), Some(selection)) = (
                                                         input_action.pasted_url.as_deref(),
                                                         visual_selection_before.clone(),
@@ -3128,7 +3419,8 @@ impl RuporaApp {
                                                         changed = true;
                                                         cursor_adjusted = true;
                                                     }
-                                                } else if focused && input_action.tab {
+                                                } else if !defer_ime && focused && input_action.tab
+                                                {
                                                     let selection = visual_selection_before
                                                         .clone()
                                                         .unwrap_or_else(|| {
@@ -3151,7 +3443,8 @@ impl RuporaApp {
                                                     kind = EditKind::Other;
                                                     changed = true;
                                                     cursor_adjusted = true;
-                                                } else if focused
+                                                } else if !defer_ime
+                                                    && focused
                                                     && let (Some(typed), Some(selection)) = (
                                                         input_action.typed_text.as_deref(),
                                                         visual_selection_before.clone(),
@@ -3171,7 +3464,8 @@ impl RuporaApp {
                                                     }
                                                 }
 
-                                                if source_update.is_none()
+                                                if !defer_ime
+                                                    && source_update.is_none()
                                                     && changed
                                                     && let Some(selection) =
                                                         visual_selection_after.clone()
@@ -3196,7 +3490,20 @@ impl RuporaApp {
                                                         Some((update.source, update.selection));
                                                 }
 
-                                                if let Some((updated, selection)) = source_update {
+                                                if defer_ime {
+                                                    // IME pre-edit text belongs to the composition,
+                                                    // not to the Markdown document or its undo history.
+                                                    // Keeping this visual buffer alive lets egui replace
+                                                    // the previous pre-edit range on the next frame.
+                                                    ime_session = Some(HybridImeSession {
+                                                        document_id,
+                                                        block_id: block.id,
+                                                        base_source: original_block,
+                                                        visual_content,
+                                                    });
+                                                } else if let Some((updated, selection)) =
+                                                    source_update
+                                                {
                                                     next_global_cursor = Some(CCursorRange::two(
                                                         CCursor::new(
                                                             block_char_start + selection.start,
@@ -3278,14 +3585,14 @@ impl RuporaApp {
                                             }
                                         }
                                     });
-                                    ui.add_space(6.0);
+                                    ui.add_space(8.0);
                                 }
-                                ui.add_space(52.0);
+                                ui.add_space(60.0);
                             });
                         });
                     page_rect = Some(page.response.rect);
                 });
-                ui.add_space(32.0);
+                ui.add_space(40.0);
             });
 
         let deactivate = ui.input(|input| {
@@ -3330,12 +3637,15 @@ impl RuporaApp {
         }
         if deactivate {
             self.hybrid_active = None;
+            ime_session = None;
         }
         if let Some((id, start)) = activate {
             let char_start = source[..start].chars().count();
             self.hybrid_active = Some((index, id));
+            ime_session = None;
             self.queue_editor_selection(char_start..char_start);
         }
+        self.hybrid_ime_session = ime_session;
 
         let clicked_link = local_links
             .into_iter()
@@ -3414,18 +3724,23 @@ impl RuporaApp {
 
         let palette = app_palette(self.state.dark);
         Panel::bottom("status")
-            .exact_size(24.0)
+            .exact_size(23.0)
             .frame(
                 egui::Frame::new()
-                    .fill(palette.accent)
-                    .inner_margin(Margin::symmetric(8, 3))
-                    .stroke(Stroke::NONE),
+                    .fill(palette.toolbar)
+                    .inner_margin(Margin::symmetric(10, 3))
+                    .stroke(Stroke::new(1.0, palette.border)),
             )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&self.status).small().color(Color32::WHITE));
+                    ui.label(RichText::new("●").size(8.0).color(palette.accent));
+                    ui.label(RichText::new(&self.status).small().color(palette.secondary));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(document_info).small().color(Color32::WHITE));
+                        ui.label(
+                            RichText::new(document_info)
+                                .small()
+                                .color(palette.secondary),
+                        );
                     });
                 });
             });
@@ -3516,49 +3831,238 @@ impl eframe::App for RuporaApp {
     }
 }
 
-fn toolbar_symbol_button(ui: &mut Ui, symbol: &str, tooltip: &str) -> egui::Response {
-    ui.add(
-        Button::new(RichText::new(symbol).size(16.0))
-            .frame(false)
-            .min_size(Vec2::splat(28.0)),
-    )
-    .on_hover_text(tooltip)
+#[derive(Clone, Copy)]
+enum AppIcon {
+    New,
+    Folder,
+    Save,
+    Sidebar,
+    Outline,
+    Theme,
+    File,
+    Close,
 }
 
-fn toolbar_toggle_button(
+impl AppIcon {
+    const fn accessible_label(self) -> &'static str {
+        match self {
+            Self::New => "新建",
+            Self::Folder => "打开",
+            Self::Save => "保存",
+            Self::Sidebar => "资源管理器",
+            Self::Outline => "文档大纲",
+            Self::Theme => "切换主题",
+            Self::File => "Markdown 文档",
+            Self::Close => "关闭",
+        }
+    }
+}
+
+struct AppIconButton {
+    icon: AppIcon,
+    selected: bool,
+    palette: AppPalette,
+    size: f32,
+}
+
+impl egui::Widget for AppIconButton {
+    fn ui(self, ui: &mut Ui) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(self.size), egui::Sense::click());
+        let enabled = ui.is_enabled();
+        let fill = if self.selected {
+            self.palette.accent_soft
+        } else if response.hovered() && enabled {
+            self.palette.hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, 6.0, fill);
+        let color = if !enabled {
+            self.palette.secondary.gamma_multiply(0.45)
+        } else if self.selected {
+            self.palette.accent
+        } else {
+            self.palette.secondary
+        };
+        paint_app_icon(
+            ui.painter(),
+            rect.shrink(self.size * 0.25),
+            self.icon,
+            color,
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                enabled,
+                self.icon.accessible_label(),
+            )
+        });
+        response
+    }
+}
+
+fn icon_button_widget(icon: AppIcon, selected: bool, palette: AppPalette) -> AppIconButton {
+    AppIconButton {
+        icon,
+        selected,
+        palette,
+        size: 30.0,
+    }
+}
+
+fn app_icon_button(
     ui: &mut Ui,
-    symbol: &str,
+    icon: AppIcon,
     selected: bool,
     tooltip: &str,
     palette: AppPalette,
 ) -> egui::Response {
-    let button = Button::new(RichText::new(symbol).size(14.0))
-        .fill(if selected {
-            palette.accent_soft
-        } else {
-            Color32::TRANSPARENT
-        })
-        .stroke(Stroke::NONE)
-        .min_size(Vec2::splat(28.0));
-    ui.add(button).on_hover_text(tooltip)
+    ui.add(icon_button_widget(icon, selected, palette))
+        .on_hover_text(tooltip)
+}
+
+fn paint_app_icon(painter: &egui::Painter, rect: egui::Rect, icon: AppIcon, color: Color32) {
+    let stroke = Stroke::new(1.45, color);
+    let center = rect.center();
+    let left = rect.left();
+    let right = rect.right();
+    let top = rect.top();
+    let bottom = rect.bottom();
+    match icon {
+        AppIcon::New => {
+            painter.line_segment(
+                [egui::pos2(left, center.y), egui::pos2(right, center.y)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(center.x, top), egui::pos2(center.x, bottom)],
+                stroke,
+            );
+        }
+        AppIcon::Folder => {
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    egui::pos2(left, top + 3.0),
+                    egui::pos2(left + 5.0, top + 3.0),
+                    egui::pos2(left + 7.0, top + 5.0),
+                    egui::pos2(right, top + 5.0),
+                    egui::pos2(right, bottom - 1.0),
+                    egui::pos2(left, bottom - 1.0),
+                ],
+                stroke,
+            ));
+        }
+        AppIcon::Save => {
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    egui::pos2(left + 1.0, top),
+                    egui::pos2(right - 2.0, top),
+                    egui::pos2(right, top + 2.0),
+                    egui::pos2(right, bottom),
+                    egui::pos2(left + 1.0, bottom),
+                ],
+                stroke,
+            ));
+            painter.line_segment(
+                [
+                    egui::pos2(left + 4.0, top),
+                    egui::pos2(left + 4.0, top + 5.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(left + 4.0, bottom - 4.0),
+                    egui::pos2(right - 3.0, bottom - 4.0),
+                ],
+                stroke,
+            );
+        }
+        AppIcon::Sidebar => {
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    egui::pos2(left, top),
+                    egui::pos2(right, top),
+                    egui::pos2(right, bottom),
+                    egui::pos2(left, bottom),
+                ],
+                stroke,
+            ));
+            painter.line_segment(
+                [egui::pos2(left + 4.5, top), egui::pos2(left + 4.5, bottom)],
+                stroke,
+            );
+        }
+        AppIcon::Outline => {
+            for row in 0..3 {
+                let y = top + 2.0 + row as f32 * 5.0;
+                painter.circle_filled(egui::pos2(left + 1.5, y), 1.15, color);
+                painter.line_segment([egui::pos2(left + 5.0, y), egui::pos2(right, y)], stroke);
+            }
+        }
+        AppIcon::Theme => {
+            painter.circle_stroke(center, 3.3, stroke);
+            for index in 0..8 {
+                let angle = index as f32 * std::f32::consts::TAU / 8.0;
+                let direction = egui::vec2(angle.cos(), angle.sin());
+                painter.line_segment([center + direction * 5.3, center + direction * 7.0], stroke);
+            }
+        }
+        AppIcon::File => {
+            painter.add(egui::Shape::line(
+                vec![
+                    egui::pos2(left + 2.0, top),
+                    egui::pos2(right - 4.0, top),
+                    egui::pos2(right, top + 4.0),
+                    egui::pos2(right, bottom),
+                    egui::pos2(left + 2.0, bottom),
+                    egui::pos2(left + 2.0, top),
+                ],
+                stroke,
+            ));
+            painter.line_segment(
+                [
+                    egui::pos2(right - 4.0, top),
+                    egui::pos2(right - 4.0, top + 4.0),
+                ],
+                stroke,
+            );
+        }
+        AppIcon::Close => {
+            painter.line_segment(
+                [
+                    egui::pos2(left + 2.0, top + 2.0),
+                    egui::pos2(right - 2.0, bottom - 2.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(right - 2.0, top + 2.0),
+                    egui::pos2(left + 2.0, bottom - 2.0),
+                ],
+                stroke,
+            );
+        }
+    }
 }
 
 fn view_mode_selector(ui: &mut Ui, mode: &mut ViewMode, palette: AppPalette) {
     ui.allocate_ui_with_layout(
-        Vec2::new(218.0, 28.0),
+        Vec2::new(204.0, 30.0),
         Layout::left_to_right(Align::Center),
         |ui| {
             egui::Frame::new()
-                .fill(palette.toolbar)
+                .fill(palette.surface)
                 .stroke(Stroke::new(1.0, palette.border))
-                .corner_radius(3)
-                .inner_margin(1)
+                .corner_radius(8)
+                .inner_margin(2)
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.spacing_mut().item_spacing.x = 1.0;
                     for (value, label, tooltip, width) in [
-                        (ViewMode::Hybrid, "所见即所得", "视觉排版编辑", 108.0),
-                        (ViewMode::Edit, "源码", "Markdown 源码编辑", 52.0),
-                        (ViewMode::Preview, "预览", "只读排版预览", 52.0),
+                        (ViewMode::Hybrid, "所见", "所见即所得编辑", 66.0),
+                        (ViewMode::Edit, "源码", "Markdown 源码编辑", 64.0),
+                        (ViewMode::Preview, "预览", "只读排版预览", 64.0),
                     ] {
                         let selected = *mode == value;
                         let text_color = if selected {
@@ -3575,6 +4079,7 @@ fn view_mode_selector(ui: &mut Ui, mode: &mut ViewMode, palette: AppPalette) {
                                         Color32::TRANSPARENT
                                     })
                                     .stroke(Stroke::NONE)
+                                    .corner_radius(6)
                                     .min_size(Vec2::new(width, 24.0)),
                             )
                             .on_hover_text(tooltip)
@@ -3689,11 +4194,11 @@ fn wysiwyg_layout(
 
 fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
     let size = match style.heading {
-        1 => 30.0,
-        2 => 24.0,
-        3 => 20.0,
-        4 => 17.0,
-        _ => 14.0,
+        1 => 34.0,
+        2 => 27.0,
+        3 => 22.0,
+        4 => 18.0,
+        _ => 16.0,
     };
     let family = if style.code {
         FontFamily::Monospace
@@ -3713,11 +4218,11 @@ fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
         },
     );
     format.line_height = Some(match style.heading {
-        1 => 38.0,
-        2 => 32.0,
-        3 => 28.0,
-        4 => 25.0,
-        _ => 24.0,
+        1 => 44.0,
+        2 => 36.0,
+        3 => 31.0,
+        4 => 27.0,
+        _ => 27.0,
     });
     if style.strong || style.heading > 0 {
         format.extra_letter_spacing = 0.2;
@@ -3859,6 +4364,28 @@ fn editor_input_action(ui: &Ui) -> EditorInputAction {
             _ => None,
         }),
     })
+}
+
+fn ime_frame_action(events: &[egui::Event]) -> ImeFrameAction {
+    events
+        .iter()
+        .fold(ImeFrameAction::None, |action, event| match event {
+            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                if text.is_empty() {
+                    ImeFrameAction::Cancel
+                } else {
+                    ImeFrameAction::Preedit
+                }
+            }
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                if text.is_empty() {
+                    ImeFrameAction::Cancel
+                } else {
+                    ImeFrameAction::Commit
+                }
+            }
+            _ => action,
+        })
 }
 
 fn workspace_entries_ui(
@@ -4004,8 +4531,8 @@ fn apply_theme(ctx: &Context, dark: bool) {
     visuals.panel_fill = palette.canvas;
     visuals.window_fill = palette.surface;
     visuals.window_stroke = Stroke::new(1.0, palette.border);
-    visuals.window_corner_radius = egui::CornerRadius::same(4);
-    visuals.menu_corner_radius = egui::CornerRadius::same(4);
+    visuals.window_corner_radius = egui::CornerRadius::same(10);
+    visuals.menu_corner_radius = egui::CornerRadius::same(8);
     visuals.faint_bg_color = palette.hover;
     visuals.extreme_bg_color = palette.surface;
     visuals.text_edit_bg_color = Some(palette.surface);
@@ -4025,26 +4552,26 @@ fn apply_theme(ctx: &Context, dark: bool) {
     visuals.widgets.noninteractive.weak_bg_fill = palette.surface;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.border);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette.text);
-    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(2);
+    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
 
     visuals.widgets.inactive.bg_fill = palette.surface;
     visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
     visuals.widgets.inactive.bg_stroke = Stroke::NONE;
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, palette.text);
-    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
 
     visuals.widgets.hovered.bg_fill = palette.hover;
     visuals.widgets.hovered.weak_bg_fill = palette.hover;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, palette.border);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, palette.text);
-    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(2);
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
     visuals.widgets.hovered.expansion = 0.0;
 
     visuals.widgets.active.bg_fill = palette.accent_soft;
     visuals.widgets.active.weak_bg_fill = palette.accent_soft;
     visuals.widgets.active.bg_stroke = Stroke::NONE;
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, palette.text);
-    visuals.widgets.active.corner_radius = egui::CornerRadius::same(2);
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
     visuals.widgets.active.expansion = 0.0;
     visuals.widgets.open = visuals.widgets.active;
 
@@ -4055,17 +4582,17 @@ fn apply_theme(ctx: &Context, dark: bool) {
     });
     ctx.global_style_mut(|style| {
         style.visuals = visuals;
-        style.spacing.item_spacing = Vec2::new(6.0, 4.0);
-        style.spacing.button_padding = Vec2::new(8.0, 4.0);
-        style.spacing.interact_size = Vec2::new(32.0, 28.0);
+        style.spacing.item_spacing = Vec2::new(7.0, 5.0);
+        style.spacing.button_padding = Vec2::new(10.0, 5.0);
+        style.spacing.interact_size = Vec2::new(32.0, 29.0);
         style.spacing.window_margin = Margin::same(12);
         style.text_styles.insert(
             TextStyle::Heading,
-            FontId::new(24.0, FontFamily::Proportional),
+            FontId::new(32.0, FontFamily::Proportional),
         );
         style
             .text_styles
-            .insert(TextStyle::Body, FontId::new(14.0, FontFamily::Proportional));
+            .insert(TextStyle::Body, FontId::new(16.0, FontFamily::Proportional));
         style.text_styles.insert(
             TextStyle::Button,
             FontId::new(13.0, FontFamily::Proportional),
@@ -4076,7 +4603,7 @@ fn apply_theme(ctx: &Context, dark: bool) {
         );
         style.text_styles.insert(
             TextStyle::Monospace,
-            FontId::new(14.0, FontFamily::Monospace),
+            FontId::new(15.0, FontFamily::Monospace),
         );
         for (name, size) in [
             ("rupora-title", 30.0),
@@ -4350,5 +4877,95 @@ mod tests {
         let updated_range = hybrid_edit_range(&trailing, &updated_blocks, updated_blocks[0].id);
         assert_eq!(&trailing[updated_range], "换句话\n");
         assert_eq!(multiline_edit_rows(&trailing), 2);
+    }
+
+    #[test]
+    fn classifies_ime_preedit_commit_and_cancel_frames() {
+        use egui::{Event, ImeEvent};
+
+        assert_eq!(
+            ime_frame_action(&[Event::Ime(ImeEvent::Preedit {
+                text: "ni".to_owned(),
+                active_range_chars: Some(0..2),
+            })]),
+            ImeFrameAction::Preedit
+        );
+        assert_eq!(
+            ime_frame_action(&[Event::Ime(ImeEvent::Commit("你".to_owned()))]),
+            ImeFrameAction::Commit
+        );
+        assert_eq!(
+            ime_frame_action(&[Event::Ime(ImeEvent::Preedit {
+                text: String::new(),
+                active_range_chars: None,
+            })]),
+            ImeFrameAction::Cancel
+        );
+    }
+
+    #[test]
+    fn wysiwyg_ime_session_preserves_preedit_text_between_frames() {
+        use egui::{Event, Id, ImeEvent, RawInput};
+
+        fn run_frame(
+            context: &Context,
+            text: &mut String,
+            events: Vec<Event>,
+            request_focus: bool,
+        ) {
+            let _ = context.run_ui(
+                RawInput {
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| {
+                    let id = Id::new("wysiwyg-ime-regression");
+                    if request_focus {
+                        ui.memory_mut(|memory| memory.request_focus(id));
+                    }
+                    TextEdit::multiline(text).id(id).show(ui);
+                },
+            );
+        }
+
+        let context = Context::default();
+        let block_id = markdown::blocks("")[0].id;
+        let mut session = HybridImeSession {
+            document_id: 1,
+            block_id,
+            base_source: String::new(),
+            visual_content: String::new(),
+        };
+
+        run_frame(&context, &mut session.visual_content, Vec::new(), true);
+        run_frame(
+            &context,
+            &mut session.visual_content,
+            vec![Event::Ime(ImeEvent::Preedit {
+                text: "n".to_owned(),
+                active_range_chars: Some(0..1),
+            })],
+            false,
+        );
+        assert_eq!(session.visual_content, "n");
+
+        run_frame(
+            &context,
+            &mut session.visual_content,
+            vec![Event::Ime(ImeEvent::Preedit {
+                text: "ni".to_owned(),
+                active_range_chars: Some(0..2),
+            })],
+            false,
+        );
+        assert_eq!(session.visual_content, "ni");
+
+        run_frame(
+            &context,
+            &mut session.visual_content,
+            vec![Event::Ime(ImeEvent::Commit("你".to_owned()))],
+            false,
+        );
+        assert_eq!(session.visual_content, "你");
     }
 }
