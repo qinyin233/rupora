@@ -480,6 +480,19 @@ fn block_ranges(source: &str) -> Vec<Range<usize>> {
         merged.push(range);
     }
 
+    // A trailing blank paragraph is an addressable editing block in the
+    // WYSIWYG canvas. pulldown-cmark intentionally emits no event for it, but
+    // without an empty block the caret is forced back into the preceding
+    // fenced code block.
+    let ends_after_fenced_code = merged.last().is_some_and(|range| {
+        source.get(range.clone()).is_some_and(|block| {
+            block.trim_start().starts_with("```") || block.trim_start().starts_with("~~~")
+        })
+    });
+    if ends_after_fenced_code && (source.ends_with("\n\n") || source.ends_with("\r\n\r\n")) {
+        merged.push(source.len()..source.len());
+    }
+
     merged
 }
 
@@ -1538,6 +1551,15 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].range, 0..0);
         assert_eq!(blocks[0].line, 1);
+    }
+
+    #[test]
+    fn returns_an_editable_trailing_paragraph_after_a_fenced_block() {
+        for source in ["```\ncode\n```\n\n", "```\r\ncode\r\n```\r\n\r\n"] {
+            let blocks = blocks(source);
+            assert_eq!(blocks.len(), 2, "source: {source:?}");
+            assert_eq!(blocks[1].range, source.len()..source.len());
+        }
     }
 
     #[test]

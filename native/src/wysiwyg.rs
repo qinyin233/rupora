@@ -580,6 +580,45 @@ pub fn fenced_code_language(source: &str) -> Option<&str> {
     (!info.is_empty()).then_some(info)
 }
 
+/// Returns only the editable body of a complete fenced code block.
+///
+/// The opening/closing markers and the structural line break immediately
+/// before the closing marker are intentionally excluded. This is the text a
+/// user expects the code-block copy button to place on the clipboard.
+pub fn fenced_code_content(source: &str) -> Option<&str> {
+    let opening_end = source.find(['\n', '\r'])?;
+    let (_, opening_character, opening_length, _) = parse_fence_line(&source[..opening_end])?;
+    if opening_length < 3 {
+        return None;
+    }
+    let body_start = skip_one_line_break(source, opening_end)?;
+    let mut line_start = body_start;
+    while line_start <= source.len() {
+        let line_end = source[line_start..]
+            .find(['\n', '\r'])
+            .map_or(source.len(), |offset| line_start + offset);
+        if let Some((_, character, length, info)) = parse_fence_line(&source[line_start..line_end])
+            && character == opening_character
+            && length >= opening_length
+            && info.is_empty()
+        {
+            let content_end = if line_start > body_start {
+                line_break_before_byte(source, line_start)
+                    .filter(|line_break| line_break.start >= body_start)
+                    .map_or(line_start, |line_break| line_break.start)
+            } else {
+                line_start
+            };
+            return source.get(body_start..content_end);
+        }
+        if line_end == source.len() {
+            break;
+        }
+        line_start = skip_one_line_break(source, line_end)?;
+    }
+    None
+}
+
 pub fn move_across_hidden_inline_code_boundary(
     source: &str,
     selection: Range<usize>,
@@ -1970,6 +2009,18 @@ mod tests {
             Some("text linenos")
         );
         assert_eq!(fenced_code_language("```\nvalue\n```"), None);
+    }
+
+    #[test]
+    fn exposes_only_complete_fenced_code_content_for_copying() {
+        assert_eq!(
+            fenced_code_content("```rust\nfn main() {}\nlet n = 1;\n```"),
+            Some("fn main() {}\nlet n = 1;")
+        );
+        assert_eq!(fenced_code_content("~~~\r\n中文\r\n~~~\r\n"), Some("中文"));
+        assert_eq!(fenced_code_content("```\n```"), Some(""));
+        assert_eq!(fenced_code_content("```\n\n```"), Some(""));
+        assert_eq!(fenced_code_content("```\nunclosed"), None);
     }
 
     #[test]
