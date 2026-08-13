@@ -3200,7 +3200,7 @@ impl RuporaApp {
         let range = clamp_char_range(&before, range);
         let start = char_to_byte(&before, range.start);
         let end = char_to_byte(&before, range.end);
-        let selected = before[start..end].to_owned();
+        let selected = selected_markdown_for_clipboard(&before[start..end]);
         if action.copy() {
             ui.ctx().copy_text(selected);
         }
@@ -4864,6 +4864,13 @@ fn code_block_removal_range(
     }
 }
 
+fn selected_markdown_for_clipboard(selected: &str) -> String {
+    selected
+        .trim_end_matches(['\r', '\n'])
+        .trim_end()
+        .to_owned()
+}
+
 fn paragraph_after_code_double_click(
     source: &str,
     blocks: &[markdown::MarkdownBlock],
@@ -6399,6 +6406,11 @@ mod tests {
             char_at(after.range.start) + 2,
         );
         assert_eq!(from_code.secondary.index.0, char_at(code.range.start));
+        let selected = &source[code.range.clone()];
+        assert_eq!(
+            selected_markdown_for_clipboard(selected),
+            "```rust\n代码();\n```"
+        );
     }
 
     #[test]
