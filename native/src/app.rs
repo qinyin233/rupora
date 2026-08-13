@@ -29,8 +29,10 @@ use crate::{
     updater::{self, UpdateInfo, UpdateStatus},
     workspace::{Workspace, WorkspaceEntry},
     wysiwyg::{
-        VisualProjection, VisualStyle, complete_fenced_code_on_enter, complete_visual_enter,
-        contains_footnote_reference, move_across_hidden_inline_code_boundary,
+        VisualProjection, VisualStyle, complete_bare_fenced_code_after_typing,
+        complete_fenced_code_on_enter, complete_visual_enter, consume_paired_fenced_code_closer,
+        contains_footnote_reference, fenced_code_language, move_across_hidden_inline_code_boundary,
+        paragraph_after_fenced_code,
     },
 };
 use eframe::{
@@ -128,6 +130,19 @@ struct HybridImeSession {
     visual_content: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct HybridPointerAnchor {
+    document_id: u64,
+    block_id: BlockId,
+    source_char: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HybridCrossSelection {
+    document_id: u64,
+    cursor: CCursorRange,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ImeFrameAction {
     #[default]
@@ -171,6 +186,8 @@ pub struct RuporaApp {
     workspace: Option<Workspace>,
     hybrid_active: Option<(usize, BlockId)>,
     hybrid_ime_session: Option<HybridImeSession>,
+    hybrid_pointer_anchor: Option<HybridPointerAnchor>,
+    hybrid_cross_selection: Option<HybridCrossSelection>,
     external_conflicts: HashSet<PathBuf>,
     last_external_check: Instant,
     external_scan_error_reported: bool,
@@ -271,6 +288,8 @@ impl RuporaApp {
             workspace,
             hybrid_active: None,
             hybrid_ime_session: None,
+            hybrid_pointer_anchor: None,
+            hybrid_cross_selection: None,
             external_conflicts: HashSet::new(),
             last_external_check: Instant::now(),
             external_scan_error_reported: false,
@@ -3158,9 +3177,61 @@ impl RuporaApp {
         }
     }
 
+    fn apply_hybrid_cross_selection_input(&mut self, ui: &mut Ui, index: usize) {
+        let document_id = self.documents[index].id();
+        let Some(selection) = self
+            .hybrid_cross_selection
+            .filter(|selection| selection.document_id == document_id)
+        else {
+            self.hybrid_cross_selection = None;
+            return;
+        };
+        let range = cursor_range_to_char_range(selection.cursor);
+        if range.is_empty() {
+            self.hybrid_cross_selection = None;
+            return;
+        }
+        let action = take_cross_block_input(ui);
+        let Some(action) = action else {
+            return;
+        };
+
+        let before = self.documents[index].content.clone();
+        let range = clamp_char_range(&before, range);
+        let start = char_to_byte(&before, range.start);
+        let end = char_to_byte(&before, range.end);
+        let selected = before[start..end].to_owned();
+        if action.copy() {
+            ui.ctx().copy_text(selected);
+        }
+        let Some(replacement) = action.replacement() else {
+            return;
+        };
+
+        self.documents[index]
+            .content
+            .replace_range(start..end, replacement);
+        let cursor = range.start + replacement.chars().count();
+        let cursor = CCursorRange::one(CCursor::new(cursor));
+        self.documents[index].record_edit(
+            before,
+            Some(range),
+            Some(cursor_range_to_char_range(cursor)),
+            EditKind::Typing,
+        );
+        self.editor_cursor = Some(cursor);
+        self.pending_editor_cursor = Some(cursor);
+        self.hybrid_cross_selection = None;
+        self.hybrid_pointer_anchor = None;
+        self.hybrid_ime_session = None;
+        self.status = "已更新跨块选择".to_owned();
+    }
+
     fn hybrid_pane(&mut self, ui: &mut Ui, index: usize) {
+        self.apply_hybrid_cross_selection_input(ui, index);
         let viewport_height = ui.available_height();
         let source = self.documents[index].content.clone();
+        let document_id = self.documents[index].id();
         let cursor_before = self.editor_cursor;
         let selection_before = cursor_before.map(cursor_range_to_char_range);
         let blocks = self.documents[index].blocks().to_vec();
@@ -3206,7 +3277,6 @@ impl RuporaApp {
             })
             .map(|(_, id)| id)
             .or_else(|| source.is_empty().then(|| blocks[0].id));
-        let document_id = self.documents[index].id();
         let document_title = self.documents[index].title();
         let ime_action = ui.input(|input| ime_frame_action(&input.events));
         let mut ime_session = self.hybrid_ime_session.take().filter(|session| {
@@ -3219,6 +3289,7 @@ impl RuporaApp {
         let mut cursor_adjusted = false;
         let mut page_rect = None;
         let mut active_editor_rect = None;
+        let mut pointer_regions = Vec::<HybridPointerRegion>::new();
         let palette = app_palette(self.state.dark);
 
         ScrollArea::vertical()
@@ -3404,6 +3475,18 @@ impl RuporaApp {
                                                     .inner_margin(Margin::symmetric(0, 3))
                                             };
                                             let editor_frame = frame.show(ui, |ui| {
+                                                if block_is_code
+                                                    && let Some(language) =
+                                                        fenced_code_language(&original_block)
+                                                {
+                                                    ui.label(
+                                                        RichText::new(language.to_uppercase())
+                                                            .monospace()
+                                                            .size(11.0)
+                                                            .color(palette.secondary),
+                                                    );
+                                                    ui.add_space(4.0);
+                                                }
                                                 let desired_rows = if block_is_code {
                                                     multiline_edit_rows(&visual_content).max(2)
                                                 } else {
@@ -3442,6 +3525,18 @@ impl RuporaApp {
                                                 let inline_code_background = (!block_is_code)
                                                     .then(|| ui.painter().add(egui::Shape::Noop));
                                                 let mut output = editor.show(ui);
+                                                pointer_regions.push(HybridPointerRegion {
+                                                    block_id: block.id,
+                                                    source_range: edit_range.clone(),
+                                                    rect: output.response.rect,
+                                                    mapping: HybridPointerMapping::Exact(
+                                                        TextProjectionPreview {
+                                                            galley: Arc::clone(&output.galley),
+                                                            galley_pos: output.galley_pos,
+                                                            projection: projection.clone(),
+                                                        },
+                                                    ),
+                                                });
                                                 if let Some(shape_index) = inline_code_background {
                                                     let runs = projection.runs_for(&visual_content);
                                                     ui.painter().set(
@@ -3702,9 +3797,51 @@ impl RuporaApp {
                                                                 );
                                                         }
                                                     }
+                                                    if let Some(selection) =
+                                                        consume_paired_fenced_code_closer(
+                                                            &mut update.source,
+                                                            update.selection.clone(),
+                                                        )
+                                                    {
+                                                        update.selection = selection;
+                                                    } else if let Some(selection) =
+                                                        complete_bare_fenced_code_after_typing(
+                                                            &mut update.source,
+                                                            update.selection.clone(),
+                                                        )
+                                                    {
+                                                        update.selection = selection;
+                                                    }
                                                     cursor_adjusted = true;
                                                     source_update =
                                                         Some((update.source, update.selection));
+                                                }
+
+                                                if !boundary_input_handled
+                                                    && !defer_ime
+                                                    && source_update.is_none()
+                                                    && focused
+                                                    && block_is_code
+                                                    && !input_action.horizontal_modified
+                                                    && (input_action.right || input_action.down)
+                                                    && visual_selection_before.as_ref().is_some_and(
+                                                        |selection| {
+                                                            selection.is_empty()
+                                                                && selection.end
+                                                                    == projection
+                                                                        .text()
+                                                                        .chars()
+                                                                        .count()
+                                                        },
+                                                    )
+                                                {
+                                                    let mut updated = original_block.clone();
+                                                    if let Some(selection) =
+                                                        paragraph_after_fenced_code(&mut updated)
+                                                    {
+                                                        source_update = Some((updated, selection));
+                                                        cursor_adjusted = true;
+                                                    }
                                                 }
 
                                                 if defer_ime {
@@ -3799,7 +3936,7 @@ impl RuporaApp {
                                                 .interact(
                                                     shown.response.rect,
                                                     activation_id,
-                                                    egui::Sense::click(),
+                                                    egui::Sense::click_and_drag(),
                                                 )
                                                 .on_hover_text(format!(
                                                     "点击编辑第 {} 行开始的 Markdown 块",
@@ -3809,6 +3946,18 @@ impl RuporaApp {
                                                 &response,
                                                 source_block,
                                             );
+                                            pointer_regions.push(HybridPointerRegion {
+                                                block_id: block.id,
+                                                source_range: block.range.clone(),
+                                                rect: shown.response.rect,
+                                                mapping: projection_preview
+                                                    .as_ref()
+                                                    .cloned()
+                                                    .map_or(
+                                                        HybridPointerMapping::Approximate,
+                                                        HybridPointerMapping::Exact,
+                                                    ),
+                                            });
                                             if response.clicked() {
                                                 let local_source_byte = response
                                                     .interact_pointer_pos()
@@ -3857,6 +4006,61 @@ impl RuporaApp {
                 ui.add_space(40.0);
             });
 
+        let pointer = ui.input(|input| {
+            (
+                input.pointer.primary_pressed(),
+                input.pointer.primary_released(),
+                input.pointer.primary_down(),
+                input.pointer.is_decidedly_dragging(),
+                input.pointer.press_origin(),
+                input.pointer.interact_pos(),
+            )
+        });
+        if pointer.0
+            && let Some(origin) = pointer.4
+            && let Some((block_id, source_char)) =
+                hybrid_pointer_hit(&source, &pointer_regions, origin)
+        {
+            self.hybrid_pointer_anchor = Some(HybridPointerAnchor {
+                document_id,
+                block_id,
+                source_char,
+            });
+            self.hybrid_cross_selection = None;
+        }
+        if pointer.2
+            && pointer.3
+            && let (Some(anchor), Some(position)) = (self.hybrid_pointer_anchor, pointer.5)
+            && anchor.document_id == document_id
+            && let Some((current_block, current_char)) =
+                hybrid_pointer_hit(&source, &pointer_regions, position)
+        {
+            if current_block != anchor.block_id {
+                let cursor = CCursorRange {
+                    primary: CCursor::new(current_char),
+                    secondary: CCursor::new(anchor.source_char),
+                    h_pos: None,
+                };
+                self.hybrid_cross_selection = Some(HybridCrossSelection {
+                    document_id,
+                    cursor,
+                });
+                next_global_cursor = Some(cursor);
+            } else {
+                self.hybrid_cross_selection = None;
+            }
+        }
+        if pointer.1 {
+            self.hybrid_pointer_anchor = None;
+        }
+        if let Some(selection) = self
+            .hybrid_cross_selection
+            .filter(|selection| selection.document_id == document_id)
+        {
+            next_global_cursor = Some(selection.cursor);
+            paint_hybrid_cross_selection(ui, &source, &pointer_regions, selection.cursor);
+        }
+
         let deactivate = ui.input(|input| {
             input.key_pressed(Key::Escape)
                 || input.pointer.any_click()
@@ -3897,7 +4101,7 @@ impl RuporaApp {
         if cursor_adjusted {
             self.pending_editor_cursor = next_global_cursor;
         }
-        if deactivate {
+        if deactivate && self.hybrid_cross_selection.is_none() {
             self.hybrid_active = None;
             ime_session = None;
         }
@@ -4700,6 +4904,7 @@ fn rounded_inline_code_backgrounds(
     shapes
 }
 
+#[derive(Clone)]
 struct TextProjectionPreview {
     galley: Arc<egui::Galley>,
     galley_pos: egui::Pos2,
@@ -4718,6 +4923,122 @@ impl TextProjectionPreview {
             .start;
         char_to_byte(source, source_index)
     }
+}
+
+#[derive(Clone)]
+enum HybridPointerMapping {
+    Exact(TextProjectionPreview),
+    Approximate,
+}
+
+#[derive(Clone)]
+struct HybridPointerRegion {
+    block_id: BlockId,
+    source_range: std::ops::Range<usize>,
+    rect: egui::Rect,
+    mapping: HybridPointerMapping,
+}
+
+impl HybridPointerRegion {
+    fn source_char_at_position(&self, source: &str, position: egui::Pos2) -> Option<usize> {
+        if !self.rect.expand(3.0).contains(position) {
+            return None;
+        }
+        let block_source = source.get(self.source_range.clone())?;
+        let local_byte = match &self.mapping {
+            HybridPointerMapping::Exact(preview) => {
+                preview.source_byte_at_position(block_source, position)
+            }
+            HybridPointerMapping::Approximate => {
+                let width = self.rect.width().max(1.0);
+                let height = self.rect.height().max(1.0);
+                SourceMap::from_markdown(block_source).source_byte_at_normalized_point(
+                    (position.x - self.rect.left()) / width,
+                    (position.y - self.rect.top()) / height,
+                )
+            }
+        };
+        let byte = (self.source_range.start + local_byte).min(source.len());
+        Some(source[..byte].chars().count())
+    }
+}
+
+fn hybrid_pointer_hit(
+    source: &str,
+    regions: &[HybridPointerRegion],
+    position: egui::Pos2,
+) -> Option<(BlockId, usize)> {
+    regions.iter().find_map(|region| {
+        region
+            .source_char_at_position(source, position)
+            .map(|cursor| (region.block_id, cursor))
+    })
+}
+
+fn paint_hybrid_cross_selection(
+    ui: &Ui,
+    source: &str,
+    regions: &[HybridPointerRegion],
+    cursor: CCursorRange,
+) {
+    let selection = cursor_range_to_char_range(cursor);
+    if selection.is_empty() {
+        return;
+    }
+    for region in regions {
+        let Some(local_source) = hybrid_region_selection(source, &region.source_range, &selection)
+        else {
+            continue;
+        };
+        let block_source = &source[region.source_range.clone()];
+        match &region.mapping {
+            HybridPointerMapping::Exact(preview) => {
+                let visual = preview
+                    .projection
+                    .visual_char_range(block_source, local_source);
+                if visual.is_empty() {
+                    continue;
+                }
+                let mut galley = Arc::clone(&preview.galley);
+                egui::text_selection::visuals::paint_text_selection(
+                    &mut galley,
+                    ui.visuals(),
+                    &CCursorRange::two(CCursor::new(visual.start), CCursor::new(visual.end)),
+                    None,
+                );
+                ui.painter()
+                    .galley(preview.galley_pos, galley, ui.visuals().text_color());
+            }
+            HybridPointerMapping::Approximate => {
+                let length = block_source.chars().count().max(1);
+                let left = region.rect.left()
+                    + region.rect.width() * local_source.start as f32 / length as f32;
+                let right = region.rect.left()
+                    + region.rect.width() * local_source.end as f32 / length as f32;
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(left.min(right), region.rect.top()),
+                    egui::pos2(left.max(right), region.rect.bottom()),
+                );
+                ui.painter().rect_filled(
+                    rect,
+                    2.0,
+                    ui.visuals().selection.bg_fill.gamma_multiply(0.45),
+                );
+            }
+        }
+    }
+}
+
+fn hybrid_region_selection(
+    source: &str,
+    region: &std::ops::Range<usize>,
+    selection: &std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let region_start = source.get(..region.start)?.chars().count();
+    let region_end = source.get(..region.end)?.chars().count();
+    let start = selection.start.max(region_start);
+    let end = selection.end.min(region_end);
+    (start < end).then_some(start - region_start..end - region_start)
 }
 
 fn show_text_projection_preview(
@@ -5123,6 +5444,7 @@ fn duplicate_shortcuts(bindings: &KeyBindings) -> bool {
 #[derive(Default)]
 struct EditorInputAction {
     backspace: bool,
+    down: bool,
     enter: bool,
     horizontal_modified: bool,
     left: bool,
@@ -5133,9 +5455,62 @@ struct EditorInputAction {
     typed_text: Option<String>,
 }
 
+enum CrossBlockInput {
+    Copy,
+    Cut,
+    Delete,
+    Replace(String),
+}
+
+impl CrossBlockInput {
+    fn copy(&self) -> bool {
+        matches!(self, Self::Copy | Self::Cut)
+    }
+
+    fn replacement(&self) -> Option<&str> {
+        match self {
+            Self::Copy => None,
+            Self::Cut | Self::Delete => Some(""),
+            Self::Replace(text) => Some(text),
+        }
+    }
+}
+
+fn take_cross_block_input(ui: &mut Ui) -> Option<CrossBlockInput> {
+    let mut action = None;
+    ui.input_mut(|input| {
+        input.events.retain(|event| {
+            let next = match event {
+                egui::Event::Copy => Some(CrossBlockInput::Copy),
+                egui::Event::Cut => Some(CrossBlockInput::Cut),
+                egui::Event::Paste(text) | egui::Event::Text(text) => {
+                    Some(CrossBlockInput::Replace(text.clone()))
+                }
+                egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty() => {
+                    Some(CrossBlockInput::Replace(text.clone()))
+                }
+                egui::Event::Key {
+                    key: Key::Backspace | Key::Delete,
+                    pressed: true,
+                    ..
+                } => Some(CrossBlockInput::Delete),
+                _ => None,
+            };
+            if let Some(next) = next {
+                action = Some(next);
+                false
+            } else {
+                true
+            }
+        });
+    });
+    action
+}
+
 fn editor_input_action(ui: &Ui) -> EditorInputAction {
     ui.input(|input| EditorInputAction {
         backspace: input.key_pressed(Key::Backspace),
+        down: input.key_pressed(Key::ArrowDown),
         enter: input.key_pressed(Key::Enter),
         horizontal_modified: input.modifiers.alt
             || input.modifiers.ctrl
@@ -5283,6 +5658,11 @@ fn char_to_byte(text: &str, char_index: usize) -> usize {
     text.char_indices()
         .nth(char_index)
         .map_or(text.len(), |(index, _)| index)
+}
+
+fn clamp_char_range(text: &str, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let length = text.chars().count();
+    range.start.min(length)..range.end.min(length).max(range.start.min(length))
 }
 
 fn next_footnote_number(source: &str) -> usize {
@@ -6330,5 +6710,175 @@ mod tests {
             false,
         );
         assert_eq!(session.visual_content, "你");
+    }
+
+    #[test]
+    fn wysiwyg_third_backtick_accepts_code_on_the_very_next_frame() {
+        use egui::{Event, Id, Modifiers, RawInput};
+
+        fn edit_frame(
+            context: &Context,
+            id: Id,
+            source: &str,
+            source_selection: std::ops::Range<usize>,
+            events: Vec<Event>,
+        ) -> crate::wysiwyg::VisualSourceEdit {
+            let projection = VisualProjection::from_markdown_with_selection(
+                source,
+                Some(source_selection.clone()),
+            );
+            let visual_selection = projection.visual_char_range(source, source_selection);
+            let mut visual_content = projection.text().to_owned();
+            let mut result = None;
+            let _ = context.run_ui(
+                RawInput {
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| {
+                    let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+                    state
+                        .cursor
+                        .set_char_range(Some(CCursorRange::one(CCursor::new(
+                            visual_selection.start,
+                        ))));
+                    state.store(ui.ctx(), id);
+                    ui.memory_mut(|memory| memory.request_focus(id));
+                    let mut editor = TextEdit::multiline(&mut visual_content).id(id);
+                    if is_fenced_code_block(source) {
+                        editor = editor.code_editor();
+                    }
+                    let output = editor.show(ui);
+                    let visual_cursor = text_edit_cursor_after_input(&output)
+                        .map(cursor_range_to_char_range)
+                        .expect("focused editor should retain a cursor");
+                    result = projection.apply_edit(source, &visual_content, visual_cursor);
+                },
+            );
+            result.expect("typing should update the projected source")
+        }
+
+        fn type_frame(
+            context: &Context,
+            id: Id,
+            source: &str,
+            source_selection: std::ops::Range<usize>,
+            text: &str,
+        ) -> crate::wysiwyg::VisualSourceEdit {
+            edit_frame(
+                context,
+                id,
+                source,
+                source_selection,
+                vec![Event::Text(text.to_owned())],
+            )
+        }
+
+        let context = Context::default();
+        let id = Id::new("wysiwyg-fence-first-code-regression");
+        let mut update = crate::wysiwyg::VisualSourceEdit {
+            source: String::new(),
+            selection: 0..0,
+        };
+        for marker in ["`", "`", "`"] {
+            update = type_frame(&context, id, &update.source, update.selection, marker);
+            if let Some(selection) =
+                complete_bare_fenced_code_after_typing(&mut update.source, update.selection.clone())
+            {
+                update.selection = selection;
+            }
+        }
+        assert_eq!(update.source, "```\n\n```");
+        assert_eq!(update.selection, 4..4);
+
+        update = type_frame(
+            &context,
+            id,
+            &update.source,
+            update.selection,
+            "fn main() {} 中文",
+        );
+        assert_eq!(update.source, "```\nfn main() {} 中文\n```");
+        assert_eq!(
+            VisualProjection::from_markdown(&update.source).text(),
+            "fn main() {} 中文"
+        );
+
+        update = edit_frame(
+            &context,
+            id,
+            &update.source,
+            update.selection,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        for marker in ["`", "`", "`"] {
+            update = type_frame(&context, id, &update.source, update.selection, marker);
+            if let Some(selection) =
+                consume_paired_fenced_code_closer(&mut update.source, update.selection.clone())
+            {
+                update.selection = selection;
+            } else if let Some(selection) =
+                complete_bare_fenced_code_after_typing(&mut update.source, update.selection.clone())
+            {
+                update.selection = selection;
+            }
+        }
+        assert_eq!(update.source, "```\nfn main() {} 中文\n```\n\n");
+        assert_eq!(update.selection.end, update.source.chars().count());
+
+        update = type_frame(&context, id, &update.source, update.selection, "AFTER");
+        assert_eq!(update.source, "```\nfn main() {} 中文\n```\n\nAFTER");
+    }
+
+    #[test]
+    fn cross_block_input_is_consumed_before_the_active_widget_can_duplicate_it() {
+        use egui::{Event, RawInput};
+
+        let context = Context::default();
+        let mut action = None;
+        let mut remaining = usize::MAX;
+        let _ = context.run_ui(
+            RawInput {
+                events: vec![Event::Text("替换".to_owned())],
+                ..RawInput::default()
+            },
+            |ui| {
+                action = take_cross_block_input(ui);
+                remaining = ui.input(|input| input.events.len());
+            },
+        );
+        assert!(matches!(action, Some(CrossBlockInput::Replace(ref text)) if text == "替换"));
+        assert_eq!(remaining, 0);
+
+        let selected = "前段\n\n```\ncode\n```";
+        let range = clamp_char_range(selected, 2..selected.chars().count());
+        let start = char_to_byte(selected, range.start);
+        let end = char_to_byte(selected, range.end);
+        let mut replaced = selected.to_owned();
+        replaced.replace_range(start..end, "新");
+        assert_eq!(replaced, "前段新");
+    }
+
+    #[test]
+    fn cross_block_selection_intersects_each_unicode_block_in_source_coordinates() {
+        let source = "段落 alpha\n\n```\n代码 beta\n```";
+        let blocks = markdown::blocks(source);
+        assert_eq!(blocks.len(), 2);
+        let selection_start = source[..source.find("alpha").unwrap()].chars().count() + 2;
+        let selection_end = source[..source.find("beta").unwrap()].chars().count() + 2;
+        let selection = selection_start..selection_end;
+
+        let first = hybrid_region_selection(source, &blocks[0].range, &selection).unwrap();
+        let second = hybrid_region_selection(source, &blocks[1].range, &selection).unwrap();
+        assert_eq!(first.start, "段落 al".chars().count());
+        assert_eq!(first.end, source[blocks[0].range.clone()].chars().count());
+        assert_eq!(second.start, 0);
+        assert!(second.end > "```\n代码 b".chars().count());
     }
 }

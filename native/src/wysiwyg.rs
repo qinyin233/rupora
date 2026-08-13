@@ -464,6 +464,122 @@ pub fn complete_fenced_code_on_enter(
     Some(selection)
 }
 
+/// Turns a freshly typed bare fence into an immediately editable code block.
+///
+/// A visual editor cannot leave the cursor on Markdown's hidden info-string
+/// line: the next text would be accepted by the source parser but remain
+/// invisible. Pairing the fence as soon as its third marker is typed places
+/// the cursor on the first code line instead.
+pub fn complete_bare_fenced_code_after_typing(
+    source: &mut String,
+    selection: Range<usize>,
+) -> Option<Range<usize>> {
+    if !selection.is_empty() {
+        return None;
+    }
+    // egui can report the pre-reflow cursor for the frame in which the third
+    // marker turns a plain TextEdit into a fenced-code TextEdit. The source is
+    // authoritative here: a bare final fence is unambiguous even if that
+    // transient cursor still points one character earlier.
+    let cursor_byte = source.len();
+    let line_start = source[..cursor_byte]
+        .rfind(['\n', '\r'])
+        .map_or(0, |index| index + 1);
+    if has_unclosed_fenced_code(&source[..line_start]) {
+        return None;
+    }
+    let line = &source[line_start..cursor_byte];
+    let (indentation, fence_character, fence_length, info) = parse_fence_line(line)?;
+    if fence_length < 3 || !info.is_empty() {
+        return None;
+    }
+
+    let closing = fence_character.to_string().repeat(fence_length);
+    source.insert_str(cursor_byte, &format!("\n\n{indentation}{closing}"));
+    let body_cursor = source[..cursor_byte].chars().count() + 1;
+    Some(body_cursor..body_cursor)
+}
+
+/// Consumes a closing fence typed in front of the hidden auto-paired fence and
+/// leaves the caret in a normal paragraph after the code block.
+pub fn consume_paired_fenced_code_closer(
+    source: &mut String,
+    _selection: Range<usize>,
+) -> Option<Range<usize>> {
+    // The third marker changes the parser's block structure in the same frame,
+    // so egui may still report a cursor or selection from the previous
+    // two-marker line. Detect the unambiguous pair of adjacent matching
+    // closers at EOF from the source instead.
+    let duplicate_end = source.trim_end_matches([' ', '\t']).len();
+    let duplicate_start = source[..duplicate_end]
+        .rfind(['\n', '\r'])
+        .map_or(0, |index| index + 1);
+    let duplicate_break = line_break_before_byte(source, duplicate_start)?;
+    let typed_end = duplicate_break.start;
+    let typed_start = source[..typed_end]
+        .rfind(['\n', '\r'])
+        .map_or(0, |index| index + 1);
+
+    let (_, typed_character, typed_length, typed_info) =
+        parse_fence_line(&source[typed_start..typed_end])?;
+    if !typed_info.is_empty() {
+        return None;
+    }
+    let opening_end = source.find(['\n', '\r'])?;
+    let (_, opening_character, opening_length, _) = parse_fence_line(&source[..opening_end])?;
+    if typed_character != opening_character || typed_length < opening_length {
+        return None;
+    }
+
+    let (_, duplicate_character, duplicate_length, duplicate_info) =
+        parse_fence_line(&source[duplicate_start..duplicate_end])?;
+    if duplicate_character != opening_character
+        || duplicate_length < opening_length
+        || !duplicate_info.is_empty()
+        || !source[duplicate_end..].trim().is_empty()
+    {
+        return None;
+    }
+
+    source.replace_range(typed_end.., "\n\n");
+    let cursor = source.chars().count();
+    Some(cursor..cursor)
+}
+
+/// Makes the paragraph after a completed fenced block addressable by keyboard.
+pub fn paragraph_after_fenced_code(source: &mut String) -> Option<Range<usize>> {
+    let opening_end = source.find(['\n', '\r'])?;
+    let (_, opening_character, opening_length, _) = parse_fence_line(&source[..opening_end])?;
+    let mut line_start = skip_one_line_break(source, opening_end)?;
+    while line_start <= source.len() {
+        let line_end = source[line_start..]
+            .find(['\n', '\r'])
+            .map_or(source.len(), |offset| line_start + offset);
+        if let Some((_, character, length, info)) = parse_fence_line(&source[line_start..line_end])
+            && character == opening_character
+            && length >= opening_length
+            && info.is_empty()
+            && source[line_end..].trim().is_empty()
+        {
+            source.truncate(line_end);
+            source.push_str("\n\n");
+            let cursor = source.chars().count();
+            return Some(cursor..cursor);
+        }
+        if line_end == source.len() {
+            break;
+        }
+        line_start = skip_one_line_break(source, line_end)?;
+    }
+    None
+}
+
+pub fn fenced_code_language(source: &str) -> Option<&str> {
+    let opening_end = source.find(['\n', '\r']).unwrap_or(source.len());
+    let (_, _, _, info) = parse_fence_line(&source[..opening_end])?;
+    (!info.is_empty()).then_some(info)
+}
+
 pub fn move_across_hidden_inline_code_boundary(
     source: &str,
     selection: Range<usize>,
@@ -533,6 +649,72 @@ fn newline_start_before_cursor(source: &str, cursor_byte: usize) -> Option<usize
     } else {
         None
     }
+}
+
+fn line_break_before_byte(source: &str, byte_index: usize) -> Option<Range<usize>> {
+    let before = source.get(..byte_index)?;
+    if before.ends_with("\r\n") {
+        Some(byte_index - 2..byte_index)
+    } else if before.ends_with(['\n', '\r']) {
+        Some(byte_index - 1..byte_index)
+    } else {
+        None
+    }
+}
+
+fn parse_fence_line(line: &str) -> Option<(&str, char, usize, &str)> {
+    let indentation_length = line
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let indentation = &line[..indentation_length];
+    let marker_text = &line[indentation_length..];
+    let fence_character = marker_text.chars().next()?;
+    if !matches!(fence_character, '`' | '~') {
+        return None;
+    }
+    let fence_length = marker_text
+        .chars()
+        .take_while(|character| *character == fence_character)
+        .count();
+    let marker_bytes = fence_character.len_utf8() * fence_length;
+    let info = marker_text[marker_bytes..].trim();
+    if fence_character == '`' && info.contains('`') {
+        return None;
+    }
+    Some((indentation, fence_character, fence_length, info))
+}
+
+fn skip_one_line_break(source: &str, at: usize) -> Option<usize> {
+    match source.as_bytes().get(at..) {
+        Some([b'\r', b'\n', ..]) => Some(at + 2),
+        Some([b'\r' | b'\n', ..]) => Some(at + 1),
+        _ => None,
+    }
+}
+
+fn has_unclosed_fenced_code(source: &str) -> bool {
+    let mut open = None::<(char, usize)>;
+    for line in source.lines() {
+        let Some((_, character, length, info)) = parse_fence_line(line) else {
+            continue;
+        };
+        if length < 3 {
+            continue;
+        }
+        match open {
+            None => open = Some((character, length)),
+            Some((opening_character, opening_length))
+                if character == opening_character
+                    && length >= opening_length
+                    && info.is_empty() =>
+            {
+                open = None;
+            }
+            Some(_) => {}
+        }
+    }
+    open.is_some()
 }
 
 struct ProjectionBuilder {
@@ -1699,6 +1881,95 @@ mod tests {
         assert_eq!(completed.text(), "");
         let code = completed.apply_edit(&update.source, "value", 5..5).unwrap();
         assert_eq!(code.source, "```\nvalue\n```");
+    }
+
+    #[test]
+    fn third_fence_marker_immediately_places_the_cursor_in_the_code_body() {
+        for (before, expected, cursor) in [
+            ("```", "```\n\n```", 4),
+            ("~~~", "~~~\n\n~~~", 4),
+            ("  ```", "  ```\n\n  ```", 6),
+            ("paragraph\n\n```", "paragraph\n\n```\n\n```", 15),
+        ] {
+            let mut source = before.to_owned();
+            let end = source.chars().count();
+            let selection = complete_bare_fenced_code_after_typing(&mut source, end..end).unwrap();
+            assert_eq!(source, expected);
+            assert_eq!(selection, cursor..cursor);
+        }
+
+        let mut language = "```rust".to_owned();
+        let end = language.chars().count();
+        assert!(
+            complete_bare_fenced_code_after_typing(&mut language, end..end).is_none(),
+            "a fence and info string delivered in one input event remains editable until Enter"
+        );
+        let mut nested = "```\ncode\n```".to_owned();
+        let end = nested.chars().count();
+        assert!(complete_bare_fenced_code_after_typing(&mut nested, end..end).is_none());
+
+        let mut stale_cursor = "```".to_owned();
+        assert_eq!(
+            complete_bare_fenced_code_after_typing(&mut stale_cursor, 2..2),
+            Some(4..4)
+        );
+        assert_eq!(stale_cursor, "```\n\n```");
+    }
+
+    #[test]
+    fn an_explicit_closer_consumes_the_hidden_paired_closer_and_exits() {
+        for (before, expected) in [
+            ("```\ncode\n```\n```", "```\ncode\n```\n\n"),
+            ("~~~text\n中文\n~~~\n~~~", "~~~text\n中文\n~~~\n\n"),
+        ] {
+            let mut source = before.to_owned();
+            let typed_end = source[..source.rfind('\n').unwrap()].chars().count();
+            let selection =
+                consume_paired_fenced_code_closer(&mut source, typed_end..typed_end).unwrap();
+            assert_eq!(source, expected);
+            assert_eq!(
+                selection,
+                expected.chars().count()..expected.chars().count()
+            );
+        }
+
+        let mut longer_outer = "````\n```\n````".to_owned();
+        let cursor = "````\n```".chars().count();
+        assert!(consume_paired_fenced_code_closer(&mut longer_outer, cursor..cursor).is_none());
+
+        let mut stale_cursor = "```\ncode\n```\n```".to_owned();
+        assert_eq!(
+            consume_paired_fenced_code_closer(&mut stale_cursor, 2..3),
+            Some(14..14)
+        );
+        assert_eq!(stale_cursor, "```\ncode\n```\n\n");
+    }
+
+    #[test]
+    fn arrow_exit_addresses_a_normal_paragraph_after_the_closing_fence() {
+        for (before, expected) in [
+            ("```\ncode\n```", "```\ncode\n```\n\n"),
+            ("```rust\ncode\n```\n", "```rust\ncode\n```\n\n"),
+            ("~~~\ncode\n~~~\n\n\n", "~~~\ncode\n~~~\n\n"),
+        ] {
+            let mut source = before.to_owned();
+            let selection = paragraph_after_fenced_code(&mut source).unwrap();
+            assert_eq!(source, expected);
+            assert_eq!(selection.end, expected.chars().count());
+        }
+    }
+
+    #[test]
+    fn exposes_the_fenced_language_without_exposing_the_markers() {
+        assert_eq!(
+            fenced_code_language("```rust\nfn main() {}\n```"),
+            Some("rust")
+        );
+        assert_eq!(
+            fenced_code_language("~~~ text linenos\nvalue\n~~~"),
+            Some("text linenos")
+        );
+        assert_eq!(fenced_code_language("```\nvalue\n```"), None);
     }
 
     #[test]
