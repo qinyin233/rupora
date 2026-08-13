@@ -1574,6 +1574,17 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_heading_keeps_the_active_block_identity() {
+        let mut index = BlockIndex::new("");
+        let id = index.blocks()[0].id;
+        for source in ["#", "# ", "# ATX 标题", "# ATX 标题\n"] {
+            index.update(source);
+            assert_eq!(index.blocks().len(), 1, "source: {source:?}");
+            assert_eq!(index.blocks()[0].id, id, "source: {source:?}");
+        }
+    }
+
+    #[test]
     fn inserting_a_block_preserves_surrounding_identities() {
         let original = "Alpha.\n\nOmega.";
         let mut index = BlockIndex::new(original);

@@ -30,7 +30,7 @@ use crate::{
     workspace::{Workspace, WorkspaceEntry},
     wysiwyg::{
         VisualProjection, VisualStyle, complete_fenced_code_on_enter, complete_visual_enter,
-        move_across_hidden_inline_code_boundary,
+        contains_footnote_reference, move_across_hidden_inline_code_boundary,
     },
 };
 use eframe::{
@@ -3060,9 +3060,11 @@ impl RuporaApp {
     ) -> PaneScroll {
         let viewport_height = ui.available_height();
         let before_content = self.documents[index].content.clone();
+        let base_path = self.preview_base_path(index);
         let mut preview_content = prepare_native_preview(
             ui.ctx(),
             &before_content,
+            &base_path,
             self.state.dark,
             &mut self.generated_svg_cache.borrow_mut(),
         );
@@ -3163,6 +3165,7 @@ impl RuporaApp {
         let selection_before = cursor_before.map(cursor_range_to_char_range);
         let blocks = self.documents[index].blocks().to_vec();
         let base_uri = self.preview_base_uri(index);
+        let base_path = self.preview_base_path(index);
         let local_links = markdown::local_link_destinations(&source);
         let preview_blocks = blocks
             .iter()
@@ -3172,6 +3175,7 @@ impl RuporaApp {
                     prepare_native_preview(
                         ui.ctx(),
                         &source[block.range.clone()],
+                        &base_path,
                         self.state.dark,
                         &mut self.generated_svg_cache.borrow_mut(),
                     ),
@@ -3203,6 +3207,7 @@ impl RuporaApp {
             .map(|(_, id)| id)
             .or_else(|| source.is_empty().then(|| blocks[0].id));
         let document_id = self.documents[index].id();
+        let document_title = self.documents[index].title();
         let ime_action = ui.input(|input| ime_frame_action(&input.events));
         let mut ime_session = self.hybrid_ime_session.take().filter(|session| {
             session.document_id == document_id && Some(session.block_id) == active_id
@@ -3243,6 +3248,7 @@ impl RuporaApp {
                         })
                         .inner_margin(Margin::symmetric(56, 38))
                         .show(ui, |ui| {
+                            set_wysiwyg_document_accessibility(ui, &document_title);
                             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                                 ui.set_width((page_width - 112.0).max(160.0));
                                 ui.set_min_height((viewport_height - 142.0).max(480.0));
@@ -3448,6 +3454,26 @@ impl RuporaApp {
                                                                 palette,
                                                             ),
                                                         ),
+                                                    );
+                                                    paint_inline_code_delimiters(
+                                                        ui,
+                                                        &output.galley,
+                                                        output.galley_pos,
+                                                        &runs,
+                                                        palette,
+                                                    );
+                                                }
+                                                if output.response.has_focus() {
+                                                    let accessible_remainder =
+                                                        accessible_document_remainder(
+                                                            &source, &blocks, block.id,
+                                                        );
+                                                    append_accessible_text_runs(
+                                                        ui,
+                                                        editor_id,
+                                                        (document_id, block.id),
+                                                        &accessible_remainder,
+                                                        output.response.rect,
                                                     );
                                                 }
                                                 set_accessible_label(
@@ -3745,11 +3771,13 @@ impl RuporaApp {
                                                 .unwrap_or(source_block);
                                             let shown = ui.scope(|ui| {
                                                 ui.add_space(6.0);
-                                                if !show_inline_code_chip_preview(
-                                                    ui,
-                                                    source_block,
-                                                    palette,
-                                                ) {
+                                                let projection_preview =
+                                                    show_text_projection_preview(
+                                                        ui,
+                                                        source_block,
+                                                        palette,
+                                                    );
+                                                if projection_preview.is_none() {
                                                     CommonMarkViewer::new()
                                                         .default_implicit_uri_scheme(
                                                             base_uri.clone(),
@@ -3762,35 +3790,53 @@ impl RuporaApp {
                                                         );
                                                 }
                                                 ui.add_space(6.0);
+                                                projection_preview
                                             });
+                                            let projection_preview = shown.inner;
+                                            let activation_id =
+                                                ui.make_persistent_id(("activate-block", block.id));
                                             let response = ui
                                                 .interact(
                                                     shown.response.rect,
-                                                    ui.make_persistent_id((
-                                                        "activate-block",
-                                                        block.id,
-                                                    )),
+                                                    activation_id,
                                                     egui::Sense::click(),
                                                 )
                                                 .on_hover_text(format!(
                                                     "点击编辑第 {} 行开始的 Markdown 块",
                                                     block.line
                                                 ));
+                                            set_markdown_preview_accessibility(
+                                                &response,
+                                                source_block,
+                                            );
                                             if response.clicked() {
                                                 let local_source_byte = response
                                                     .interact_pointer_pos()
                                                     .map(|position| {
-                                                        let width = response.rect.width().max(1.0);
-                                                        let height =
-                                                            response.rect.height().max(1.0);
-                                                        SourceMap::from_markdown(
-                                                            &source[block.range.clone()],
-                                                        )
-                                                        .source_byte_at_normalized_point(
-                                                            (position.x - response.rect.left())
-                                                                / width,
-                                                            (position.y - response.rect.top())
-                                                                / height,
+                                                        projection_preview.as_ref().map_or_else(
+                                                            || {
+                                                                let width =
+                                                                    response.rect.width().max(1.0);
+                                                                let height =
+                                                                    response.rect.height().max(1.0);
+                                                                SourceMap::from_markdown(
+                                                                    source_block,
+                                                                )
+                                                                .source_byte_at_normalized_point(
+                                                                    (position.x
+                                                                        - response.rect.left())
+                                                                        / width,
+                                                                    (position.y
+                                                                        - response.rect.top())
+                                                                        / height,
+                                                                )
+                                                            },
+                                                            |preview| {
+                                                                preview.source_byte_at_position(
+                                                                    source_block,
+                                                                    position,
+                                                                )
+                                                            },
                                                         )
                                                     })
                                                     .unwrap_or_default();
@@ -3872,7 +3918,11 @@ impl RuporaApp {
     }
 
     fn preview_base_uri(&self, index: usize) -> String {
-        let base = self.documents[index]
+        file_uri_base(&self.preview_base_path(index))
+    }
+
+    fn preview_base_path(&self, index: usize) -> PathBuf {
+        self.documents[index]
             .path
             .as_deref()
             .and_then(Path::parent)
@@ -3883,8 +3933,7 @@ impl RuporaApp {
             })
             .map(Path::to_path_buf)
             .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        file_uri_base(&base)
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     fn open_local_preview_link(&mut self, index: usize, destination: &str) {
@@ -4408,11 +4457,31 @@ fn cursor_range_with_direction(
 }
 
 fn text_edit_cursor_after_input(output: &egui::text_edit::TextEditOutput) -> Option<CCursorRange> {
-    // In egui 0.35 pointer interaction updates `state.cursor` after the public
-    // `cursor_range` field is captured. Reading the state is therefore
-    // essential for clicks and drag-selection; using the output field would
-    // restore the stale cursor on the next frame.
-    output.state.cursor.range(&output.galley)
+    if output.response.clicked() || output.response.dragged() {
+        // Pointer interaction happens after `cursor_range` is captured. For
+        // clicks and drag-selection the stored state is therefore newer, even
+        // if another event also changed text in the same frame.
+        output
+            .state
+            .cursor
+            .range(&output.galley)
+            .or(output.cursor_range)
+    } else if output.response.changed() {
+        // With hint text, egui 0.35 deliberately returns the pre-input empty
+        // galley for the first keystroke. Resolving `state.cursor` against that
+        // stale galley collapses the freshly advanced cursor back to zero, so
+        // the next frame inserts before the Markdown marker. The public range
+        // is the authoritative post-keyboard-edit cursor in this case.
+        output
+            .cursor_range
+            .or_else(|| output.state.cursor.range(&output.galley))
+    } else {
+        output
+            .state
+            .cursor
+            .range(&output.galley)
+            .or(output.cursor_range)
+    }
 }
 
 fn text_edit_cursor_at_position(
@@ -4631,9 +4700,33 @@ fn rounded_inline_code_backgrounds(
     shapes
 }
 
-fn show_inline_code_chip_preview(ui: &mut Ui, source: &str, palette: AppPalette) -> bool {
-    if !supports_inline_code_chip_preview(source) {
-        return false;
+struct TextProjectionPreview {
+    galley: Arc<egui::Galley>,
+    galley_pos: egui::Pos2,
+    projection: VisualProjection,
+}
+
+impl TextProjectionPreview {
+    fn source_byte_at_position(&self, source: &str, position: egui::Pos2) -> usize {
+        let cursor = self
+            .galley
+            .cursor_from_pos(position - self.galley_pos + egui::vec2(self.galley.rect.left(), 0.0));
+        let visual_index = cursor.index.0;
+        let source_index = self
+            .projection
+            .source_char_range(source, visual_index..visual_index)
+            .start;
+        char_to_byte(source, source_index)
+    }
+}
+
+fn show_text_projection_preview(
+    ui: &mut Ui,
+    source: &str,
+    palette: AppPalette,
+) -> Option<TextProjectionPreview> {
+    if !supports_text_projection_preview(source) {
+        return None;
     }
     let projection = VisualProjection::from_markdown(source);
     let runs = projection.runs_for(projection.text());
@@ -4649,15 +4742,22 @@ fn show_inline_code_chip_preview(ui: &mut Ui, source: &str, palette: AppPalette)
     ui.painter().extend(rounded_inline_code_backgrounds(
         &galley, galley_pos, &runs, palette,
     ));
-    ui.painter().galley(galley_pos, galley, palette.text);
-    true
+    ui.painter()
+        .galley(galley_pos, Arc::clone(&galley), palette.text);
+    Some(TextProjectionPreview {
+        galley,
+        galley_pos,
+        projection,
+    })
 }
 
-fn supports_inline_code_chip_preview(source: &str) -> bool {
-    let mut has_inline_code = false;
+fn supports_text_projection_preview(source: &str) -> bool {
+    let mut needs_projection = contains_footnote_reference(source);
     for event in Parser::new_ext(source, markdown::parser_options()) {
         match event {
-            MarkdownEvent::Code(_) => has_inline_code = true,
+            MarkdownEvent::Code(_) | MarkdownEvent::FootnoteReference(_) => {
+                needs_projection = true;
+            }
             MarkdownEvent::Start(
                 Tag::Paragraph
                 | Tag::Heading { .. }
@@ -4672,13 +4772,171 @@ fn supports_inline_code_chip_preview(source: &str) -> bool {
                 | TagEnd::Strong
                 | TagEnd::Strikethrough,
             )
-            | MarkdownEvent::Text(_)
             | MarkdownEvent::SoftBreak
             | MarkdownEvent::HardBreak => {}
+            MarkdownEvent::Text(_) => {}
             _ => return false,
         }
     }
-    has_inline_code
+    needs_projection
+}
+
+fn accessible_markdown_block_text(source: &str) -> String {
+    let projection = VisualProjection::from_markdown(source);
+    let text = projection.text().trim_end_matches(['\r', '\n']);
+    if text.trim().is_empty() {
+        source.to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+fn set_wysiwyg_document_accessibility(ui: &Ui, title: &str) {
+    ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+        node.set_role(egui::accesskit::Role::Document);
+        node.set_label(format!("{title} 所见即所得文档"));
+    });
+}
+
+fn accessible_document_remainder(
+    source: &str,
+    blocks: &[markdown::MarkdownBlock],
+    active_id: BlockId,
+) -> String {
+    const MAX_ACCESSIBLE_REMAINDER_CHARS: usize = 1_048_576;
+
+    let mut output = String::new();
+    let mut remaining = MAX_ACCESSIBLE_REMAINDER_CHARS;
+    for block in blocks.iter().filter(|block| block.id != active_id) {
+        if remaining == 0 {
+            break;
+        }
+        let text = accessible_markdown_block_text(&source[block.range.clone()]);
+        if text.is_empty() {
+            continue;
+        }
+        if remaining > 0 {
+            output.push('\n');
+            remaining = remaining.saturating_sub(1);
+        }
+        let mut appended = 0usize;
+        for character in text.chars().take(remaining) {
+            output.push(character);
+            appended += 1;
+        }
+        remaining = remaining.saturating_sub(appended);
+    }
+    output
+}
+
+fn append_accessible_text_runs(
+    ui: &mut Ui,
+    parent_id: egui::Id,
+    salt: (u64, BlockId),
+    text: &str,
+    bounds: egui::Rect,
+) {
+    const MAX_TEXT_RUN_CHARS: usize = 255;
+
+    let mut chunk = String::new();
+    let mut chunk_chars = 0usize;
+    let mut chunk_index = 0usize;
+    for character in text.chars() {
+        chunk.push(character);
+        chunk_chars += 1;
+        if chunk_chars == MAX_TEXT_RUN_CHARS {
+            append_accessible_text_run(ui, parent_id, salt, chunk_index, &chunk, bounds);
+            chunk.clear();
+            chunk_chars = 0;
+            chunk_index += 1;
+        }
+    }
+    if !chunk.is_empty() {
+        append_accessible_text_run(ui, parent_id, salt, chunk_index, &chunk, bounds);
+    }
+}
+
+fn append_accessible_text_run(
+    ui: &mut Ui,
+    parent_id: egui::Id,
+    salt: (u64, BlockId),
+    chunk_index: usize,
+    text: &str,
+    bounds: egui::Rect,
+) {
+    let child = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("wysiwyg-accessible-remainder", salt, chunk_index))
+            .max_rect(bounds)
+            .accessibility_parent(parent_id),
+    );
+    child
+        .ctx()
+        .accesskit_node_builder(child.unique_id(), |node| {
+            node.set_role(egui::accesskit::Role::TextRun);
+            node.set_value(text);
+            node.set_character_lengths(
+                text.chars()
+                    .map(|character| character.len_utf8() as u8)
+                    .collect::<Vec<_>>(),
+            );
+            node.set_text_direction(egui::accesskit::TextDirection::LeftToRight);
+            node.set_bounds(egui::accesskit::Rect {
+                x0: bounds.min.x.into(),
+                y0: bounds.min.y.into(),
+                x1: bounds.max.x.into(),
+                y1: bounds.max.y.into(),
+            });
+        });
+}
+
+fn set_markdown_preview_accessibility(response: &egui::Response, source: &str) {
+    let accessible_text = accessible_markdown_block_text(source);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &accessible_text));
+}
+
+fn paint_inline_code_delimiters(
+    ui: &Ui,
+    galley: &egui::Galley,
+    galley_pos: egui::Pos2,
+    runs: &[crate::wysiwyg::VisualRun],
+    palette: AppPalette,
+) -> usize {
+    let mut painted = 0usize;
+    let mut char_index = 0usize;
+    let mut run_index = 0usize;
+    for placed_row in &galley.rows {
+        let row_offset = galley_pos.to_vec2() + placed_row.pos.to_vec2();
+        for glyph in &placed_row.glyphs {
+            while runs
+                .get(run_index)
+                .is_some_and(|run| run.range.end <= char_index)
+            {
+                run_index += 1;
+            }
+            let is_delimiter = glyph.chr == '`'
+                && runs.get(run_index).is_some_and(|run| {
+                    run.range.contains(&char_index) && run.style.code && run.style.marker
+                });
+            if is_delimiter {
+                let rect = glyph.logical_rect().translate(row_offset);
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "`",
+                    FontId::new(17.0, FontFamily::Monospace),
+                    palette.accent,
+                );
+                painted += 1;
+            }
+            char_index += 1;
+        }
+        if placed_row.ends_with_newline {
+            char_index += 1;
+        }
+    }
+    painted
 }
 
 fn push_inline_code_background(
@@ -4700,13 +4958,19 @@ fn push_inline_code_background(
 }
 
 fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
-    let size = match (style.code, style.heading) {
-        (_, 1) => 34.0,
-        (_, 2) => 27.0,
-        (_, 3) => 22.0,
-        (_, 4) => 18.0,
-        (true, _) => 15.0,
-        _ => 16.0,
+    let size = if style.code && style.marker {
+        17.0
+    } else if style.footnote {
+        11.0
+    } else {
+        match (style.code, style.heading) {
+            (_, 1) => 34.0,
+            (_, 2) => 27.0,
+            (_, 3) => 22.0,
+            (_, 4) => 18.0,
+            (true, _) => 15.0,
+            _ => 16.0,
+        }
     };
     let family = if style.code {
         FontFamily::Monospace
@@ -4717,7 +4981,9 @@ fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
     };
     let mut format = TextFormat::simple(
         FontId::new(size, family),
-        if style.marker || style.quote {
+        if style.code && style.marker {
+            palette.accent
+        } else if style.marker || style.quote {
             palette.secondary
         } else if style.link {
             palette.accent
@@ -4735,6 +5001,8 @@ fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
     });
     if style.code {
         format.valign = Align::Center;
+    } else if style.footnote {
+        format.valign = Align::Min;
     }
     if style.strong || style.heading > 0 {
         format.extra_letter_spacing = 0.2;
@@ -5244,6 +5512,7 @@ mod tests {
         let preview = prepare_native_preview(
             &context,
             "```mermaid\nflowchart LR\nA --> B\n```\n",
+            Path::new("."),
             false,
             &mut cache,
         );
@@ -5379,13 +5648,14 @@ mod tests {
     }
 
     #[test]
-    fn rounded_inline_code_preview_only_replaces_simple_text_blocks() {
+    fn text_projection_preview_only_replaces_supported_text_blocks() {
         for source in [
             "before `code` after",
             "# heading with `code`",
             "**bold `code`** and *emphasis*",
+            "脚注引用[^1]",
         ] {
-            assert!(supports_inline_code_chip_preview(source), "{source}");
+            assert!(supports_text_projection_preview(source), "{source}");
         }
 
         for source in [
@@ -5395,8 +5665,173 @@ mod tests {
             "![image](image.png) and `code`",
             "```rust\ncode\n```",
         ] {
-            assert!(!supports_inline_code_chip_preview(source), "{source}");
+            assert!(!supports_text_projection_preview(source), "{source}");
         }
+    }
+
+    #[test]
+    fn inline_code_preview_click_maps_to_the_actual_glyph() {
+        use egui::RawInput;
+
+        let context = Context::default();
+        let source = "PRE `ab` POST";
+        let mut source_byte = None;
+        let _ = context.run_ui(RawInput::default(), |ui| {
+            ui.set_width(720.0);
+            let preview = show_text_projection_preview(ui, source, app_palette(false))
+                .expect("inline code should use the precise projection preview");
+            let visual_index = preview
+                .projection
+                .text()
+                .find("ab")
+                .expect("code should be visible")
+                + 1;
+            let position = preview.galley_pos
+                + preview
+                    .galley
+                    .pos_from_cursor(CCursor::new(visual_index))
+                    .center()
+                    .to_vec2();
+            source_byte = Some(preview.source_byte_at_position(source, position));
+        });
+
+        let source_byte = source_byte.expect("preview should be measured");
+        let source_cursor = source[..source_byte].chars().count();
+        assert_eq!(source_cursor, 6);
+        assert_eq!(
+            VisualProjection::from_markdown_with_selection(
+                source,
+                Some(source_cursor..source_cursor),
+            )
+            .text(),
+            source
+        );
+    }
+
+    #[test]
+    fn accessible_preview_text_covers_non_active_markdown_blocks() {
+        assert_eq!(accessible_markdown_block_text("- 项目"), "• 项目");
+        let footnote = accessible_markdown_block_text("脚注引用[^1]");
+        assert!(footnote.contains('1'));
+        assert!(!footnote.contains("[^1]"));
+        assert!(accessible_markdown_block_text("```rust\nfn main() {}\n```").contains("fn main"));
+    }
+
+    #[test]
+    fn inactive_markdown_preview_registers_its_accessible_text() {
+        use egui::{RawInput, Sense, vec2};
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let output = context.run_ui(RawInput::default(), |ui| {
+            ui.push_id("accessible-wysiwyg-document", |ui| {
+                set_wysiwyg_document_accessibility(ui, "测试.md");
+                ui.label("文档开头");
+                let response = ui.allocate_response(vec2(240.0, 40.0), Sense::click());
+                set_markdown_preview_accessibility(
+                    &response,
+                    "后续列表与 `code` RETEST-END-20260813",
+                );
+            });
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("AccessKit should receive a tree update");
+
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.role() == egui::accesskit::Role::Document)
+        );
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.value()
+                .is_some_and(|value| value.contains("RETEST-END-20260813"))
+        }));
+    }
+
+    #[test]
+    fn focused_wysiwyg_editor_exposes_the_remaining_document_as_text_runs() {
+        use egui::{Id, RawInput};
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let editor_id = Id::new("focused-wysiwyg-accessibility-regression");
+        let source = "ACCESS-FINAL\n\nACCESS-FINAL-END-20260813";
+        let blocks = markdown::blocks(source);
+        let remainder = accessible_document_remainder(source, &blocks, blocks[0].id);
+        assert!(remainder.contains("ACCESS-FINAL-END-20260813"));
+        assert!(!remainder.contains("ACCESS-FINAL\n"));
+
+        let output = context.run_ui(RawInput::default(), |ui| {
+            ui.memory_mut(|memory| memory.request_focus(editor_id));
+            let mut active = "ACCESS-FINAL".to_owned();
+            let output = TextEdit::multiline(&mut active).id(editor_id).show(ui);
+            append_accessible_text_runs(
+                ui,
+                editor_id,
+                (7, blocks[0].id),
+                &remainder,
+                output.response.rect,
+            );
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("AccessKit should receive a tree update");
+        assert_eq!(update.focus, editor_id.accesskit_id());
+
+        let editor = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == editor_id.accesskit_id())
+            .map(|(_, node)| node)
+            .expect("focused editor node should exist");
+        let remainder_node = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.value()
+                    .is_some_and(|value| value.contains("ACCESS-FINAL-END-20260813"))
+            })
+            .expect("remainder text run should exist");
+        assert!(editor.children().contains(&remainder_node.0));
+    }
+
+    #[test]
+    fn active_inline_code_paints_both_visible_delimiters() {
+        use egui::RawInput;
+
+        let context = Context::default();
+        let mut painted = None;
+        let _ = context.run_ui(RawInput::default(), |ui| {
+            let source = "PRE `ab` POST";
+            let content_start = source.find("ab").unwrap();
+            let source_cursor = source[..content_start + 1].chars().count();
+            let projection = VisualProjection::from_markdown_with_selection(
+                source,
+                Some(source_cursor..source_cursor),
+            );
+            let runs = projection.runs_for(projection.text());
+            let galley = wysiwyg_layout(
+                ui,
+                projection.text(),
+                &projection,
+                480.0,
+                app_palette(false),
+                true,
+            );
+            painted = Some(paint_inline_code_delimiters(
+                ui,
+                &galley,
+                egui::Pos2::ZERO,
+                &runs,
+                app_palette(false),
+            ));
+        });
+
+        assert_eq!(painted, Some(2));
     }
 
     #[test]
@@ -5630,6 +6065,95 @@ mod tests {
         );
         assert_eq!(reverse.primary.index.0, 2);
         assert_eq!(reverse.secondary.index.0, 10);
+    }
+
+    #[test]
+    fn wysiwyg_text_edit_keeps_source_cursor_when_markers_become_hidden() {
+        use egui::{Event, Id, Modifiers, RawInput};
+
+        fn edit_frame(
+            context: &Context,
+            id: Id,
+            source: &str,
+            source_selection: std::ops::Range<usize>,
+            events: Vec<Event>,
+        ) -> crate::wysiwyg::VisualSourceEdit {
+            let projection = VisualProjection::from_markdown_with_selection(
+                source,
+                Some(source_selection.clone()),
+            );
+            let visual_selection = projection.visual_char_range(source, source_selection);
+            let mut visual_content = projection.text().to_owned();
+            let mut result = None;
+            let _ = context.run_ui(
+                RawInput {
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| {
+                    let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+                    state
+                        .cursor
+                        .set_char_range(Some(CCursorRange::one(CCursor::new(
+                            visual_selection.start,
+                        ))));
+                    state.store(ui.ctx(), id);
+                    ui.memory_mut(|memory| memory.request_focus(id));
+                    let output = TextEdit::multiline(&mut visual_content)
+                        .id(id)
+                        .hint_text("开始写作…")
+                        .show(ui);
+                    let visual_cursor = text_edit_cursor_after_input(&output)
+                        .map(cursor_range_to_char_range)
+                        .expect("focused TextEdit should retain a cursor");
+                    result = projection.apply_edit(source, &visual_content, visual_cursor);
+                },
+            );
+            result.expect("typed frame should update the source")
+        }
+
+        fn type_frame(
+            context: &Context,
+            id: Id,
+            source: &str,
+            source_selection: std::ops::Range<usize>,
+            text: &str,
+        ) -> crate::wysiwyg::VisualSourceEdit {
+            edit_frame(
+                context,
+                id,
+                source,
+                source_selection,
+                vec![Event::Text(text.to_owned())],
+            )
+        }
+
+        let context = Context::default();
+        let id = Id::new("wysiwyg-hidden-marker-cursor-regression");
+        let mut update = type_frame(&context, id, "", 0..0, "#");
+        assert_eq!(update.source, "#");
+        update = type_frame(&context, id, &update.source, update.selection, " ");
+        assert_eq!(update.source, "# ");
+        update = type_frame(&context, id, &update.source, update.selection, "ATX 标题");
+        assert_eq!(update.source, "# ATX 标题");
+
+        update = edit_frame(
+            &context,
+            id,
+            &update.source,
+            update.selection,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        update.selection = complete_visual_enter(&mut update.source, update.selection, false);
+        assert_eq!(update.source, "# ATX 标题\n");
+        update = type_frame(&context, id, &update.source, update.selection, "下一行");
+        assert_eq!(update.source, "# ATX 标题\n下一行");
     }
 
     #[test]

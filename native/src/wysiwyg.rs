@@ -14,6 +14,7 @@ pub struct VisualStyle {
     pub link: bool,
     pub marker: bool,
     pub quote: bool,
+    pub footnote: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +58,7 @@ impl FormatState {
             link: self.link > 0,
             marker: false,
             quote: self.quote > 0,
+            footnote: false,
         }
     }
 }
@@ -84,6 +86,7 @@ impl VisualProjection {
             .as_ref()
             .filter(|selection| selection.is_empty())
             .map(|selection| selection.start);
+        let standalone_footnotes = standalone_footnote_references(source);
 
         for (event, range) in Parser::new_ext(source, parser_options()).into_offset_iter() {
             match event {
@@ -183,7 +186,17 @@ impl VisualProjection {
                 }
                 Event::Text(text) => {
                     builder.append_container_prefix(source, range.start, format);
-                    builder.append_mapped(source, &text, range, format.visual());
+                    if format.code == 0 {
+                        builder.append_text_with_footnote_references(
+                            source,
+                            &text,
+                            range,
+                            format.visual(),
+                            &standalone_footnotes,
+                        );
+                    } else {
+                        builder.append_mapped(source, &text, range, format.visual());
+                    }
                 }
                 Event::Code(text) => {
                     builder.append_container_prefix(source, range.start, format);
@@ -214,6 +227,7 @@ impl VisualProjection {
                     let rendered = format!("〔{label}〕");
                     let mut style = format.visual();
                     style.link = true;
+                    style.footnote = true;
                     builder.append_transformed(&rendered, range, style);
                 }
                 Event::SoftBreak | Event::HardBreak => {
@@ -409,6 +423,10 @@ pub fn complete_visual_enter(
     } else {
         crate::editing::continue_markdown_line(source, selection.end).unwrap_or(selection)
     }
+}
+
+pub fn contains_footnote_reference(source: &str) -> bool {
+    !standalone_footnote_references(source).is_empty()
 }
 
 pub fn complete_fenced_code_on_enter(
@@ -753,6 +771,50 @@ impl ProjectionBuilder {
         self.append_transformed(rendered, range, style);
     }
 
+    fn append_text_with_footnote_references(
+        &mut self,
+        source: &str,
+        rendered: &str,
+        range: Range<usize>,
+        style: VisualStyle,
+        references: &[Range<usize>],
+    ) {
+        let first = references.partition_point(|reference| reference.end <= range.start);
+        let count = references[first..].partition_point(|reference| reference.start < range.end);
+        let overlapping = &references[first..first + count];
+        if overlapping.is_empty() {
+            self.append_mapped(source, rendered, range, style);
+            return;
+        }
+
+        let mut cursor = range.start;
+        for reference in overlapping {
+            if cursor < reference.start {
+                self.append_mapped(
+                    source,
+                    &source[cursor..reference.start],
+                    cursor..reference.start,
+                    style,
+                );
+            }
+            if range.start <= reference.start {
+                let label = &source[reference.start + 2..reference.end - 1];
+                let mut reference_style = style;
+                reference_style.link = true;
+                reference_style.footnote = true;
+                self.append_transformed(
+                    &format!("〔{label}〕"),
+                    reference.clone(),
+                    reference_style,
+                );
+            }
+            cursor = cursor.max(reference.end);
+        }
+        if cursor < range.end {
+            self.append_mapped(source, &source[cursor..range.end], cursor..range.end, style);
+        }
+    }
+
     fn append_revealed_inline_code(
         &mut self,
         source: &str,
@@ -857,6 +919,37 @@ fn inline_code_content_range(
         .map_or(syntax_range.clone(), |start| {
             syntax_range.start + start..syntax_range.start + start + rendered.len()
         })
+}
+
+fn standalone_footnote_references(text: &str) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut references = Vec::new();
+    let mut cursor = 0usize;
+    while cursor + 3 < bytes.len() {
+        let Some(relative_start) = text[cursor..].find("[^") else {
+            break;
+        };
+        let start = cursor + relative_start;
+        let escaped = text[..start]
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'\\')
+            .count()
+            % 2
+            == 1;
+        let label_start = start + 2;
+        let Some(relative_end) = text[label_start..].find(']') else {
+            break;
+        };
+        let end = label_start + relative_end + 1;
+        let label = &text[label_start..end - 1];
+        if !escaped && !label.is_empty() && label.len() <= 128 && !label.contains(['\r', '\n', '['])
+        {
+            references.push(start..end);
+        }
+        cursor = end;
+    }
+    references
 }
 
 fn inline_code_delimited_content_range(
@@ -1105,6 +1198,20 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn type_visual_frame(source: &str, selection: Range<usize>, typed: &str) -> VisualSourceEdit {
+        let projection =
+            VisualProjection::from_markdown_with_selection(source, Some(selection.clone()));
+        let visual_selection = projection.visual_char_range(source, selection);
+        let mut edited = projection.text().to_owned();
+        let start = char_to_byte(&edited, visual_selection.start);
+        let end = char_to_byte(&edited, visual_selection.end);
+        edited.replace_range(start..end, typed);
+        let cursor = visual_selection.start + typed.chars().count();
+        projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .expect("typed frame should update the source")
+    }
+
     #[test]
     fn projects_common_markdown_without_exposing_source_markers() {
         let source = "# 标题 **粗体**\n\n- 第一项\n- [x] 第二项 *强调*\n  - 子项\n\n> 引用 `代码`";
@@ -1120,6 +1227,22 @@ mod tests {
         assert!(projection.runs.iter().any(|run| run.style.emphasis));
         assert!(projection.runs.iter().any(|run| run.style.code));
         assert!(projection.runs.iter().any(|run| run.style.marker));
+    }
+
+    #[test]
+    fn staged_atx_heading_typing_keeps_the_marker_at_the_start() {
+        let mut update = type_visual_frame("", 0..0, "#");
+        assert_eq!(update.source, "#");
+        update = type_visual_frame(&update.source, update.selection, " ");
+        assert_eq!(update.source, "# ");
+        update = type_visual_frame(&update.source, update.selection, "ATX 标题");
+        assert_eq!(update.source, "# ATX 标题");
+
+        update = type_visual_frame(&update.source, update.selection, "\n");
+        update.selection = complete_visual_enter(&mut update.source, update.selection, false);
+        assert_eq!(update.source, "# ATX 标题\n");
+        update = type_visual_frame(&update.source, update.selection, "Setext 标题");
+        assert_eq!(update.source, "# ATX 标题\nSetext 标题");
     }
 
     #[test]
@@ -1147,6 +1270,39 @@ mod tests {
                 "cursor: {cursor}"
             );
         }
+    }
+
+    #[test]
+    fn renders_footnote_references_even_when_the_definition_is_in_another_block() {
+        let source = "脚注引用[^1] 与 [^说明]";
+        let projection = VisualProjection::from_markdown(source);
+
+        assert_eq!(projection.text(), "脚注引用〔1〕 与 〔说明〕");
+        let footnotes = projection
+            .runs_for(projection.text())
+            .into_iter()
+            .filter(|run| run.style.footnote)
+            .collect::<Vec<_>>();
+        assert_eq!(footnotes.len(), 2);
+        assert!(footnotes.iter().all(|run| run.style.link));
+
+        let escaped = VisualProjection::from_markdown(r"转义 \[^1]");
+        assert_eq!(escaped.text(), "转义 [^1]");
+        assert!(
+            !escaped
+                .runs_for(escaped.text())
+                .iter()
+                .any(|run| run.style.footnote)
+        );
+
+        let code = VisualProjection::from_markdown("```text\n[^1]\n```");
+        assert_eq!(code.text(), "[^1]");
+        assert!(
+            !code
+                .runs_for(code.text())
+                .iter()
+                .any(|run| run.style.footnote)
+        );
     }
 
     #[test]
