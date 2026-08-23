@@ -28,13 +28,21 @@ pub struct VisualRun {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VisualProjection {
     text: String,
+    source_left_boundaries: Vec<usize>,
     source_boundaries: Vec<usize>,
     runs: Vec<VisualRun>,
     atomic_ranges: Vec<AtomicVisualRange>,
+    inline_wrappers: Vec<InlineWrapper>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AtomicVisualRange {
+    visual: Range<usize>,
+    source: Range<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InlineWrapper {
     visual: Range<usize>,
     source: Range<usize>,
 }
@@ -178,10 +186,22 @@ impl VisualProjection {
                             }
                             table_cells += 1;
                         }
-                        Tag::Emphasis => format.emphasis += 1,
-                        Tag::Strong => format.strong += 1,
-                        Tag::Strikethrough => format.strikethrough += 1,
-                        Tag::Link { .. } => format.link += 1,
+                        Tag::Emphasis => {
+                            builder.begin_inline_wrapper(range.start);
+                            format.emphasis += 1;
+                        }
+                        Tag::Strong => {
+                            builder.begin_inline_wrapper(range.start);
+                            format.strong += 1;
+                        }
+                        Tag::Strikethrough => {
+                            builder.begin_inline_wrapper(range.start);
+                            format.strikethrough += 1;
+                        }
+                        Tag::Link { .. } => {
+                            builder.begin_inline_wrapper(range.start);
+                            format.link += 1;
+                        }
                         Tag::Image { .. } => {
                             format.link += 1;
                             let marker_end = source[range.clone()]
@@ -210,6 +230,12 @@ impl VisualProjection {
                     }
                 }
                 Event::End(tag) => {
+                    if matches!(
+                        tag,
+                        TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link
+                    ) {
+                        builder.end_inline_wrapper(range.end);
+                    }
                     match tag {
                         TagEnd::Paragraph
                         | TagEnd::Heading(_)
@@ -324,6 +350,12 @@ impl VisualProjection {
         builder.append_trailing_container_line(source);
         let mut projection =
             builder.finish(source, trailing_container_block, trailing_fenced_code_block);
+        if let Some(selection) = source_selection.as_ref()
+            && selection.is_empty()
+            && let Some((syntax, style)) = empty_inline_wrapper_at(source, selection.start)
+        {
+            projection.collapse_source_range(syntax, selection.start, style);
+        }
         if let Some(source_byte) = collapsed_source_cursor {
             projection.anchor_source_cursor(source_byte);
         }
@@ -343,7 +375,11 @@ impl VisualProjection {
     pub fn source_char_range(&self, source: &str, visual_range: Range<usize>) -> Range<usize> {
         let range = clamp_range(visual_range, self.char_count());
         let start = self.source_boundaries[range.start];
-        let end = self.source_boundaries[range.end];
+        let end = if range.is_empty() {
+            start
+        } else {
+            self.source_left_boundaries[range.end]
+        };
         source[..start].chars().count()..source[..end].chars().count()
     }
 
@@ -361,8 +397,16 @@ impl VisualProjection {
         visual_selection: Range<usize>,
     ) -> Option<VisualSourceEdit> {
         let change = text_change(&self.text, edited)?;
+        let insertion = change.old.is_empty();
         let mut source_start = self.source_boundaries[change.old.start];
-        let mut source_end = self.source_boundaries[change.old.end];
+        let mut source_end = if insertion {
+            source_start
+        } else {
+            self.source_left_boundaries[change.old.end]
+        };
+        let replacement_start = char_to_byte(edited, change.new.start);
+        let replacement_end = char_to_byte(edited, change.new.end);
+        let replacement = &edited[replacement_start..replacement_end];
         for atomic in self
             .atomic_ranges
             .iter()
@@ -371,9 +415,22 @@ impl VisualProjection {
             source_start = source_start.min(atomic.source.start);
             source_end = source_end.max(atomic.source.end);
         }
-        let replacement_start = char_to_byte(edited, change.new.start);
-        let replacement_end = char_to_byte(edited, change.new.end);
-        let replacement = &edited[replacement_start..replacement_end];
+        for wrapper in self.inline_wrappers.iter().filter(|wrapper| {
+            change.old.start <= wrapper.visual.start && change.old.end >= wrapper.visual.end
+        }) {
+            if replacement.is_empty() {
+                source_start = source_start.min(wrapper.source.start);
+                source_end = source_end.max(wrapper.source.end);
+            }
+        }
+        if replacement.is_empty()
+            && !change.old.is_empty()
+            && self.source_left_boundaries[change.old.start] < source_start
+            && self.source_boundaries[change.old.end] > source_end
+        {
+            source_start = self.source_left_boundaries[change.old.start];
+            source_end = self.source_boundaries[change.old.end];
+        }
 
         let mut output = source.to_owned();
         output.replace_range(source_start..source_end, replacement);
@@ -443,6 +500,53 @@ impl VisualProjection {
         if let Some(boundary) = self.source_boundaries.get_mut(visual_index) {
             *boundary = source_byte;
         }
+        if let Some(boundary) = self.source_left_boundaries.get_mut(visual_index) {
+            *boundary = source_byte;
+        }
+    }
+
+    fn collapse_source_range(
+        &mut self,
+        source_range: Range<usize>,
+        source_anchor: usize,
+        _style: VisualStyle,
+    ) {
+        let visual_start = self.visual_char_for_source_byte(source_range.start);
+        let visual_end = self.visual_char_for_source_byte(source_range.end);
+        if visual_start >= visual_end {
+            return;
+        }
+        let start_byte = char_to_byte(&self.text, visual_start);
+        let end_byte = char_to_byte(&self.text, visual_end);
+        self.text.replace_range(start_byte..end_byte, "");
+        let removed = visual_end - visual_start;
+        self.source_left_boundaries
+            .splice(visual_start..=visual_end, [source_anchor]);
+        self.source_boundaries
+            .splice(visual_start..=visual_end, [source_anchor]);
+        self.runs = shift_or_split_runs(&self.runs, visual_start..visual_end, removed);
+        self.atomic_ranges.retain_mut(|atomic| {
+            if atomic.visual.end <= visual_start {
+                true
+            } else if atomic.visual.start >= visual_end {
+                atomic.visual.start -= removed;
+                atomic.visual.end -= removed;
+                true
+            } else {
+                false
+            }
+        });
+        self.inline_wrappers.retain_mut(|wrapper| {
+            if wrapper.visual.end <= visual_start {
+                true
+            } else if wrapper.visual.start >= visual_end {
+                wrapper.visual.start -= removed;
+                wrapper.visual.end -= removed;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     fn style_at(&self, index: usize) -> VisualStyle {
@@ -490,6 +594,86 @@ impl VisualProjection {
         );
         source_start + relative
     }
+}
+
+fn empty_inline_wrapper_at(
+    source: &str,
+    source_cursor: usize,
+) -> Option<(Range<usize>, VisualStyle)> {
+    for (delimiter, style) in [
+        (
+            "**",
+            VisualStyle {
+                strong: true,
+                ..VisualStyle::default()
+            },
+        ),
+        (
+            "~~",
+            VisualStyle {
+                strikethrough: true,
+                ..VisualStyle::default()
+            },
+        ),
+        (
+            "*",
+            VisualStyle {
+                emphasis: true,
+                ..VisualStyle::default()
+            },
+        ),
+        (
+            "`",
+            VisualStyle {
+                code: true,
+                ..VisualStyle::default()
+            },
+        ),
+    ] {
+        let Some(start) = source_cursor.checked_sub(delimiter.len()) else {
+            continue;
+        };
+        let Some(end) = source_cursor.checked_add(delimiter.len()) else {
+            continue;
+        };
+        if source.get(start..source_cursor) == Some(delimiter)
+            && source.get(source_cursor..end) == Some(delimiter)
+        {
+            return Some((start..end, style));
+        }
+    }
+    None
+}
+
+fn shift_or_split_runs(
+    runs: &[VisualRun],
+    removed: Range<usize>,
+    removed_length: usize,
+) -> Vec<VisualRun> {
+    let mut output = Vec::with_capacity(runs.len());
+    for run in runs {
+        if run.range.end <= removed.start {
+            push_run(&mut output, run.range.clone(), run.style);
+        } else if run.range.start >= removed.end {
+            push_run(
+                &mut output,
+                run.range.start - removed_length..run.range.end - removed_length,
+                run.style,
+            );
+        } else {
+            if run.range.start < removed.start {
+                push_run(&mut output, run.range.start..removed.start, run.style);
+            }
+            if run.range.end > removed.end {
+                push_run(
+                    &mut output,
+                    removed.start..run.range.end - removed_length,
+                    run.style,
+                );
+            }
+        }
+    }
+    output
 }
 
 pub fn complete_visual_enter(
@@ -642,9 +826,21 @@ pub fn paragraph_after_fenced_code(source: &mut String) -> Option<Range<usize>> 
             && info.is_empty()
             && source[line_end..].trim().is_empty()
         {
-            source.truncate(line_end);
-            source.push_str("\n\n");
-            let cursor = source.chars().count();
+            let first_line_start = if let Some(start) = skip_one_line_break(source, line_end) {
+                start
+            } else {
+                source.push_str("\n\n");
+                let cursor = source.chars().count();
+                return Some(cursor..cursor);
+            };
+            let paragraph_start = if let Some(start) = skip_one_line_break(source, first_line_start)
+            {
+                start
+            } else {
+                source.insert(first_line_start, '\n');
+                first_line_start + 1
+            };
+            let cursor = source[..paragraph_start].chars().count();
             return Some(cursor..cursor);
         }
         if line_end == source.len() {
@@ -783,10 +979,10 @@ fn line_break_before_byte(source: &str, byte_index: usize) -> Option<Range<usize
 }
 
 fn parse_fence_line(line: &str) -> Option<(&str, char, usize, &str)> {
-    let indentation_length = line
-        .bytes()
-        .take_while(|byte| matches!(byte, b' ' | b'\t'))
-        .count();
+    let indentation_length = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation_length > 3 || line.as_bytes().get(indentation_length) == Some(&b'\t') {
+        return None;
+    }
     let indentation = &line[..indentation_length];
     let marker_text = &line[indentation_length..];
     let fence_character = marker_text.chars().next()?;
@@ -839,18 +1035,24 @@ fn has_unclosed_fenced_code(source: &str) -> bool {
 
 struct ProjectionBuilder {
     text: String,
+    source_left_boundaries: Vec<usize>,
     source_boundaries: Vec<usize>,
     runs: Vec<VisualRun>,
     atomic_ranges: Vec<AtomicVisualRange>,
+    inline_wrapper_stack: Vec<(usize, usize)>,
+    inline_wrappers: Vec<InlineWrapper>,
 }
 
 impl ProjectionBuilder {
     fn new() -> Self {
         Self {
             text: String::new(),
+            source_left_boundaries: vec![0],
             source_boundaries: vec![0],
             runs: Vec::new(),
             atomic_ranges: Vec::new(),
+            inline_wrapper_stack: Vec::new(),
+            inline_wrappers: Vec::new(),
         }
     }
 
@@ -871,6 +1073,7 @@ impl ProjectionBuilder {
                 break;
             }
             self.text.pop();
+            self.source_left_boundaries.pop();
             self.source_boundaries.pop();
         }
 
@@ -879,6 +1082,7 @@ impl ProjectionBuilder {
             // closing fence in the code text. It terminates the final code
             // line, but is not itself an editable blank line.
             self.text.pop();
+            self.source_left_boundaries.pop();
             self.source_boundaries.pop();
         }
 
@@ -918,8 +1122,9 @@ impl ProjectionBuilder {
             let visual_start = self.text.chars().count();
             self.text.push('\n');
             let previous_boundary = self.source_boundaries.last().copied().unwrap_or_default();
-            self.source_boundaries
-                .push(line_break.end.max(previous_boundary).min(source.len()));
+            let boundary = line_break.end.max(previous_boundary).min(source.len());
+            self.source_left_boundaries.push(boundary);
+            self.source_boundaries.push(boundary);
             push_run(
                 &mut self.runs,
                 visual_start..visual_start + 1,
@@ -938,9 +1143,29 @@ impl ProjectionBuilder {
         });
         VisualProjection {
             text: self.text,
+            source_left_boundaries: self.source_left_boundaries,
             source_boundaries: self.source_boundaries,
             runs: self.runs,
             atomic_ranges: self.atomic_ranges,
+            inline_wrappers: self.inline_wrappers,
+        }
+    }
+
+    fn begin_inline_wrapper(&mut self, source_start: usize) {
+        self.inline_wrapper_stack
+            .push((self.text.chars().count(), source_start));
+    }
+
+    fn end_inline_wrapper(&mut self, source_end: usize) {
+        let Some((visual_start, source_start)) = self.inline_wrapper_stack.pop() else {
+            return;
+        };
+        let visual_end = self.text.chars().count();
+        if visual_start < visual_end && source_start < source_end {
+            self.inline_wrappers.push(InlineWrapper {
+                visual: visual_start..visual_end,
+                source: source_start..source_end,
+            });
         }
     }
 
@@ -1070,7 +1295,9 @@ impl ProjectionBuilder {
             let mut consumed = 0usize;
             for character in rendered.chars() {
                 consumed += character.len_utf8();
-                self.source_boundaries.push(source_start + consumed);
+                let boundary = source_start + consumed;
+                self.source_left_boundaries.push(boundary);
+                self.source_boundaries.push(boundary);
             }
             push_run(
                 &mut self.runs,
@@ -1260,7 +1487,9 @@ impl ProjectionBuilder {
             .collect::<Vec<_>>();
         for index in 1..=rendered_chars {
             let source_index = index * source_boundaries.len().saturating_sub(1) / rendered_chars;
-            self.source_boundaries.push(source_boundaries[source_index]);
+            let boundary = source_boundaries[source_index];
+            self.source_left_boundaries.push(boundary);
+            self.source_boundaries.push(boundary);
         }
         let visual_end = self.text.chars().count();
         if !source_range.is_empty() {
@@ -1290,6 +1519,8 @@ impl ProjectionBuilder {
         self.set_current_boundary(source_byte);
         let visual_start = self.text.chars().count();
         self.text.push_str(rendered);
+        self.source_left_boundaries
+            .extend(std::iter::repeat_n(source_byte, rendered.chars().count()));
         self.source_boundaries
             .extend(std::iter::repeat_n(source_byte, rendered.chars().count()));
         push_run(
@@ -1303,6 +1534,7 @@ impl ProjectionBuilder {
         if !self.text.is_empty() && !self.text.ends_with('\n') {
             let start = self.text.chars().count();
             self.text.push('\n');
+            self.source_left_boundaries.push(source_byte);
             self.source_boundaries.push(source_byte);
             push_run(&mut self.runs, start..start + 1, style);
         }
@@ -1527,8 +1759,12 @@ fn item_prefix(source: &str, item_start: usize) -> Option<(Range<usize>, String)
         if cursor == 1 {
             return None;
         }
-        if marker[cursor..].starts_with("[ ]") || marker[cursor..].starts_with("[x]") {
-            let checked = marker[cursor..].starts_with("[x]");
+        if marker[cursor..].starts_with("[ ]")
+            || marker[cursor..].starts_with("[x]")
+            || marker[cursor..].starts_with("[X]")
+        {
+            let checked =
+                marker[cursor..].starts_with("[x]") || marker[cursor..].starts_with("[X]");
             cursor += 3;
             cursor += marker[cursor..]
                 .bytes()
@@ -2038,6 +2274,43 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_complete_formatted_run_removes_both_hidden_delimiters() {
+        for (source, edited, expected) in [
+            ("**a**b", "b", "b"),
+            ("*a*b", "b", "b"),
+            ("~~a~~b", "b", "b"),
+            ("**a**b", "", ""),
+            ("a**b**", "", ""),
+        ] {
+            let projection = VisualProjection::from_markdown(source);
+            let update = projection.apply_edit(source, edited, 0..0).unwrap();
+            assert_eq!(update.source, expected, "source: {source:?}");
+        }
+
+        let source = "**ab**c";
+        let projection = VisualProjection::from_markdown(source);
+        let update = projection.apply_edit(source, "ac", 1..1).unwrap();
+        assert_eq!(update.source, "**a**c");
+    }
+
+    #[test]
+    fn empty_inline_format_pairs_are_editable_without_block_syntax_conflicts() {
+        for (source, cursor, typed, expected) in [
+            ("****", 2, "bold", "**bold**"),
+            ("~~~~", 2, "gone", "~~gone~~"),
+            ("**", 1, "em", "*em*"),
+            ("``", 1, "code", "`code`"),
+        ] {
+            let projection =
+                VisualProjection::from_markdown_with_selection(source, Some(cursor..cursor));
+            assert_eq!(projection.text(), "", "source: {source:?}");
+            let end = typed.chars().count();
+            let update = projection.apply_edit(source, typed, end..end).unwrap();
+            assert_eq!(update.source, expected, "source: {source:?}");
+        }
+    }
+
+    #[test]
     fn maps_visual_list_content_back_to_source_characters() {
         let source = "- 第一项\n- [ ] 第二项";
         let projection = VisualProjection::from_markdown(source);
@@ -2067,6 +2340,7 @@ mod tests {
             ("- 项目", "- 项目\n- ", "• 项目\n• "),
             ("3. 项目", "3. 项目\n4. ", "3. 项目\n4. "),
             ("- [x] 完成", "- [x] 完成\n- [ ] ", "☑ 完成\n☐ "),
+            ("- [X] 完成", "- [X] 完成\n- [ ] ", "☑ 完成\n☐ "),
             ("> 引用", "> 引用\n> ", "│ 引用\n│ "),
         ] {
             let projection = VisualProjection::from_markdown(source);
@@ -2314,6 +2588,11 @@ mod tests {
         let end = nested.chars().count();
         assert!(complete_bare_fenced_code_after_typing(&mut nested, end..end).is_none());
 
+        let mut indented = "    ```".to_owned();
+        let end = indented.chars().count();
+        assert!(complete_bare_fenced_code_after_typing(&mut indented, end..end).is_none());
+        assert_eq!(indented, "    ```");
+
         let mut stale_cursor = "```".to_owned();
         assert_eq!(
             complete_bare_fenced_code_after_typing(&mut stale_cursor, 2..2),
@@ -2353,15 +2632,15 @@ mod tests {
 
     #[test]
     fn arrow_exit_addresses_a_normal_paragraph_after_the_closing_fence() {
-        for (before, expected) in [
-            ("```\ncode\n```", "```\ncode\n```\n\n"),
-            ("```rust\ncode\n```\n", "```rust\ncode\n```\n\n"),
-            ("~~~\ncode\n~~~\n\n\n", "~~~\ncode\n~~~\n\n"),
+        for (before, expected, cursor) in [
+            ("```\ncode\n```", "```\ncode\n```\n\n", 14),
+            ("```rust\ncode\n```\n", "```rust\ncode\n```\n\n", 18),
+            ("~~~\ncode\n~~~\n\n\n", "~~~\ncode\n~~~\n\n\n", 14),
         ] {
             let mut source = before.to_owned();
             let selection = paragraph_after_fenced_code(&mut source).unwrap();
             assert_eq!(source, expected);
-            assert_eq!(selection.end, expected.chars().count());
+            assert_eq!(selection, cursor..cursor);
         }
     }
 

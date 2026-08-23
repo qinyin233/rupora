@@ -157,13 +157,15 @@ pub fn indent_selected_lines(
     outdent: bool,
 ) -> Range<usize> {
     let selection = clamp_char_range(text, selection);
+    let collapsed = selection.is_empty();
     let start_byte = char_to_byte(text, selection.start);
     let end_byte = char_to_byte(text, selection.end);
     let block_start = text[..start_byte].rfind('\n').map_or(0, |index| index + 1);
     let block_end = text[end_byte..]
         .find('\n')
         .map_or(text.len(), |index| end_byte + index);
-    let transformed = text[block_start..block_end]
+    let original = text[block_start..block_end].to_owned();
+    let transformed = original
         .split('\n')
         .map(|line| {
             if outdent {
@@ -182,7 +184,16 @@ pub fn indent_selected_lines(
         .join("\n");
     text.replace_range(block_start..block_end, &transformed);
     let start = text[..block_start].chars().count();
-    start..start + transformed.chars().count()
+    if collapsed {
+        let mapped = map_prefix_edit_cursor(
+            &original,
+            &transformed,
+            start_byte.saturating_sub(block_start),
+        );
+        start + mapped..start + mapped
+    } else {
+        start..start + transformed.chars().count()
+    }
 }
 
 pub fn paste_url_as_markdown_link(
@@ -196,8 +207,9 @@ pub fn paste_url_as_markdown_link(
     let selection = clamp_char_range(text, selection);
     let start = char_to_byte(text, selection.start);
     let end = char_to_byte(text, selection.end);
-    let label = text[start..end].to_owned();
-    let replacement = format!("[{label}]({url})");
+    let label = escape_link_label(&text[start..end]);
+    let destination = escape_link_destination(url);
+    let replacement = format!("[{label}]({destination})");
     text.replace_range(start..end, &replacement);
     let cursor = selection.start + replacement.chars().count();
     Some(cursor..cursor)
@@ -211,6 +223,7 @@ pub fn insert_resource_link(
     image: bool,
 ) -> Range<usize> {
     let selection = clamp_char_range(text, selection);
+    let label = escape_link_label(label);
     let replacement = if image {
         format!("![{label}]({destination})")
     } else {
@@ -370,6 +383,7 @@ fn transform_selected_lines(
     selection: Range<usize>,
     command: LineCommand,
 ) -> Range<usize> {
+    let collapsed = selection.is_empty();
     let selection_start_byte = char_to_byte(text, selection.start);
     let selection_end_byte = char_to_byte(text, selection.end);
     let block_start = text[..selection_start_byte]
@@ -378,7 +392,7 @@ fn transform_selected_lines(
     let block_end = text[selection_end_byte..]
         .find('\n')
         .map_or(text.len(), |index| selection_end_byte + index);
-    let original = &text[block_start..block_end];
+    let original = text[block_start..block_end].to_owned();
     let lines = original.split('\n').collect::<Vec<_>>();
     let all_prefixed = lines
         .iter()
@@ -392,7 +406,56 @@ fn transform_selected_lines(
     text.replace_range(block_start..block_end, &transformed);
 
     let start = text[..block_start].chars().count();
-    start..start + transformed.chars().count()
+    if collapsed {
+        let mapped = map_prefix_edit_cursor(
+            &original,
+            &transformed,
+            selection_start_byte.saturating_sub(block_start),
+        );
+        start + mapped..start + mapped
+    } else {
+        start..start + transformed.chars().count()
+    }
+}
+
+fn map_prefix_edit_cursor(original: &str, transformed: &str, original_byte_offset: usize) -> usize {
+    let original_offset = original[..original_byte_offset.min(original.len())]
+        .chars()
+        .count();
+    let original_chars = original.chars().collect::<Vec<_>>();
+    let transformed_chars = transformed.chars().collect::<Vec<_>>();
+    let common_suffix = original_chars
+        .iter()
+        .rev()
+        .zip(transformed_chars.iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let original_prefix = original_chars.len().saturating_sub(common_suffix);
+    let transformed_prefix = transformed_chars.len().saturating_sub(common_suffix);
+    if original_offset <= original_prefix {
+        transformed_prefix
+    } else {
+        transformed_prefix + original_offset - original_prefix
+    }
+}
+
+fn escape_link_label(label: &str) -> String {
+    label
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace(['\r', '\n'], " ")
+}
+
+fn escape_link_destination(destination: &str) -> String {
+    destination
+        .replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('<', "%3C")
+        .replace('>', "%3E")
+        .replace('(', "%28")
+        .replace(')', "%29")
+        .replace(['\r', '\n'], "")
 }
 
 fn line_has_command_prefix(line: &str, command: LineCommand) -> bool {
@@ -480,7 +543,10 @@ fn continuation_prefix(line: &str) -> Option<ContinuationPrefix> {
 
     for marker in ["- ", "* ", "+ "] {
         if let Some(after_marker) = rest.strip_prefix(marker) {
-            let task_len = if after_marker.starts_with("[ ] ") || after_marker.starts_with("[x] ") {
+            let task_len = if after_marker.starts_with("[ ] ")
+                || after_marker.starts_with("[x] ")
+                || after_marker.starts_with("[X] ")
+            {
                 4
             } else {
                 0
@@ -567,10 +633,12 @@ mod tests {
     #[test]
     fn toggles_heading_without_stacking_prefixes() {
         let mut text = "## title\nbody".to_owned();
-        apply_markdown_command(&mut text, 0..0, MarkdownCommand::Heading(3));
+        let selection = apply_markdown_command(&mut text, 0..0, MarkdownCommand::Heading(3));
         assert_eq!(text, "### title\nbody");
-        apply_markdown_command(&mut text, 0..0, MarkdownCommand::Heading(3));
+        assert_eq!(selection, 1..1);
+        let selection = apply_markdown_command(&mut text, selection, MarkdownCommand::Heading(3));
         assert_eq!(text, "title\nbody");
+        assert_eq!(selection, 0..0);
     }
 
     #[test]
@@ -614,6 +682,7 @@ mod tests {
             ("3. item\n", 8, "3. item\n4. ", 11),
             ("> quote\n", 8, "> quote\n> ", 10),
             ("- [x] done\n", 11, "- [x] done\n- [ ] ", 17),
+            ("- [X] done\n", 11, "- [X] done\n- [ ] ", 17),
             ("  - 中文\n", 7, "  - 中文\n  - ", 11),
         ] {
             let mut text = before.to_owned();
@@ -659,6 +728,23 @@ mod tests {
     }
 
     #[test]
+    fn indentation_and_line_formats_preserve_a_collapsed_cursor() {
+        let mut text = "alpha".to_owned();
+        let selection = indent_selected_lines(&mut text, 5..5, false);
+        assert_eq!(text, "    alpha");
+        assert_eq!(selection, 9..9);
+
+        let selection = apply_markdown_command(&mut text, selection, MarkdownCommand::BulletList);
+        assert_eq!(text, "-     alpha");
+        assert_eq!(selection, 11..11);
+
+        let mut text = "    alpha".to_owned();
+        let selection = indent_selected_lines(&mut text, 9..9, true);
+        assert_eq!(text, "alpha");
+        assert_eq!(selection, 5..5);
+    }
+
+    #[test]
     fn toggles_parenthesized_ordered_lists_without_stacking_markers() {
         let mut text = "1) one\n2) two".to_owned();
         let end = text.chars().count();
@@ -675,6 +761,15 @@ mod tests {
         assert_eq!(text, "Open [documentation](https://example.com) now");
         assert_eq!(cursor, 41..41);
         assert!(paste_url_as_markdown_link(&mut text, 0..0, "not a url").is_none());
+    }
+
+    #[test]
+    fn smart_paste_escapes_labels_and_ambiguous_destinations() {
+        let mut text = "a]b".to_owned();
+        let cursor =
+            paste_url_as_markdown_link(&mut text, 0..3, "https://example.com/a_(b)").unwrap();
+        assert_eq!(text, "[a\\]b](https://example.com/a_%28b%29)");
+        assert_eq!(cursor, text.chars().count()..text.chars().count());
     }
 
     #[test]

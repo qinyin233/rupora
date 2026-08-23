@@ -130,7 +130,8 @@ struct PaneScroll {
 }
 
 struct TableEditorState {
-    document: usize,
+    document_id: u64,
+    base_content: String,
     table: MarkdownTable,
 }
 
@@ -798,7 +799,8 @@ impl RuporaApp {
         let table = table::find_table(&self.documents[index].content, cursor_byte)
             .unwrap_or_else(|| table::new_table(cursor_byte));
         self.table_editor = Some(TableEditorState {
-            document: index,
+            document_id: self.documents[index].id(),
+            base_content: self.documents[index].content.clone(),
             table,
         });
     }
@@ -1774,12 +1776,18 @@ impl RuporaApp {
 
         if apply {
             let state = self.table_editor.take().expect("table editor state");
-            if state.document >= self.documents.len() {
+            let Some(document_index) = self
+                .documents
+                .iter()
+                .position(|document| document.id() == state.document_id)
+            else {
+                self.show_error("表格应用失败", "目标文档已关闭，请重新打开表格编辑器。");
                 return;
-            }
-            let document = &mut self.documents[state.document];
+            };
+            let document = &mut self.documents[document_index];
             let before = document.content.clone();
-            if state.table.range.end > before.len()
+            if before != state.base_content
+                || state.table.range.end > before.len()
                 || !before.is_char_boundary(state.table.range.start)
                 || !before.is_char_boundary(state.table.range.end)
             {
@@ -4942,9 +4950,9 @@ fn paragraph_after_code_double_click(
 
     let tail_range = block.range.start..source.len();
     let mut replacement = source[tail_range.clone()].to_owned();
-    paragraph_after_fenced_code(&mut replacement)
+    let local_selection = paragraph_after_fenced_code(&mut replacement)
         .expect("a complete fenced block must expose a trailing paragraph");
-    let cursor = source[..tail_range.start].chars().count() + replacement.chars().count();
+    let cursor = source[..tail_range.start].chars().count() + local_selection.end;
     let changed = (replacement != source[tail_range.clone()]).then_some(replacement);
     (tail_range, changed, cursor)
 }
@@ -4958,8 +4966,13 @@ fn scroll_ratio(scroll: PaneScroll) -> f32 {
 }
 
 fn is_fenced_code_block(source: &str) -> bool {
-    let trimmed = source.trim_start();
-    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+    let first_line = source.lines().next().unwrap_or_default();
+    let indentation = first_line.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation > 3 || first_line.as_bytes().get(indentation) == Some(&b'\t') {
+        return false;
+    }
+    let marker = &first_line[indentation..];
+    marker.starts_with("```") || marker.starts_with("~~~")
 }
 
 fn hybrid_edit_range(
