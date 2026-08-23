@@ -384,6 +384,32 @@ pub fn local_link_destinations(source: &str) -> Vec<String> {
     destinations
 }
 
+pub fn link_destination_at(source: &str, source_byte: usize) -> Option<String> {
+    Parser::new_ext(source, parser_options())
+        .into_offset_iter()
+        .find_map(|(event, range)| match event {
+            Event::Start(Tag::Link { dest_url, .. })
+                if range.start <= source_byte && source_byte <= range.end =>
+            {
+                Some(dest_url.into_string())
+            }
+            _ => None,
+        })
+}
+
+pub fn toggle_task_marker_at(source: &str, source_byte: usize) -> Option<String> {
+    let (range, checked) = task_markers(source)
+        .into_iter()
+        .find(|(range, _)| range.start <= source_byte && source_byte <= range.end)?;
+    let mut output = source.to_owned();
+    output.replace_range(range, if checked { "[ ]" } else { "[x]" });
+    Some(output)
+}
+
+pub fn is_local_link_destination(destination: &str) -> bool {
+    is_local_link(destination)
+}
+
 pub fn local_image_destinations(source: &str) -> Vec<String> {
     let mut destinations = Parser::new_ext(source, parser_options())
         .filter_map(|event| match event {
@@ -1555,6 +1581,23 @@ mod tests {
         assert!(!is_local_link(r"C:\notes\a.md"));
         assert!(!is_local_link(r"\\server\share\a.md"));
         assert!(!is_local_link("/absolute/a.md"));
+    }
+
+    #[test]
+    fn native_hit_testing_finds_links_and_toggles_only_the_clicked_task() {
+        let link = "before [文档](notes/today.md) after";
+        let inside = link.find("文档").unwrap();
+        assert_eq!(
+            link_destination_at(link, inside).as_deref(),
+            Some("notes/today.md")
+        );
+        assert!(link_destination_at(link, 0).is_none());
+
+        let tasks = "- [ ] first\n- [x] second";
+        let first = tasks.find("[ ]").unwrap() + 1;
+        let updated = toggle_task_marker_at(tasks, first).unwrap();
+        assert_eq!(updated, "- [x] first\n- [x] second");
+        assert!(toggle_task_marker_at(tasks, tasks.find("first").unwrap()).is_none());
     }
 
     #[test]

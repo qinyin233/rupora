@@ -11,7 +11,6 @@ pub mod markdown;
 pub mod merge;
 mod native_preview;
 pub mod recovery;
-pub mod source_map;
 pub mod table;
 pub mod updater;
 pub mod workspace;

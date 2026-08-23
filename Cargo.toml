@@ -54,8 +54,9 @@ eframe = { version = "0.35.0", default-features = false, features = [
     "wayland",
     "x11",
 ] }
-egui_commonmark = { version = "0.24.0", features = [
-    "better_syntax_highlighting",
+egui_extras = { version = "0.35.0", default-features = false, features = [
+    "file",
+    "image",
     "svg",
 ] }
 encoding_rs = "0.8.35"

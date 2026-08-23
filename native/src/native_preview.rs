@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use eframe::egui::{self, Context, Ui};
+use eframe::egui::{self, Context, Response, Ui};
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
 use crate::markdown;
@@ -13,56 +13,26 @@ use crate::markdown;
 pub(crate) const MAX_GENERATED_SVG_CACHE_ENTRIES: usize = 128;
 pub(crate) const MAX_GENERATED_SVG_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
-pub(crate) fn prepare_native_preview(
-    ctx: &Context,
-    source: &str,
-    base_directory: &Path,
-    dark: bool,
-    cache: &mut HashMap<String, Arc<[u8]>>,
-) -> String {
-    let mut output = markdown::prepare_preview_markdown(source);
-    for block in markdown::mermaid_blocks(&output).into_iter().rev() {
-        let key = generated_svg_key("mermaid", &block.source, dark);
-        let rendered = if let Some(bytes) = cache.get(&key) {
-            Ok(bytes.clone())
-        } else {
-            markdown::render_mermaid_svg(&block.source, dark).and_then(|svg| {
-                let bytes = Arc::<[u8]>::from(svg.into_bytes());
-                cache_generated_svg(ctx, cache, key.clone(), bytes.clone())
-                    .then_some(bytes)
-                    .ok_or_else(|| "图表超过预览缓存资源预算".to_owned())
-            })
-        };
-        let replacement = match rendered {
-            Ok(bytes) => {
-                let uri = format!("bytes://rupora/{key}.svg");
-                ctx.include_bytes(uri.clone(), egui::load::Bytes::Shared(bytes));
-                format!("\n\n![Mermaid diagram]({uri})\n\n")
-            }
-            Err(error) => format!(
-                "\n\n> **Mermaid 图表错误：** {}\n\n",
-                error.replace('\n', " ")
-            ),
-        };
-        output.replace_range(block.range, &replacement);
-    }
-    replace_missing_local_images(&output, base_directory)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeImage {
+    pub range: std::ops::Range<usize>,
+    pub destination: String,
+    pub alt: String,
 }
 
-#[derive(Debug)]
-struct PreviewImage {
-    range: std::ops::Range<usize>,
-    destination: String,
-    alt: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeMath {
+    pub range: std::ops::Range<usize>,
+    pub source: String,
 }
 
-fn replace_missing_local_images(source: &str, base_directory: &Path) -> String {
+pub(crate) fn standalone_image(source: &str) -> Option<NativeImage> {
     let mut images = Vec::new();
     let mut active = None;
     for (event, range) in Parser::new_ext(source, markdown::parser_options()).into_offset_iter() {
         match event {
             Event::Start(Tag::Image { dest_url, .. }) => {
-                active = Some(PreviewImage {
+                active = Some(NativeImage {
                     range,
                     destination: dest_url.into_string(),
                     alt: String::new(),
@@ -74,44 +44,76 @@ fn replace_missing_local_images(source: &str, base_directory: &Path) -> String {
                 }
             }
             Event::End(TagEnd::Image) => {
-                if let Some(image) = active.take()
-                    && local_image_is_missing(base_directory, &image.destination)
-                {
+                if let Some(image) = active.take() {
                     images.push(image);
                 }
             }
             _ => {}
         }
     }
-    if images.is_empty() {
-        return source.to_owned();
-    }
-
-    let mut output = source.to_owned();
-    for image in images.into_iter().rev() {
-        let alt = single_line_markdown_text(&image.alt, "未命名图片");
-        let destination = single_line_markdown_text(&image.destination, "未知路径");
-        let replacement = format!("\n\n> **图片不可用：{alt}**  \n> 路径：`{destination}`\n\n");
-        output.replace_range(image.range, &replacement);
-    }
-    output
+    let image = images.pop()?;
+    images.is_empty().then_some(())?;
+    source[..image.range.start]
+        .trim()
+        .is_empty()
+        .then_some(())?;
+    source[image.range.end..].trim().is_empty().then_some(image)
 }
 
-fn local_image_is_missing(base_directory: &Path, destination: &str) -> bool {
-    let path_part = destination.split(['?', '#']).next().unwrap_or_default();
-    if path_part.is_empty() || has_uri_scheme(path_part) {
-        return false;
+pub(crate) fn standalone_display_math(source: &str) -> Option<NativeMath> {
+    let mut math = None;
+    for (event, range) in Parser::new_ext(source, markdown::parser_options()).into_offset_iter() {
+        match event {
+            Event::DisplayMath(value) if math.is_none() => {
+                math = Some(NativeMath {
+                    range,
+                    source: value.into_string(),
+                });
+            }
+            Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph) => {}
+            Event::Text(value) if value.trim().is_empty() => {}
+            Event::SoftBreak | Event::HardBreak => {}
+            Event::DisplayMath(_) => return None,
+            _ => return None,
+        }
     }
-    let Some(decoded) = percent_decode_path(path_part) else {
-        return true;
-    };
+    math
+}
+
+pub(crate) fn standalone_mermaid(source: &str) -> Option<markdown::MermaidBlock> {
+    let mut blocks = markdown::mermaid_blocks(source);
+    let block = blocks.pop()?;
+    blocks.is_empty().then_some(())?;
+    source[..block.range.start]
+        .trim()
+        .is_empty()
+        .then_some(())?;
+    source[block.range.end..].trim().is_empty().then_some(block)
+}
+
+pub(crate) fn document_image_uri(
+    base_directory: &Path,
+    destination: &str,
+) -> Result<String, String> {
+    let path_part = destination.split(['?', '#']).next().unwrap_or_default();
+    if path_part.is_empty() {
+        return Err("图片路径为空".to_owned());
+    }
+    if has_uri_scheme(path_part) {
+        return Err("远程图片不会自动联网加载".to_owned());
+    }
+    let decoded = percent_decode_path(path_part).ok_or_else(|| "图片路径编码无效".to_owned())?;
     let path = PathBuf::from(decoded);
     let resolved = if path.is_absolute() {
         path
     } else {
         base_directory.join(path)
     };
-    !resolved.is_file()
+    if !resolved.is_file() {
+        return Err(format!("找不到图片：{}", resolved.display()));
+    }
+    let absolute = resolved.canonicalize().unwrap_or(resolved);
+    Ok(path_to_file_uri(&absolute))
 }
 
 fn has_uri_scheme(value: &str) -> bool {
@@ -148,13 +150,25 @@ const fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
-fn single_line_markdown_text(value: &str, fallback: &str) -> String {
-    let value = value.trim().replace(['\r', '\n'], " ");
-    let value = value.replace('`', "'").replace('*', "\\*");
-    if value.is_empty() {
-        fallback.to_owned()
+fn path_to_file_uri(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::with_capacity(normalized.len() + 16);
+    for byte in normalized.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/' | b':') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    if cfg!(target_os = "windows") {
+        if encoded.starts_with("//") {
+            format!("file:{encoded}")
+        } else {
+            format!("file:///{encoded}")
+        }
     } else {
-        value
+        format!("file://{encoded}")
     }
 }
 
@@ -164,7 +178,7 @@ pub(crate) fn render_math_widget(
     math: &str,
     inline: bool,
     dark: bool,
-) {
+) -> Response {
     let kind = if inline {
         "math-inline"
     } else {
@@ -187,24 +201,48 @@ pub(crate) fn render_math_widget(
                 .ok_or_else(|| "公式超过预览缓存资源预算".to_owned())
         })
     };
+    show_generated_svg(ui, key, rendered, format!("公式错误：{math}"))
+}
+
+pub(crate) fn render_mermaid_widget(
+    ui: &mut Ui,
+    cache: &mut HashMap<String, Arc<[u8]>>,
+    source: &str,
+    dark: bool,
+) -> Response {
+    let key = generated_svg_key("mermaid", source, dark);
+    let rendered = if let Some(bytes) = cache.get(&key) {
+        Ok(bytes.clone())
+    } else {
+        markdown::render_mermaid_svg(source, dark).and_then(|svg| {
+            let bytes = Arc::<[u8]>::from(svg.into_bytes());
+            cache_generated_svg(ui.ctx(), cache, key.clone(), bytes.clone())
+                .then_some(bytes)
+                .ok_or_else(|| "图表超过预览缓存资源预算".to_owned())
+        })
+    };
+    show_generated_svg(ui, key, rendered, "Mermaid 图表错误".to_owned())
+}
+
+fn show_generated_svg(
+    ui: &mut Ui,
+    key: String,
+    rendered: Result<Arc<[u8]>, String>,
+    error_prefix: String,
+) -> Response {
     match rendered {
-        Ok(bytes) => {
-            let uri = format!("bytes://rupora/{key}.svg");
-            ui.add(
-                egui::Image::new(egui::ImageSource::Bytes {
-                    uri: uri.into(),
-                    bytes: egui::load::Bytes::Shared(bytes),
-                })
-                .fit_to_original_size(1.0)
-                .max_width(ui.available_width()),
-            );
-        }
-        Err(error) => {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                format!("公式错误：{math}（{error}）"),
-            );
-        }
+        Ok(bytes) => ui.add(
+            egui::Image::new(egui::ImageSource::Bytes {
+                uri: format!("bytes://rupora/{key}.svg").into(),
+                bytes: egui::load::Bytes::Shared(bytes),
+            })
+            .fit_to_original_size(1.0)
+            .max_width(ui.available_width()),
+        ),
+        Err(error) => ui.colored_label(
+            ui.visuals().error_fg_color,
+            format!("{error_prefix}（{}）", error.replace('\n', " ")),
+        ),
     }
 }
 
@@ -244,42 +282,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_local_images_become_readable_placeholders() {
-        let directory = tempfile::tempdir().unwrap();
-        let source = "before\n\n![审计截图](missing%20image.png)\n\nafter";
-        let preview = replace_missing_local_images(source, directory.path());
-
-        assert!(preview.contains("图片不可用：审计截图"));
-        assert!(preview.contains("missing%20image.png"));
-        assert!(!preview.contains("![审计截图]"));
-        assert!(preview.contains("before"));
-        assert!(preview.contains("after"));
+    fn recognizes_only_standalone_markdown_images() {
+        let image = standalone_image("![审计截图](missing%20image.png)").unwrap();
+        assert_eq!(image.alt, "审计截图");
+        assert_eq!(image.destination, "missing%20image.png");
+        assert!(standalone_image("before ![inline](image.png) after").is_none());
+        assert!(standalone_image("![one](1.png) ![two](2.png)").is_none());
     }
 
     #[test]
-    fn existing_and_remote_images_remain_unchanged() {
+    fn resolves_existing_local_images_and_reports_missing_or_remote_ones() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("present image.png"), b"image").unwrap();
-        for source in [
-            "![存在](present%20image.png)",
-            "![远程](https://example.invalid/image.png)",
-            "![内存](bytes://rupora/generated.svg)",
-        ] {
-            assert_eq!(
-                replace_missing_local_images(source, directory.path()),
-                source
-            );
-        }
+        let uri = document_image_uri(directory.path(), "present%20image.png").unwrap();
+        assert!(uri.starts_with("file://"));
+        assert!(uri.ends_with("present%20image.png"));
+        assert!(document_image_uri(directory.path(), "missing.png").is_err());
+        assert!(document_image_uri(directory.path(), "https://example.invalid/image.png").is_err());
     }
 
     #[test]
-    fn missing_image_placeholder_escapes_active_markdown() {
-        let directory = tempfile::tempdir().unwrap();
-        let preview =
-            replace_missing_local_images("![**危险**](missing`name.png)", directory.path());
+    fn recognizes_standalone_display_math_and_mermaid() {
+        let math = standalone_display_math("$$x^2 + y^2$$").unwrap();
+        assert_eq!(math.source, "x^2 + y^2");
+        assert!(standalone_display_math("before $x$ after").is_none());
 
-        assert!(preview.contains("图片不可用：危险"));
-        assert!(!preview.contains("**危险**"));
-        assert!(preview.contains("missing'name.png"));
+        let diagram = standalone_mermaid("```mermaid\nflowchart LR\nA --> B\n```").unwrap();
+        assert_eq!(diagram.source, "flowchart LR\nA --> B\n");
+        assert!(standalone_mermaid("```rust\nlet x = 1;\n```").is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_percent_encoded_image_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(document_image_uri(directory.path(), "bad%ZZ.png").is_err());
     }
 }

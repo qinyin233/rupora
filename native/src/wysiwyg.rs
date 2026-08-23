@@ -15,6 +15,8 @@ pub struct VisualStyle {
     pub marker: bool,
     pub quote: bool,
     pub footnote: bool,
+    pub table: bool,
+    pub table_header: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +54,8 @@ struct FormatState {
     code: usize,
     link: usize,
     quote: usize,
+    table: usize,
+    table_header: usize,
 }
 
 impl FormatState {
@@ -66,6 +70,8 @@ impl FormatState {
             marker: false,
             quote: self.quote > 0,
             footnote: false,
+            table: self.table > 0,
+            table_header: self.table_header > 0,
         }
     }
 }
@@ -127,6 +133,8 @@ impl VisualProjection {
                                 );
                             }
                         }
+                        Tag::Table(_) => format.table += 1,
+                        Tag::TableHead => format.table_header += 1,
                         Tag::TableRow => table_cells = 0,
                         Tag::TableCell => {
                             if table_cells > 0 {
@@ -204,6 +212,10 @@ impl VisualProjection {
                         TagEnd::Strong => format.strong = format.strong.saturating_sub(1),
                         TagEnd::Strikethrough => {
                             format.strikethrough = format.strikethrough.saturating_sub(1);
+                        }
+                        TagEnd::Table => format.table = format.table.saturating_sub(1),
+                        TagEnd::TableHead => {
+                            format.table_header = format.table_header.saturating_sub(1);
                         }
                         TagEnd::Link | TagEnd::Image => {
                             format.link = format.link.saturating_sub(1);
@@ -474,10 +486,6 @@ pub fn complete_visual_enter(
     } else {
         crate::editing::continue_markdown_line(source, selection.end).unwrap_or(selection)
     }
-}
-
-pub fn contains_footnote_reference(source: &str) -> bool {
-    !standalone_footnote_references(source).is_empty()
 }
 
 pub fn complete_fenced_code_on_enter(
@@ -1173,10 +1181,13 @@ impl ProjectionBuilder {
             visible_cursor = tag.end;
         }
         has_visible_text |= !source[visible_cursor..source_range.end].trim().is_empty();
-        let reveal_tag_only_html = source_selection.is_some()
-            && !has_visible_text
-            && source_range.start == 0
-            && source_range.end == source.len();
+        let tag_only_block =
+            !has_visible_text && source_range.start == 0 && source_range.end == source.len();
+        if tag_only_block && source_selection.is_none() {
+            self.append_marker(source, "◇ HTML", source_range, style);
+            return;
+        }
+        let reveal_tag_only_html = source_selection.is_some() && tag_only_block;
 
         let mut cursor = source_range.start;
         for tag in tags {
@@ -1798,7 +1809,7 @@ mod tests {
         assert_eq!(VisualProjection::from_markdown(block).text(), "文字");
 
         let tag_only = "<img alt=\"diagram\" src=\"image.png\">";
-        assert_eq!(VisualProjection::from_markdown(tag_only).text(), "");
+        assert_eq!(VisualProjection::from_markdown(tag_only).text(), "◇ HTML");
         assert_eq!(
             VisualProjection::from_markdown_with_selection(tag_only, Some(0..0)).text(),
             tag_only

@@ -22,17 +22,19 @@ use crate::{
     extensions::{self, ExtensionInvocation, ExtensionRegistry},
     instance::InstanceCoordinator,
     markdown::{self, BlockId, Heading},
-    native_preview::{prepare_native_preview, render_math_widget},
+    native_preview::{
+        document_image_uri, render_math_widget, render_mermaid_widget, standalone_display_math,
+        standalone_image, standalone_mermaid,
+    },
     recovery::{RecoveryEntry, RecoveryStore},
-    source_map::SourceMap,
     table::{self, MarkdownTable},
     updater::{self, UpdateInfo, UpdateStatus},
     workspace::{Workspace, WorkspaceEntry},
     wysiwyg::{
         VisualProjection, VisualStyle, complete_bare_fenced_code_after_typing,
         complete_fenced_code_on_enter, complete_visual_enter, consume_paired_fenced_code_closer,
-        contains_footnote_reference, fenced_code_content, fenced_code_language,
-        move_across_hidden_inline_code_boundary, paragraph_after_fenced_code,
+        fenced_code_content, fenced_code_language, move_across_hidden_inline_code_boundary,
+        paragraph_after_fenced_code,
     },
 };
 use eframe::{
@@ -44,8 +46,6 @@ use eframe::{
         text::{CCursor, CCursorRange, LayoutJob, TextFormat},
     },
 };
-use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use pulldown_cmark::{Event as MarkdownEvent, Parser, Tag, TagEnd};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
 const APP_STATE_KEY: &str = "rupora-native-state";
@@ -170,7 +170,6 @@ pub struct RuporaApp {
     next_untitled_id: usize,
     state: PersistedState,
     status: String,
-    preview_cache: CommonMarkCache,
     allow_close: bool,
     discard_recovery_on_exit: bool,
     recovery_store: RecoveryStore,
@@ -235,6 +234,7 @@ impl RuporaApp {
         instance_coordinator: Option<InstanceCoordinator>,
     ) -> Self {
         install_fonts(&creation_context.egui_ctx);
+        egui_extras::install_image_loaders(&creation_context.egui_ctx);
         let mut state: PersistedState = creation_context
             .storage
             .and_then(|storage| eframe::get_value(storage, APP_STATE_KEY))
@@ -272,7 +272,6 @@ impl RuporaApp {
             next_untitled_id: 1,
             state,
             status: "纯 Rust 原生内核已就绪".to_owned(),
-            preview_cache: CommonMarkCache::default(),
             allow_close: false,
             discard_recovery_on_exit: false,
             recovery_store,
@@ -3078,102 +3077,116 @@ impl RuporaApp {
         scroll_offset: Option<f32>,
     ) -> PaneScroll {
         let viewport_height = ui.available_height();
-        let before_content = self.documents[index].content.clone();
+        let source = self.documents[index].content.clone();
+        let blocks = self.documents[index].blocks().to_vec();
+        let document_id = self.documents[index].id();
         let base_path = self.preview_base_path(index);
-        let mut preview_content = prepare_native_preview(
-            ui.ctx(),
-            &before_content,
-            &base_path,
-            self.state.dark,
-            &mut self.generated_svg_cache.borrow_mut(),
-        );
-        let base_uri = self.preview_base_uri(index);
-        let local_links = markdown::local_link_destinations(&before_content);
+        let svg_cache = self.generated_svg_cache.clone();
+        let dark = self.state.dark;
         let palette = app_palette(self.state.dark);
-        self.preview_cache.link_hooks_clear();
-        for destination in &local_links {
-            self.preview_cache.add_link_hook(destination);
+        let mut task_toggle = None;
+        let mut clicked_destination = None;
+        let mut scroll_area = ScrollArea::vertical().id_salt(("preview-scroll", index));
+        if let Some(offset) = scroll_offset {
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
         }
-
-        let changed = {
-            let cache = &mut self.preview_cache;
-            let svg_cache = self.generated_svg_cache.clone();
-            let dark = self.state.dark;
-            let render_math = move |ui: &mut Ui, math: &str, inline: bool| {
-                render_math_widget(ui, &mut svg_cache.borrow_mut(), math, inline, dark);
-            };
-            let mut scroll_area = ScrollArea::vertical().id_salt(("preview-scroll", index));
-            if let Some(offset) = scroll_offset {
-                scroll_area = scroll_area.vertical_scroll_offset(offset);
-            }
-            scroll_area.show(ui, |ui| {
-                ui.add_space(28.0);
-                let available_width = ui.available_width();
-                let page_width = (available_width - 48.0)
-                    .clamp(280.0, 860.0)
-                    .min(available_width);
-                let side_margin = ((available_width - page_width) * 0.5).max(0.0);
-                let changed = ui
-                    .horizontal(|ui| {
-                        ui.add_space(side_margin);
-                        egui::Frame::new()
-                            .fill(palette.surface)
-                            .stroke(Stroke::new(1.0, palette.border))
-                            .corner_radius(12)
-                            .shadow(egui::epaint::Shadow {
-                                offset: [0, 4],
-                                blur: 18,
-                                spread: 0,
-                                color: if self.state.dark {
-                                    Color32::from_black_alpha(48)
-                                } else {
-                                    Color32::from_black_alpha(18)
-                                },
-                            })
-                            .inner_margin(Margin::symmetric(56, 38))
-                            .show(ui, |ui| {
-                                ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                                    ui.set_width((page_width - 112.0).max(160.0));
-                                    ui.set_min_height((viewport_height - 142.0).max(480.0));
-                                    CommonMarkViewer::new()
-                                        .default_implicit_uri_scheme(base_uri)
-                                        .enable_scroll_to_heading(true)
-                                        .render_math_fn(Some(&render_math))
-                                        .show_mut(ui, cache, &mut preview_content)
-                                        .response
-                                        .changed()
-                                })
-                                .inner
-                            })
-                            .inner
+        let output = scroll_area.show(ui, |ui| {
+            ui.add_space(28.0);
+            let available_width = ui.available_width();
+            let page_width = (available_width - 48.0)
+                .clamp(280.0, 860.0)
+                .min(available_width);
+            let side_margin = ((available_width - page_width) * 0.5).max(0.0);
+            ui.horizontal(|ui| {
+                ui.add_space(side_margin);
+                egui::Frame::new()
+                    .fill(palette.surface)
+                    .stroke(Stroke::new(1.0, palette.border))
+                    .corner_radius(12)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 4],
+                        blur: 18,
+                        spread: 0,
+                        color: if self.state.dark {
+                            Color32::from_black_alpha(48)
+                        } else {
+                            Color32::from_black_alpha(18)
+                        },
                     })
-                    .inner;
-                ui.add_space(40.0);
-                changed
-            })
-        };
-
-        if changed.inner
-            && let Some(next_content) =
-                markdown::synchronize_task_markers(&before_content, &preview_content)
-        {
-            self.documents[index].content = next_content;
-            self.documents[index].record_edit(before_content, None, None, EditKind::TaskList);
+                    .inner_margin(Margin::symmetric(56, 38))
+                    .show(ui, |ui| {
+                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                            ui.set_width((page_width - 112.0).max(160.0));
+                            ui.set_min_height((viewport_height - 142.0).max(480.0));
+                            for block in &blocks {
+                                let source_block = &source[block.range.clone()];
+                                let code = fenced_code_content(source_block);
+                                let preview = show_native_block_preview(
+                                    ui,
+                                    source_block,
+                                    &base_path,
+                                    dark,
+                                    &mut svg_cache.borrow_mut(),
+                                    palette,
+                                );
+                                let response = ui.interact(
+                                    preview.rect,
+                                    ui.make_persistent_id(("native-preview-block", block.id)),
+                                    egui::Sense::click(),
+                                );
+                                if response.clicked()
+                                    && let Some(position) = response.interact_pointer_pos()
+                                {
+                                    let local_source_byte =
+                                        preview.mapping.source_byte_at_position(
+                                            source_block,
+                                            preview.rect,
+                                            position,
+                                        );
+                                    if let Some(updated) = markdown::toggle_task_marker_at(
+                                        source_block,
+                                        local_source_byte,
+                                    ) {
+                                        task_toggle = Some((block.range.clone(), updated));
+                                    } else if let Some(destination) = markdown::link_destination_at(
+                                        source_block,
+                                        local_source_byte,
+                                    ) {
+                                        clicked_destination = Some(destination);
+                                    }
+                                }
+                                if let Some(code) = code {
+                                    let _ = show_code_copy_button(
+                                        ui,
+                                        (document_id, block.id),
+                                        preview.rect,
+                                        code,
+                                        palette,
+                                    );
+                                }
+                                ui.add_space(12.0);
+                            }
+                            ui.add_space(60.0);
+                        });
+                    });
+            });
+            ui.add_space(40.0);
+        });
+        if let Some((range, updated)) = task_toggle {
+            self.documents[index].content.replace_range(range, &updated);
+            self.documents[index].record_edit(source, None, None, EditKind::TaskList);
             self.status = "已更新任务列表".to_owned();
         }
-        let clicked_link = local_links
-            .into_iter()
-            .find(|destination| self.preview_cache.get_link_hook(destination) == Some(true));
-        if let Some(destination) = clicked_link {
-            self.open_local_preview_link(index, &destination);
+        if let Some(destination) = clicked_destination {
+            self.open_preview_destination(index, &destination);
         }
         PaneScroll {
-            offset: changed.state.offset.y,
-            maximum: (changed.content_size.y - changed.inner_rect.height()).max(0.0),
+            offset: output.state.offset.y,
+            maximum: (output.content_size.y - output.inner_rect.height()).max(0.0),
             hovered: ui
                 .ctx()
                 .pointer_hover_pos()
-                .is_some_and(|position| changed.inner_rect.contains(position)),
+                .is_some_and(|position| output.inner_rect.contains(position)),
         }
     }
 
@@ -3235,33 +3248,9 @@ impl RuporaApp {
         let cursor_before = self.editor_cursor;
         let selection_before = cursor_before.map(cursor_range_to_char_range);
         let blocks = self.documents[index].blocks().to_vec();
-        let base_uri = self.preview_base_uri(index);
         let base_path = self.preview_base_path(index);
-        let local_links = markdown::local_link_destinations(&source);
-        let preview_blocks = blocks
-            .iter()
-            .map(|block| {
-                (
-                    block.id,
-                    prepare_native_preview(
-                        ui.ctx(),
-                        &source[block.range.clone()],
-                        &base_path,
-                        self.state.dark,
-                        &mut self.generated_svg_cache.borrow_mut(),
-                    ),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        self.preview_cache.link_hooks_clear();
-        for destination in &local_links {
-            self.preview_cache.add_link_hook(destination);
-        }
         let svg_cache = self.generated_svg_cache.clone();
         let dark = self.state.dark;
-        let render_math = move |ui: &mut Ui, math: &str, inline: bool| {
-            render_math_widget(ui, &mut svg_cache.borrow_mut(), math, inline, dark);
-        };
 
         let mut pending_source_cursor = self.pending_editor_cursor.take();
         if let Some(cursor_range) = pending_source_cursor {
@@ -3291,6 +3280,7 @@ impl RuporaApp {
         let mut active_editor_rect = None;
         let mut pointer_regions = Vec::<HybridPointerRegion>::new();
         let mut copied_code_block = false;
+        let mut clicked_destination = None;
         let palette = app_palette(self.state.dark);
 
         ScrollArea::vertical()
@@ -3469,12 +3459,28 @@ impl RuporaApp {
 
                                             let block_is_code =
                                                 is_fenced_code_block(&original_block);
+                                            let block_is_table =
+                                                is_native_table_block(&original_block);
+                                            let block_is_quote =
+                                                is_native_quote_block(&original_block);
                                             let frame = if block_is_code {
                                                 egui::Frame::new()
                                                     .fill(palette.code_bg)
                                                     .stroke(Stroke::new(1.0, palette.border))
                                                     .corner_radius(8)
                                                     .inner_margin(Margin::symmetric(14, 10))
+                                            } else if block_is_table {
+                                                egui::Frame::new()
+                                                    .fill(palette.code_bg.gamma_multiply(0.38))
+                                                    .stroke(Stroke::new(1.0, palette.border))
+                                                    .corner_radius(8)
+                                                    .inner_margin(Margin::symmetric(12, 10))
+                                            } else if block_is_quote {
+                                                egui::Frame::new()
+                                                    .fill(palette.accent_soft.gamma_multiply(0.42))
+                                                    .stroke(Stroke::new(1.0, palette.border))
+                                                    .corner_radius(6)
+                                                    .inner_margin(Margin::symmetric(14, 9))
                                             } else {
                                                 egui::Frame::new()
                                                     .inner_margin(Margin::symmetric(0, 3))
@@ -3536,7 +3542,7 @@ impl RuporaApp {
                                                     rect: output.response.rect,
                                                     atomic_range: block_is_code
                                                         .then(|| block.range.clone()),
-                                                    mapping: HybridPointerMapping::Exact(
+                                                    mapping: NativePointerMapping::Text(
                                                         TextProjectionPreview {
                                                             galley: Arc::clone(&output.galley),
                                                             galley_pos: output.galley_pos,
@@ -3944,43 +3950,21 @@ impl RuporaApp {
                                                 }
                                             }
                                         } else {
-                                            let block_text = preview_blocks
-                                                .get(&block.id)
-                                                .map(String::as_str)
-                                                .unwrap_or(source_block);
-                                            let shown = ui.scope(|ui| {
-                                                ui.add_space(6.0);
-                                                let projection_preview =
-                                                    show_text_projection_preview(
-                                                        ui,
-                                                        source_block,
-                                                        palette,
-                                                    );
-                                                if projection_preview.is_none() {
-                                                    let block_text =
-                                                        preserve_soft_breaks_for_wysiwyg(
-                                                            block_text,
-                                                        );
-                                                    CommonMarkViewer::new()
-                                                        .default_implicit_uri_scheme(
-                                                            base_uri.clone(),
-                                                        )
-                                                        .render_math_fn(Some(&render_math))
-                                                        .show(
-                                                            ui,
-                                                            &mut self.preview_cache,
-                                                            &block_text,
-                                                        );
-                                                }
-                                                ui.add_space(6.0);
-                                                projection_preview
-                                            });
-                                            let projection_preview = shown.inner;
+                                            ui.add_space(6.0);
+                                            let preview = show_native_block_preview(
+                                                ui,
+                                                source_block,
+                                                &base_path,
+                                                dark,
+                                                &mut svg_cache.borrow_mut(),
+                                                palette,
+                                            );
+                                            ui.add_space(6.0);
                                             let activation_id =
                                                 ui.make_persistent_id(("activate-block", block.id));
                                             let response = ui
                                                 .interact(
-                                                    shown.response.rect,
+                                                    preview.rect,
                                                     activation_id,
                                                     egui::Sense::click_and_drag(),
                                                 )
@@ -3995,55 +3979,52 @@ impl RuporaApp {
                                             pointer_regions.push(HybridPointerRegion {
                                                 block_id: block.id,
                                                 source_range: block.range.clone(),
-                                                rect: shown.response.rect,
-                                                atomic_range: block_is_code
+                                                rect: preview.rect,
+                                                atomic_range: (block_is_code || preview.atomic)
                                                     .then(|| block.range.clone()),
-                                                mapping: projection_preview
-                                                    .as_ref()
-                                                    .cloned()
-                                                    .map_or(
-                                                        HybridPointerMapping::Approximate,
-                                                        HybridPointerMapping::Exact,
-                                                    ),
+                                                mapping: preview.mapping.clone(),
                                             });
                                             if response.clicked() {
                                                 let local_source_byte = response
                                                     .interact_pointer_pos()
                                                     .map(|position| {
-                                                        projection_preview.as_ref().map_or_else(
-                                                            || {
-                                                                let width =
-                                                                    response.rect.width().max(1.0);
-                                                                let height =
-                                                                    response.rect.height().max(1.0);
-                                                                SourceMap::from_markdown(
-                                                                    source_block,
-                                                                )
-                                                                .source_byte_at_normalized_point(
-                                                                    (position.x
-                                                                        - response.rect.left())
-                                                                        / width,
-                                                                    (position.y
-                                                                        - response.rect.top())
-                                                                        / height,
-                                                                )
-                                                            },
-                                                            |preview| {
-                                                                preview.source_byte_at_position(
-                                                                    source_block,
-                                                                    position,
-                                                                )
-                                                            },
+                                                        preview.mapping.source_byte_at_position(
+                                                            source_block,
+                                                            preview.rect,
+                                                            position,
                                                         )
                                                     })
                                                     .unwrap_or_default();
-                                                activate = Some((
-                                                    block.id,
-                                                    block.range.start + local_source_byte,
-                                                ));
+                                                let command_click =
+                                                    ui.input(|input| input.modifiers.command);
+                                                if let Some(updated) =
+                                                    markdown::toggle_task_marker_at(
+                                                        source_block,
+                                                        local_source_byte,
+                                                    )
+                                                {
+                                                    pending_edit = Some((
+                                                        block.range.clone(),
+                                                        updated,
+                                                        EditKind::TaskList,
+                                                    ));
+                                                } else if command_click
+                                                    && let Some(destination) =
+                                                        markdown::link_destination_at(
+                                                            source_block,
+                                                            local_source_byte,
+                                                        )
+                                                {
+                                                    clicked_destination = Some(destination);
+                                                } else {
+                                                    activate = Some((
+                                                        block.id,
+                                                        block.range.start + local_source_byte,
+                                                    ));
+                                                }
                                             }
                                             if block_is_code {
-                                                code_surface_rect = Some(shown.response.rect);
+                                                code_surface_rect = Some(preview.rect);
                                             }
                                         }
                                     });
@@ -4110,6 +4091,9 @@ impl RuporaApp {
         if copied_code_block {
             self.status = "已复制代码块".to_owned();
         }
+        if let Some(destination) = clicked_destination {
+            self.open_preview_destination(index, &destination);
+        }
 
         let pointer = ui.input(|input| {
             (
@@ -4149,6 +4133,21 @@ impl RuporaApp {
                     current_block,
                     current_char,
                 );
+                self.hybrid_cross_selection = Some(HybridCrossSelection {
+                    document_id,
+                    cursor,
+                });
+                next_global_cursor = Some(cursor);
+            } else if Some(current_block) != active_id
+                && anchor.source_char != current_char
+                && let Some(atomic) = pointer_regions
+                    .iter()
+                    .find(|region| region.block_id == current_block)
+                    .and_then(|region| region.atomic_range.clone())
+            {
+                let start = source[..atomic.start].chars().count();
+                let end = source[..atomic.end].chars().count();
+                let cursor = CCursorRange::two(CCursor::new(start), CCursor::new(end));
                 self.hybrid_cross_selection = Some(HybridCrossSelection {
                     document_id,
                     cursor,
@@ -4222,17 +4221,6 @@ impl RuporaApp {
             self.queue_editor_selection(char_start..char_start);
         }
         self.hybrid_ime_session = ime_session;
-
-        let clicked_link = local_links
-            .into_iter()
-            .find(|destination| self.preview_cache.get_link_hook(destination) == Some(true));
-        if let Some(destination) = clicked_link {
-            self.open_local_preview_link(index, &destination);
-        }
-    }
-
-    fn preview_base_uri(&self, index: usize) -> String {
-        file_uri_base(&self.preview_base_path(index))
     }
 
     fn preview_base_path(&self, index: usize) -> PathBuf {
@@ -4248,6 +4236,19 @@ impl RuporaApp {
             .map(Path::to_path_buf)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    fn open_preview_destination(&mut self, index: usize, destination: &str) {
+        if destination.starts_with('#') {
+            self.status = format!("文档内锚点：{destination}");
+            return;
+        }
+        let path_part = destination.split(['#', '?']).next().unwrap_or(destination);
+        if markdown::is_local_link_destination(destination) || Path::new(path_part).is_absolute() {
+            self.open_local_preview_link(index, destination);
+        } else if let Err(error) = open::that(destination) {
+            self.status = format!("无法打开链接 {destination}：{error}");
+        }
     }
 
     fn open_local_preview_link(&mut self, index: usize, destination: &str) {
@@ -5131,9 +5132,40 @@ impl TextProjectionPreview {
 }
 
 #[derive(Clone)]
-enum HybridPointerMapping {
-    Exact(TextProjectionPreview),
-    Approximate,
+enum NativePointerMapping {
+    Text(TextProjectionPreview),
+    Atomic {
+        source_range: std::ops::Range<usize>,
+    },
+}
+
+impl NativePointerMapping {
+    fn source_byte_at_position(
+        &self,
+        source: &str,
+        rect: egui::Rect,
+        position: egui::Pos2,
+    ) -> usize {
+        match self {
+            Self::Text(preview) => preview.source_byte_at_position(source, position),
+            Self::Atomic { source_range } => {
+                if position.y < rect.center().y
+                    || (position.y == rect.center().y && position.x < rect.center().x)
+                {
+                    source_range.start
+                } else {
+                    source_range.end
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NativeBlockPreview {
+    rect: egui::Rect,
+    mapping: NativePointerMapping,
+    atomic: bool,
 }
 
 #[derive(Clone)]
@@ -5142,7 +5174,7 @@ struct HybridPointerRegion {
     source_range: std::ops::Range<usize>,
     rect: egui::Rect,
     atomic_range: Option<std::ops::Range<usize>>,
-    mapping: HybridPointerMapping,
+    mapping: NativePointerMapping,
 }
 
 impl HybridPointerRegion {
@@ -5151,19 +5183,9 @@ impl HybridPointerRegion {
             return None;
         }
         let block_source = source.get(self.source_range.clone())?;
-        let local_byte = match &self.mapping {
-            HybridPointerMapping::Exact(preview) => {
-                preview.source_byte_at_position(block_source, position)
-            }
-            HybridPointerMapping::Approximate => {
-                let width = self.rect.width().max(1.0);
-                let height = self.rect.height().max(1.0);
-                SourceMap::from_markdown(block_source).source_byte_at_normalized_point(
-                    (position.x - self.rect.left()) / width,
-                    (position.y - self.rect.top()) / height,
-                )
-            }
-        };
+        let local_byte = self
+            .mapping
+            .source_byte_at_position(block_source, self.rect, position);
         let byte = (self.source_range.start + local_byte).min(source.len());
         Some(source[..byte].chars().count())
     }
@@ -5210,41 +5232,24 @@ fn paint_hybrid_cross_selection(
             );
             continue;
         }
-        match &region.mapping {
-            HybridPointerMapping::Exact(preview) => {
-                let visual = preview
-                    .projection
-                    .visual_char_range(block_source, local_source);
-                if visual.is_empty() {
-                    continue;
-                }
-                let mut galley = Arc::clone(&preview.galley);
-                egui::text_selection::visuals::paint_text_selection(
-                    &mut galley,
-                    ui.visuals(),
-                    &CCursorRange::two(CCursor::new(visual.start), CCursor::new(visual.end)),
-                    None,
-                );
-                ui.painter()
-                    .galley(preview.galley_pos, galley, ui.visuals().text_color());
-            }
-            HybridPointerMapping::Approximate => {
-                let length = block_source.chars().count().max(1);
-                let left = region.rect.left()
-                    + region.rect.width() * local_source.start as f32 / length as f32;
-                let right = region.rect.left()
-                    + region.rect.width() * local_source.end as f32 / length as f32;
-                let rect = egui::Rect::from_min_max(
-                    egui::pos2(left.min(right), region.rect.top()),
-                    egui::pos2(left.max(right), region.rect.bottom()),
-                );
-                ui.painter().rect_filled(
-                    rect,
-                    2.0,
-                    ui.visuals().selection.bg_fill.gamma_multiply(0.45),
-                );
-            }
+        let NativePointerMapping::Text(preview) = &region.mapping else {
+            continue;
+        };
+        let visual = preview
+            .projection
+            .visual_char_range(block_source, local_source);
+        if visual.is_empty() {
+            continue;
         }
+        let mut galley = Arc::clone(&preview.galley);
+        egui::text_selection::visuals::paint_text_selection(
+            &mut galley,
+            ui.visuals(),
+            &CCursorRange::two(CCursor::new(visual.start), CCursor::new(visual.end)),
+            None,
+        );
+        ui.painter()
+            .galley(preview.galley_pos, galley, ui.visuals().text_color());
     }
 }
 
@@ -5306,10 +5311,7 @@ fn show_text_projection_preview(
     ui: &mut Ui,
     source: &str,
     palette: AppPalette,
-) -> Option<TextProjectionPreview> {
-    if !supports_text_projection_preview(source) {
-        return None;
-    }
+) -> TextProjectionPreview {
     let projection = VisualProjection::from_markdown(source);
     let runs = projection.runs_for(projection.text());
     let galley = wysiwyg_layout(
@@ -5326,86 +5328,188 @@ fn show_text_projection_preview(
     ));
     ui.painter()
         .galley(galley_pos, Arc::clone(&galley), palette.text);
-    Some(TextProjectionPreview {
+    TextProjectionPreview {
         galley,
         galley_pos,
         projection,
-    })
+    }
 }
 
-fn preserve_soft_breaks_for_wysiwyg(source: &str) -> std::borrow::Cow<'_, str> {
-    if !source.contains(['\n', '\r']) {
-        return std::borrow::Cow::Borrowed(source);
+fn show_native_block_preview(
+    ui: &mut Ui,
+    source: &str,
+    base_directory: &Path,
+    dark: bool,
+    svg_cache: &mut HashMap<String, Arc<[u8]>>,
+    palette: AppPalette,
+) -> NativeBlockPreview {
+    if let Some(diagram) = standalone_mermaid(source) {
+        let response = egui::Frame::new()
+            .fill(palette.code_bg)
+            .stroke(Stroke::new(1.0, palette.border))
+            .corner_radius(8)
+            .inner_margin(Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("MERMAID")
+                        .monospace()
+                        .size(11.0)
+                        .color(palette.secondary),
+                );
+                ui.add_space(8.0);
+                render_mermaid_widget(ui, svg_cache, &diagram.source, dark);
+            })
+            .response;
+        return NativeBlockPreview {
+            rect: response.rect,
+            mapping: NativePointerMapping::Atomic {
+                source_range: diagram.range,
+            },
+            atomic: true,
+        };
     }
 
-    let mut output = String::with_capacity(source.len());
-    let mut cursor = 0usize;
-    for (event, range) in Parser::new_ext(source, markdown::parser_options()).into_offset_iter() {
-        if !matches!(event, MarkdownEvent::SoftBreak) {
-            continue;
-        }
-        output.push_str(&source[cursor..range.start]);
-        let line_break = &source[range.clone()];
-        let before = &source[..range.start];
-        if before.ends_with("  ") || before.ends_with('\\') {
-            output.push_str(line_break);
-        } else {
-            output.push_str("  ");
-            output.push_str(line_break);
-        }
-        cursor = range.end;
+    if let Some(math) = standalone_display_math(source) {
+        let response = egui::Frame::new()
+            .fill(palette.code_bg.gamma_multiply(0.45))
+            .stroke(Stroke::new(1.0, palette.border))
+            .corner_radius(8)
+            .inner_margin(Margin::symmetric(16, 14))
+            .show(ui, |ui| {
+                ui.centered_and_justified(|ui| {
+                    render_math_widget(ui, svg_cache, &math.source, false, dark);
+                });
+            })
+            .response;
+        return NativeBlockPreview {
+            rect: response.rect,
+            mapping: NativePointerMapping::Atomic {
+                source_range: math.range,
+            },
+            atomic: true,
+        };
     }
-    if cursor == 0 {
-        std::borrow::Cow::Borrowed(source)
+
+    if let Some(image) = standalone_image(source) {
+        let response = egui::Frame::new()
+            .fill(palette.code_bg.gamma_multiply(0.35))
+            .stroke(Stroke::new(1.0, palette.border))
+            .corner_radius(8)
+            .inner_margin(Margin::symmetric(12, 12))
+            .show(ui, |ui| {
+                match document_image_uri(base_directory, &image.destination) {
+                    Ok(uri) => {
+                        ui.vertical_centered(|ui| {
+                            ui.add(
+                                egui::Image::from_uri(uri)
+                                    .alt_text(if image.alt.trim().is_empty() {
+                                        "文档图片"
+                                    } else {
+                                        &image.alt
+                                    })
+                                    .fit_to_original_size(1.0)
+                                    .max_width(ui.available_width())
+                                    .max_height(520.0),
+                            );
+                            if !image.alt.trim().is_empty() {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(&image.alt)
+                                        .size(12.0)
+                                        .color(palette.secondary),
+                                );
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("▧").size(20.0).color(palette.secondary));
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(if image.alt.trim().is_empty() {
+                                        "图片不可用"
+                                    } else {
+                                        &image.alt
+                                    })
+                                    .strong()
+                                    .color(palette.text),
+                                );
+                                ui.label(RichText::new(error).size(12.0).color(palette.secondary));
+                            });
+                        });
+                    }
+                }
+            })
+            .response;
+        return NativeBlockPreview {
+            rect: response.rect,
+            mapping: NativePointerMapping::Atomic {
+                source_range: image.range,
+            },
+            atomic: true,
+        };
+    }
+
+    if is_fenced_code_block(source) {
+        let response = egui::Frame::new()
+            .fill(palette.code_bg)
+            .stroke(Stroke::new(1.0, palette.border))
+            .corner_radius(8)
+            .inner_margin(Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                if let Some(language) = fenced_code_language(source) {
+                    ui.label(
+                        RichText::new(language.to_uppercase())
+                            .monospace()
+                            .size(11.0)
+                            .color(palette.secondary),
+                    );
+                    ui.add_space(4.0);
+                }
+                show_text_projection_preview(ui, source, palette)
+            });
+        return NativeBlockPreview {
+            rect: response.response.rect,
+            mapping: NativePointerMapping::Text(response.inner),
+            atomic: true,
+        };
+    }
+
+    let styled_container = is_native_table_block(source) || is_native_quote_block(source);
+    let shown = styled_container.then(|| {
+        egui::Frame::new()
+            .fill(if is_native_quote_block(source) {
+                palette.accent_soft.gamma_multiply(0.42)
+            } else {
+                palette.code_bg.gamma_multiply(0.38)
+            })
+            .stroke(Stroke::new(1.0, palette.border))
+            .corner_radius(if is_native_quote_block(source) { 6 } else { 8 })
+            .inner_margin(Margin::symmetric(14, 9))
+            .show(ui, |ui| show_text_projection_preview(ui, source, palette))
+    });
+    let (rect, preview) = if let Some(shown) = shown {
+        (shown.response.rect, shown.inner)
     } else {
-        output.push_str(&source[cursor..]);
-        std::borrow::Cow::Owned(output)
+        let preview = show_text_projection_preview(ui, source, palette);
+        (
+            egui::Rect::from_min_size(preview.galley_pos, preview.galley.size()),
+            preview,
+        )
+    };
+    NativeBlockPreview {
+        rect,
+        mapping: NativePointerMapping::Text(preview),
+        atomic: false,
     }
 }
 
-fn supports_text_projection_preview(source: &str) -> bool {
-    // CommonMark deliberately folds soft line breaks to spaces. That is
-    // correct for a read-only preview, but surprising in a WYSIWYG editing
-    // canvas where the source line structure must remain visible.
-    let mut needs_projection = contains_footnote_reference(source) || source.contains(['\n', '\r']);
-    let mut contains_html = false;
-    for event in Parser::new_ext(source, markdown::parser_options()) {
-        match event {
-            MarkdownEvent::Code(_) | MarkdownEvent::FootnoteReference(_) => {
-                needs_projection = true;
-            }
-            MarkdownEvent::Html(_) | MarkdownEvent::InlineHtml(_) => {
-                needs_projection = true;
-                contains_html = true;
-            }
-            MarkdownEvent::Start(
-                Tag::Paragraph
-                | Tag::Heading { .. }
-                | Tag::Emphasis
-                | Tag::Strong
-                | Tag::Strikethrough
-                | Tag::HtmlBlock,
-            )
-            | MarkdownEvent::End(
-                TagEnd::Paragraph
-                | TagEnd::Heading(_)
-                | TagEnd::Emphasis
-                | TagEnd::Strong
-                | TagEnd::Strikethrough
-                | TagEnd::HtmlBlock,
-            )
-            | MarkdownEvent::SoftBreak
-            | MarkdownEvent::HardBreak => {}
-            MarkdownEvent::Text(_) => {}
-            _ => return false,
-        }
-    }
-    needs_projection
-        && (!contains_html
-            || !VisualProjection::from_markdown(source)
-                .text()
-                .trim()
-                .is_empty())
+fn is_native_table_block(source: &str) -> bool {
+    table::find_table(source, 0).is_some()
+}
+
+fn is_native_quote_block(source: &str) -> bool {
+    source.trim_start().starts_with('>')
 }
 
 fn accessible_markdown_block_text(source: &str) -> String {
@@ -5601,7 +5705,7 @@ fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
     };
     let family = if style.code {
         FontFamily::Monospace
-    } else if style.strong || style.heading > 0 {
+    } else if style.strong || style.heading > 0 || style.table_header {
         FontFamily::Name(WYSIWYG_STRONG_FAMILY.into())
     } else {
         FontFamily::Proportional
@@ -5631,8 +5735,13 @@ fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
     } else if style.footnote {
         format.valign = Align::Min;
     }
-    if style.strong || style.heading > 0 {
+    if style.strong || style.heading > 0 || style.table_header {
         format.extra_letter_spacing = 0.2;
+    }
+    if style.table_header {
+        format.background = palette.code_bg.gamma_multiply(0.7);
+    } else if style.table {
+        format.background = palette.surface.gamma_multiply(0.98);
     }
     format.italics = style.emphasis;
     if style.strikethrough {
@@ -5887,20 +5996,6 @@ fn workspace_entries_ui(
         }
     }
     selected
-}
-
-fn file_uri_base(path: &Path) -> String {
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    let normalized = normalized.trim_end_matches('/');
-    if cfg!(target_os = "windows") {
-        if normalized.starts_with("//") {
-            format!("file://{}/", normalized.trim_start_matches('/'))
-        } else {
-            format!("file:///{normalized}/")
-        }
-    } else {
-        format!("file://{normalized}/")
-    }
 }
 
 fn is_markdown_path(path: &Path) -> bool {
@@ -6191,22 +6286,6 @@ mod tests {
     }
 
     #[test]
-    fn replaces_mermaid_fences_with_registered_native_svg_images() {
-        let context = Context::default();
-        let mut cache = HashMap::new();
-        let preview = prepare_native_preview(
-            &context,
-            "```mermaid\nflowchart LR\nA --> B\n```\n",
-            Path::new("."),
-            false,
-            &mut cache,
-        );
-        assert!(preview.contains("bytes://rupora/mermaid-"));
-        assert!(!preview.contains("```mermaid"));
-        assert_eq!(cache.len(), 1);
-    }
-
-    #[test]
     fn bounds_the_generated_svg_cache() {
         let context = Context::default();
         let mut cache = HashMap::new();
@@ -6246,17 +6325,6 @@ mod tests {
         ));
         assert_eq!(cache.len(), 4);
         assert!(!cache.contains_key("replacement"));
-    }
-
-    #[test]
-    fn creates_an_absolute_file_uri_base() {
-        let uri = file_uri_base(Path::new(if cfg!(target_os = "windows") {
-            r"C:\notes and docs"
-        } else {
-            "/tmp/notes and docs"
-        }));
-        assert!(uri.starts_with("file:///"));
-        assert!(uri.ends_with("notes and docs/"));
     }
 
     #[test]
@@ -6333,8 +6401,9 @@ mod tests {
     }
 
     #[test]
-    fn text_projection_preview_only_replaces_supported_text_blocks() {
+    fn native_projection_covers_every_markdown_block_kind() {
         for source in [
+            "plain text",
             "before `code` after",
             "# heading with `code`",
             "**bold `code`** and *emphasis*",
@@ -6343,40 +6412,20 @@ mod tests {
             "hard  \nline",
             "before <span>重点</span> after",
             "<div data-value=\"a > b\">文字</div>",
-        ] {
-            assert!(supports_text_projection_preview(source), "{source}");
-        }
-
-        for source in [
-            "plain text",
             "- list with `code`",
             "[link](note.md) and `code`",
             "![image](image.png) and `code`",
             "```rust\ncode\n```",
             "<img alt=\"diagram\" src=\"image.png\">",
         ] {
-            assert!(!supports_text_projection_preview(source), "{source}");
+            let projection = VisualProjection::from_markdown(source);
+            assert!(!projection.text().is_empty(), "{source}");
+            assert_eq!(
+                projection.visual_char_range(source, 0..source.chars().count()),
+                0..projection.text().chars().count(),
+                "{source}"
+            );
         }
-    }
-
-    #[test]
-    fn wysiwyg_static_preview_preserves_soft_breaks_without_mutating_markdown() {
-        assert_eq!(
-            preserve_soft_breaks_for_wysiwyg("[链接](note.md) 第一行\n第二行"),
-            "[链接](note.md) 第一行  \n第二行"
-        );
-        assert_eq!(
-            preserve_soft_breaks_for_wysiwyg("- 列表第一行\n  延续行"),
-            "- 列表第一行  \n  延续行"
-        );
-        assert_eq!(
-            preserve_soft_breaks_for_wysiwyg("已经硬换行  \n下一行"),
-            "已经硬换行  \n下一行"
-        );
-        assert_eq!(
-            preserve_soft_breaks_for_wysiwyg("```\na\nb\n```"),
-            "```\na\nb\n```"
-        );
     }
 
     #[test]
@@ -6475,8 +6524,7 @@ mod tests {
         let mut source_byte = None;
         let _ = context.run_ui(RawInput::default(), |ui| {
             ui.set_width(720.0);
-            let preview = show_text_projection_preview(ui, source, app_palette(false))
-                .expect("inline code should use the precise projection preview");
+            let preview = show_text_projection_preview(ui, source, app_palette(false));
             let visual_index = preview
                 .projection
                 .text()
