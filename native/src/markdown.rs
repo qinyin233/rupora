@@ -398,9 +398,12 @@ pub fn link_destination_at(source: &str, source_byte: usize) -> Option<String> {
 }
 
 pub fn toggle_task_marker_at(source: &str, source_byte: usize) -> Option<String> {
-    let (range, checked) = task_markers(source)
-        .into_iter()
-        .find(|(range, _)| range.start <= source_byte && source_byte <= range.end)?;
+    let (range, checked) = task_markers(source).into_iter().find(|(range, _)| {
+        let line_start = source[..range.start]
+            .rfind(['\n', '\r'])
+            .map_or(0, |index| index + 1);
+        line_start <= source_byte && source_byte <= range.end
+    })?;
     let mut output = source.to_owned();
     output.replace_range(range, if checked { "[ ]" } else { "[x]" });
     Some(output)

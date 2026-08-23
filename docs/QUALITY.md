@@ -24,6 +24,7 @@ cargo check --manifest-path fuzz/Cargo.toml --bins --locked
 
 - 单元测试验证文档、编辑、解析、合并、恢复、导出和桌面模块。
 - 可重放 egui 帧验证中文 IME 与 AccessKit 编辑器语义。
+- 原生 WYSIWYG 回归验证复杂块共用 galley、逐字形点击、任务框命中、原子媒体边界和链接目标显露。
 - 参考文档验证 HTML 结构，并把 PDF 页转为 SVG 和像素检查空白、裁切及布局坍缩。
 - Proptest 对任意 Unicode 文本验证格式往返、块索引、表格和三方合并性质。
 - 故障注入验证临时文件同步之后的提交失败不会破坏原文件。

@@ -32,7 +32,7 @@ cargo build --release --locked
 - `native/src/document.rs`：文档状态、编码、换行、冲突检测和原子读写
 - `native/src/editing.rs`：查找替换、格式命令和字符位置映射
 - `native/src/markdown.rs`：Markdown 解析、块范围、大纲、统计和 HTML
-- `native/src/source_map.rs`：排版文本到 UTF-8 Markdown 源码边界的映射
+- `native/src/wysiwyg.rs`：统一排版/编辑投影、逐字形命中与 UTF-8 Markdown 源码边界映射
 - `native/src/extensions.rs`：进程外扩展配置、权限、超时与 JSON 协议
 - `native/src/app_state.rs`：持久状态、快捷键和应用命令
 - `native/src/native_preview.rs`：数学公式、Mermaid 与生成 SVG 缓存

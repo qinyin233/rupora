@@ -23,8 +23,8 @@ use crate::{
     instance::InstanceCoordinator,
     markdown::{self, BlockId, Heading},
     native_preview::{
-        document_image_uri, render_math_widget, render_mermaid_widget, standalone_display_math,
-        standalone_image, standalone_mermaid,
+        decode_local_resource_path, document_image_uri, render_math_widget, render_mermaid_widget,
+        standalone_display_math, standalone_image, standalone_mermaid,
     },
     recovery::{RecoveryEntry, RecoveryStore},
     table::{self, MarkdownTable},
@@ -68,6 +68,10 @@ struct AppPalette {
     accent: Color32,
     accent_soft: Color32,
     code_bg: Color32,
+    code_keyword: Color32,
+    code_string: Color32,
+    code_comment: Color32,
+    code_number: Color32,
     hover: Color32,
 }
 
@@ -84,6 +88,10 @@ fn app_palette(dark: bool) -> AppPalette {
             accent: Color32::from_rgb(139, 148, 255),
             accent_soft: Color32::from_rgb(50, 52, 81),
             code_bg: Color32::from_rgb(38, 39, 46),
+            code_keyword: Color32::from_rgb(198, 149, 255),
+            code_string: Color32::from_rgb(143, 203, 157),
+            code_comment: Color32::from_rgb(126, 132, 146),
+            code_number: Color32::from_rgb(235, 184, 116),
             hover: Color32::from_rgb(42, 44, 53),
         }
     } else {
@@ -98,6 +106,10 @@ fn app_palette(dark: bool) -> AppPalette {
             accent: Color32::from_rgb(91, 95, 235),
             accent_soft: Color32::from_rgb(235, 236, 255),
             code_bg: Color32::from_rgb(244, 245, 247),
+            code_keyword: Color32::from_rgb(126, 65, 196),
+            code_string: Color32::from_rgb(32, 128, 86),
+            code_comment: Color32::from_rgb(113, 121, 132),
+            code_number: Color32::from_rgb(177, 91, 22),
             hover: Color32::from_rgb(234, 237, 243),
         }
     }
@@ -3459,6 +3471,9 @@ impl RuporaApp {
 
                                             let block_is_code =
                                                 is_fenced_code_block(&original_block);
+                                            let code_language =
+                                                fenced_code_language(&original_block)
+                                                    .map(str::to_owned);
                                             let block_is_table =
                                                 is_native_table_block(&original_block);
                                             let block_is_quote =
@@ -3487,8 +3502,7 @@ impl RuporaApp {
                                             };
                                             let editor_frame = frame.show(ui, |ui| {
                                                 if block_is_code
-                                                    && let Some(language) =
-                                                        fenced_code_language(&original_block)
+                                                    && let Some(language) = code_language.as_deref()
                                                 {
                                                     ui.label(
                                                         RichText::new(language.to_uppercase())
@@ -3508,14 +3522,24 @@ impl RuporaApp {
                                                     |ui: &Ui,
                                                      buffer: &dyn egui::TextBuffer,
                                                      wrap_width: f32| {
-                                                        wysiwyg_layout(
-                                                            ui,
-                                                            buffer.as_str(),
-                                                            &projection,
-                                                            wrap_width,
-                                                            palette,
-                                                            !block_is_code,
-                                                        )
+                                                        if block_is_code {
+                                                            syntax_highlighted_code_layout(
+                                                                ui,
+                                                                buffer.as_str(),
+                                                                wrap_width,
+                                                                palette,
+                                                                code_language.as_deref(),
+                                                            )
+                                                        } else {
+                                                            wysiwyg_layout(
+                                                                ui,
+                                                                buffer.as_str(),
+                                                                &projection,
+                                                                wrap_width,
+                                                                palette,
+                                                                true,
+                                                            )
+                                                        }
                                                     };
                                                 let mut editor =
                                                     TextEdit::multiline(&mut visual_content)
@@ -3544,6 +3568,7 @@ impl RuporaApp {
                                                         .then(|| block.range.clone()),
                                                     mapping: NativePointerMapping::Text(
                                                         TextProjectionPreview {
+                                                            rect: output.response.rect,
                                                             galley: Arc::clone(&output.galley),
                                                             galley_pos: output.galley_pos,
                                                             projection: projection.clone(),
@@ -3969,7 +3994,7 @@ impl RuporaApp {
                                                     egui::Sense::click_and_drag(),
                                                 )
                                                 .on_hover_text(format!(
-                                                    "点击编辑第 {} 行开始的 Markdown 块",
+                                                    "点击编辑第 {} 行开始的 Markdown 块；Ctrl+点击打开链接",
                                                     block.line
                                                 ));
                                             set_markdown_preview_accessibility(
@@ -4240,7 +4265,21 @@ impl RuporaApp {
 
     fn open_preview_destination(&mut self, index: usize, destination: &str) {
         if destination.starts_with('#') {
-            self.status = format!("文档内锚点：{destination}");
+            let anchor = destination.trim_start_matches('#');
+            let target = markdown::heading_anchors(&self.documents[index].content)
+                .into_iter()
+                .find(|heading| heading.id == anchor);
+            if let Some(target) = target {
+                let source = &self.documents[index].content;
+                let byte = line_start_byte(source, target.heading.line);
+                let cursor = source[..byte].chars().count();
+                let cursor = CCursorRange::one(CCursor::new(cursor));
+                self.editor_cursor = Some(cursor);
+                self.pending_editor_cursor = Some(cursor);
+                self.status = format!("已定位到：{}", target.heading.text);
+            } else {
+                self.status = format!("找不到文档内锚点：{destination}");
+            }
             return;
         }
         let path_part = destination.split(['#', '?']).next().unwrap_or(destination);
@@ -4252,7 +4291,10 @@ impl RuporaApp {
     }
 
     fn open_local_preview_link(&mut self, index: usize, destination: &str) {
-        let path_part = destination.split(['#', '?']).next().unwrap_or(destination);
+        let Some(path_part) = decode_local_resource_path(destination) else {
+            self.status = format!("本地链接路径编码无效：{destination}");
+            return;
+        };
         let link_path = PathBuf::from(path_part);
         let base = self.documents[index]
             .path
@@ -5071,6 +5113,28 @@ fn wysiwyg_layout(
     ui.fonts_mut(|fonts| fonts.layout_job(job))
 }
 
+fn syntax_highlighted_code_layout(
+    ui: &Ui,
+    text: &str,
+    wrap_width: f32,
+    palette: AppPalette,
+    language: Option<&str>,
+) -> Arc<egui::Galley> {
+    crate::code_highlight::layout(
+        ui,
+        text,
+        wrap_width,
+        crate::code_highlight::CodePalette {
+            plain: palette.text,
+            keyword: palette.code_keyword,
+            string: palette.code_string,
+            comment: palette.code_comment,
+            number: palette.code_number,
+        },
+        language,
+    )
+}
+
 fn rounded_inline_code_backgrounds(
     galley: &egui::Galley,
     galley_pos: egui::Pos2,
@@ -5112,6 +5176,7 @@ fn rounded_inline_code_backgrounds(
 
 #[derive(Clone)]
 struct TextProjectionPreview {
+    rect: egui::Rect,
     galley: Arc<egui::Galley>,
     galley_pos: egui::Pos2,
     projection: VisualProjection,
@@ -5322,13 +5387,41 @@ fn show_text_projection_preview(
         palette,
         true,
     );
-    let (galley_pos, galley, _) = egui::Label::new(galley).selectable(false).layout_in_ui(ui);
+    let (galley_pos, galley, response) =
+        egui::Label::new(galley).selectable(false).layout_in_ui(ui);
     ui.painter().extend(rounded_inline_code_backgrounds(
         &galley, galley_pos, &runs, palette,
     ));
     ui.painter()
         .galley(galley_pos, Arc::clone(&galley), palette.text);
     TextProjectionPreview {
+        rect: response.rect,
+        galley,
+        galley_pos,
+        projection,
+    }
+}
+
+fn show_code_projection_preview(
+    ui: &mut Ui,
+    source: &str,
+    palette: AppPalette,
+    language: Option<&str>,
+) -> TextProjectionPreview {
+    let projection = VisualProjection::from_markdown(source);
+    let galley = syntax_highlighted_code_layout(
+        ui,
+        projection.text(),
+        ui.available_width(),
+        palette,
+        language,
+    );
+    let (galley_pos, galley, response) =
+        egui::Label::new(galley).selectable(false).layout_in_ui(ui);
+    ui.painter()
+        .galley(galley_pos, Arc::clone(&galley), palette.text);
+    TextProjectionPreview {
+        rect: response.rect,
         galley,
         galley_pos,
         projection,
@@ -5466,7 +5559,7 @@ fn show_native_block_preview(
                     );
                     ui.add_space(4.0);
                 }
-                show_text_projection_preview(ui, source, palette)
+                show_code_projection_preview(ui, source, palette, fenced_code_language(source))
             });
         return NativeBlockPreview {
             rect: response.response.rect,
@@ -5492,10 +5585,7 @@ fn show_native_block_preview(
         (shown.response.rect, shown.inner)
     } else {
         let preview = show_text_projection_preview(ui, source, palette);
-        (
-            egui::Rect::from_min_size(preview.galley_pos, preview.galley.size()),
-            preview,
-        )
+        (preview.rect, preview)
     };
     NativeBlockPreview {
         rect,
@@ -6063,6 +6153,22 @@ fn char_to_byte(text: &str, char_index: usize) -> usize {
         .map_or(text.len(), |(index, _)| index)
 }
 
+fn line_start_byte(text: &str, one_based_line: usize) -> usize {
+    if one_based_line <= 1 {
+        return 0;
+    }
+    let mut line = 1usize;
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            line += 1;
+            if line == one_based_line {
+                return index + 1;
+            }
+        }
+    }
+    text.len()
+}
+
 fn clamp_char_range(text: &str, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
     let length = text.chars().count();
     range.start.min(length)..range.end.min(length).max(range.start.min(length))
@@ -6483,6 +6589,26 @@ mod tests {
     }
 
     #[test]
+    fn rendered_media_hit_testing_exposes_only_exact_atomic_boundaries() {
+        let mapping = NativePointerMapping::Atomic {
+            source_range: 3..17,
+        };
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(210.0, 120.0));
+        assert_eq!(
+            mapping.source_byte_at_position("0123456789abcdefghijkl", rect, egui::pos2(20.0, 30.0)),
+            3
+        );
+        assert_eq!(
+            mapping.source_byte_at_position(
+                "0123456789abcdefghijkl",
+                rect,
+                egui::pos2(200.0, 110.0)
+            ),
+            17
+        );
+    }
+
+    #[test]
     fn removing_a_code_block_also_removes_one_structural_gap() {
         for (source, index, expected) in [
             ("```\na\n```\n\nafter", 0, "after"),
@@ -6551,6 +6677,28 @@ mod tests {
             .text(),
             source
         );
+    }
+
+    #[test]
+    fn native_task_checkbox_hit_maps_to_the_source_marker() {
+        use egui::RawInput;
+
+        let context = Context::default();
+        let source = "- [ ] 待办事项";
+        let mut updated = None;
+        let _ = context.run_ui(RawInput::default(), |ui| {
+            ui.set_width(720.0);
+            let preview = show_text_projection_preview(ui, source, app_palette(false));
+            let position = preview.galley_pos
+                + preview
+                    .galley
+                    .pos_from_cursor(CCursor::new(0))
+                    .center()
+                    .to_vec2();
+            let source_byte = preview.source_byte_at_position(source, position);
+            updated = markdown::toggle_task_marker_at(source, source_byte);
+        });
+        assert_eq!(updated.as_deref(), Some("- [x] 待办事项"));
     }
 
     #[test]
@@ -6856,6 +7004,15 @@ mod tests {
         let localized = cursor_range_saturating_sub(range, 10);
         assert_eq!(localized.primary.index.0, 0);
         assert_eq!(localized.secondary.index.0, 0);
+    }
+
+    #[test]
+    fn heading_line_navigation_handles_unicode_and_out_of_range_lines() {
+        let source = "标题\r\n第二行\nthird";
+        assert_eq!(line_start_byte(source, 1), 0);
+        assert_eq!(&source[line_start_byte(source, 2)..], "第二行\nthird");
+        assert_eq!(&source[line_start_byte(source, 3)..], "third");
+        assert_eq!(line_start_byte(source, 99), source.len());
     }
 
     #[test]

@@ -21,7 +21,8 @@ Tauri 或 WebView。
 |---|---|
 | 窗口、输入、控件与渲染 | `eframe` / `egui` |
 | Markdown 解析 | `pulldown-cmark` |
-| Markdown 原生预览 | `egui_commonmark`、RaTeX、`mermaid-svg` |
+| Markdown 布局与编辑 | RUPORA `VisualProjection`、原生块组件与逐字形命中 |
+| 公式、图表与图片 | RaTeX、`mermaid-svg`、`egui` 图片加载器 |
 | 文档、编码、恢复与文件生命周期 | Rust |
 | 文件对话框 | `rfd` 原生对话框 |
 
@@ -48,6 +49,9 @@ Tauri 或 WebView。
 - 跨解析稳定的块 ID，避免前方编辑导致活动块和控件状态错位
 - 大文档输入期间延迟全量派生分析，编辑缓冲只在真实修改时惰性捕获历史正文
 - 可逆视觉文本到 Markdown UTF-8 边界的源码映射，支持所见即所得块内点击、选择和原地写回
+- 编辑态与排版态共用同一份 RUPORA galley；复杂 CommonMark 折行不再使用相对位置近似映射
+- RUPORA 原生代码着色、代码复制反馈、表格/引用容器、任务框点击和 Ctrl/Cmd+点击链接
+- 独立图片、块公式和 Mermaid 使用原子原生组件；拖选时只能整体选中，避免删除半个资源块
 - 单实例文件转交、文件关联、Ed25519 签名更新检查和轮转诊断日志
 - 默认关闭的进程外扩展服务，以及权限、超时、输入/输出上限和过期结果保护
 - 中文 IME、Emoji、AccessKit、HTML/PDF 视觉回归、属性、fuzz 和大文档性能测试
@@ -149,6 +153,7 @@ cargo build --locked --example extension_uppercase
 native/src/
 ├── app.rs         # 原生 UI、窗口、命令、多文档与所见即所得交互
 ├── app_state.rs   # 持久状态、快捷键与应用命令
+├── code_highlight.rs # RUPORA 原生代码词法着色与 galley 布局
 ├── diagnostics.rs # 轮转运行日志与 panic 回溯
 ├── document.rs    # 文档模型、编码、换行、冲突检测与原子写入
 ├── editing.rs     # 查找替换、格式命令和字符位置映射
@@ -158,9 +163,8 @@ native/src/
 ├── instance.rs    # 单实例协调和文件转交
 ├── markdown.rs    # GFM、公式、图表、块范围、大纲、统计和 HTML
 ├── merge.rs       # 外部修改三方合并
-├── native_preview.rs # 数学、Mermaid 与 SVG 的原生预览和有界缓存
+├── native_preview.rs # 图片、数学、Mermaid 与 SVG 的原生组件和有界缓存
 ├── recovery.rs    # 崩溃恢复快照
-├── source_map.rs  # 排版文本到 Markdown 源码的 Unicode 安全映射
 ├── table.rs       # 表格解析与可视化编辑模型
 ├── updater.rs     # Ed25519 签名的目标架构更新清单验证
 ├── wysiwyg.rs     # 可逆视觉投影、样式和 Markdown 边界映射
@@ -173,9 +177,11 @@ assets/icons/      # 桌面窗口与安装包使用的跨平台图标
 
 ## 仍需诚实说明的限制
 
-P1–P8 已逐项完成。默认所见即所得编辑采用稳定块 ID 和可逆视觉投影：常用标题、强调、列表、
-任务、引用、链接及代码标记在活动块内也不会退回源码，修改会映射回原 Markdown。它尚不提供
-跨块富文本选择、多光标以及图片拖拽缩放等排版软件级交互；这些场景仍可切换到源码模式。
+P1–P8 已逐项完成。默认所见即所得编辑采用稳定块 ID、统一原生 galley 和可逆视觉投影：标题、
+强调、列表、任务、引用、链接、表格及代码在编辑/排版态使用相同布局，修改会精确映射回原
+Markdown。链接和图片在活动时会显露可编辑目标，代码/图片/公式/图表支持原子跨块选择。
+它尚不提供多光标和图片拖拽缩放；行内图片保持紧凑占位，只有独立图片块展开为实际图片；
+远程图片默认不自动联网加载。这些场景仍可切换到源码模式。
 平台代码签名还必须由维护者提供外部证书，源码不能生成可信身份。扩展服务是进程隔离而非
 OS 沙箱，只应配置可信程序。完整状态见 [P1–P8 路线图](docs/ROADMAP.md)，质量门禁见
 [质量说明](docs/QUALITY.md)，扩展边界见 [扩展协议](docs/EXTENSIONS.md)。

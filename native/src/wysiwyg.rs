@@ -91,6 +91,7 @@ impl VisualProjection {
         let mut block_depth = 0usize;
         let mut trailing_container_block = false;
         let mut trailing_fenced_code_block = false;
+        let mut revealed_inline_depth = None::<usize>;
         let source_selection = source_selection.map(|selection| {
             let selection = clamp_range(selection, source.chars().count());
             char_to_byte(source, selection.start)..char_to_byte(source, selection.end)
@@ -102,8 +103,29 @@ impl VisualProjection {
         let standalone_footnotes = standalone_footnote_references(source);
 
         for (event, range) in Parser::new_ext(source, parser_options()).into_offset_iter() {
+            if let Some(depth) = revealed_inline_depth.as_mut() {
+                match &event {
+                    Event::Start(_) => *depth += 1,
+                    Event::End(_) if *depth == 1 => revealed_inline_depth = None,
+                    Event::End(_) => *depth -= 1,
+                    _ => {}
+                }
+                continue;
+            }
             match event {
                 Event::Start(tag) => {
+                    if matches!(&tag, Tag::Link { .. } | Tag::Image { .. })
+                        && source_selection.as_ref().is_some_and(|selection| {
+                            selection_reveals_hidden_source(selection, &range)
+                        })
+                    {
+                        let mut style = format.visual();
+                        style.link = true;
+                        style.marker = true;
+                        builder.append_mapped(source, &source[range.clone()], range, style);
+                        revealed_inline_depth = Some(1);
+                        continue;
+                    }
                     if block_depth == 0 {
                         trailing_container_block =
                             matches!(&tag, Tag::List(_) | Tag::BlockQuote(_));
@@ -1817,9 +1839,46 @@ mod tests {
     }
 
     #[test]
+    fn links_and_images_reveal_editable_destinations_only_while_active() {
+        let link = "before [文档](notes/old.md) after";
+        let label_byte = link.find("文档").unwrap();
+        let cursor = link[..label_byte].chars().count() + 1;
+        let projection = VisualProjection::from_markdown_with_selection(link, Some(cursor..cursor));
+        assert_eq!(projection.text(), link);
+        let mut edited = projection.text().replace("old.md", "new.md");
+        let cursor = edited.chars().count();
+        let update = projection
+            .apply_edit(link, &edited, cursor..cursor)
+            .expect("link destination should be directly editable");
+        assert_eq!(update.source, "before [文档](notes/new.md) after");
+
+        let image = "![截图](assets/old.png)";
+        let projection = VisualProjection::from_markdown_with_selection(image, Some(2..2));
+        assert_eq!(projection.text(), image);
+        edited = projection.text().replace("old.png", "new.png");
+        let cursor = edited.chars().count();
+        let update = projection
+            .apply_edit(image, &edited, cursor..cursor)
+            .expect("image destination should be directly editable");
+        assert_eq!(update.source, "![截图](assets/new.png)");
+
+        assert_eq!(
+            VisualProjection::from_markdown(link).text(),
+            "before 文档 after"
+        );
+        assert_eq!(VisualProjection::from_markdown(image).text(), "▧ 截图");
+    }
+
+    #[test]
     fn table_separator_edits_modify_the_backing_pipe_instead_of_being_discarded() {
         let source = "| a | b |\n| --- | --- |\n| 1 | 2 |";
         let projection = VisualProjection::from_markdown(source);
+        let runs = projection.runs_for(projection.text());
+        assert!(runs.iter().any(|run| run.style.table_header));
+        assert!(
+            runs.iter()
+                .any(|run| run.style.table && !run.style.table_header)
+        );
         let separator_byte = projection.text().find('│').unwrap();
         let separator = projection.text()[..separator_byte].chars().count();
         let mut edited = projection.text().to_owned();

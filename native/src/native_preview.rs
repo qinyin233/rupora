@@ -99,10 +99,11 @@ pub(crate) fn document_image_uri(
     if path_part.is_empty() {
         return Err("图片路径为空".to_owned());
     }
-    if has_uri_scheme(path_part) {
+    if has_uri_scheme(path_part) && !Path::new(path_part).is_absolute() {
         return Err("远程图片不会自动联网加载".to_owned());
     }
-    let decoded = percent_decode_path(path_part).ok_or_else(|| "图片路径编码无效".to_owned())?;
+    let decoded =
+        decode_local_resource_path(destination).ok_or_else(|| "图片路径编码无效".to_owned())?;
     let path = PathBuf::from(decoded);
     let resolved = if path.is_absolute() {
         path
@@ -114,6 +115,14 @@ pub(crate) fn document_image_uri(
     }
     let absolute = resolved.canonicalize().unwrap_or(resolved);
     Ok(path_to_file_uri(&absolute))
+}
+
+pub(crate) fn decode_local_resource_path(destination: &str) -> Option<String> {
+    let path_part = destination.split(['?', '#']).next().unwrap_or_default();
+    if path_part.is_empty() || (has_uri_scheme(path_part) && !Path::new(path_part).is_absolute()) {
+        return None;
+    }
+    percent_decode_path(path_part)
 }
 
 fn has_uri_scheme(value: &str) -> bool {
@@ -316,5 +325,10 @@ mod tests {
     fn rejects_invalid_percent_encoded_image_paths() {
         let directory = tempfile::tempdir().unwrap();
         assert!(document_image_uri(directory.path(), "bad%ZZ.png").is_err());
+        assert_eq!(
+            decode_local_resource_path("notes/My%20Note.md#part").as_deref(),
+            Some("notes/My Note.md")
+        );
+        assert!(decode_local_resource_path("https://example.com/note.md").is_none());
     }
 }

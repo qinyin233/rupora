@@ -1,5 +1,6 @@
 pub mod app;
 mod app_state;
+mod code_highlight;
 pub mod diagnostics;
 pub mod document;
 pub mod editing;

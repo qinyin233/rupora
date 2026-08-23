@@ -17,7 +17,8 @@ OS window + native input
           ├── Document：内容、编码、换行、dirty、指纹和文件生命周期
           ├── editing：字符安全的选择区、查找替换与 Markdown 命令
           ├── pulldown-cmark：GFM、源码范围、块、大纲和 HTML
-          ├── egui_commonmark / RaTeX / mermaid-svg：原生预览
+          ├── VisualProjection：RUPORA 可逆布局、样式、命中与编辑写回
+          ├── native_preview / RaTeX / mermaid-svg：原生资源块组件
           ├── printpdf：原生 PDF 导出
           ├── RecoveryStore：带校验的崩溃快照和会话
           ├── InstanceCoordinator：单实例文件转交
@@ -44,21 +45,29 @@ OS window + native input
 ## 单画布所见即所得编辑
 
 `markdown::blocks` 使用 `pulldown-cmark` 的源码偏移范围生成顶层 `MarkdownBlock`。默认模式在同一
-个扁平编辑器工作区内只把活动块交给原生 `TextEdit`，其余块交给原生 CommonMark 渲染器。
-`wysiwyg::VisualProjection` 将活动块投影为无 Markdown 标记的视觉文本，并记录每个视觉字符到
-UTF-8 源码边界的单调映射和标题、强调、列表、任务、引用、链接、代码样式。编辑差异通过该映射
-写回原 Markdown，回车续行再由 Markdown 结构规则补全列表序号、任务框或引用前缀。点击编辑区
-空白或按 Escape 会立即恢复只读排版。编辑事务立即更新正文、dirty 状态和紧凑补丁；大纲、
-统计与块索引在 120 ms 输入空闲窗口后统一刷新，所见即所得视图按需立即刷新。
+个扁平编辑器工作区内让活动块进入原生 `TextEdit`，失焦块仍使用同一个
+`wysiwyg::VisualProjection` 和同一套 RUPORA `LayoutJob`/galley。项目不再包含
+`egui_commonmark`，也不存在“简单块精确、复杂块按矩形比例猜测”的双渲染路径。
+
+`VisualProjection` 将 Markdown 投影为视觉文本，记录每个视觉字符到 UTF-8 源码边界的单调映射，
+并携带标题、强调、列表、任务、引用、链接、表格、代码和脚注样式。鼠标点击通过实际 galley
+逐字形命中；编辑差异通过同一映射写回原 Markdown。行内代码、链接和图片只在光标进入时显露
+需要编辑的标记/目标。回车续行由 Markdown 结构规则补全列表序号、任务框或引用前缀。
+
+代码块使用 RUPORA 词法着色与复制控件；独立图片、块公式和 Mermaid 由 `native_preview` 生成
+原生资源组件。资源块和失焦代码块具有离散的源码首尾边界，跨块拖选只能整体包含它们，不会
+生成无法保存的半资源状态。任务框点击直接形成独立撤销事务；Ctrl/Cmd+点击链接使用命中后的
+源码目标，并继续执行工作区路径边界检查。点击编辑区空白或按 Escape 会恢复排版态。编辑事务
+立即更新正文、dirty 状态和紧凑补丁；大纲、统计与块索引在 120 ms 输入空闲窗口后统一刷新。
 
 查找、格式命令和大纲使用 Unicode 字符索引；块范围来自 UTF-8 字节索引。应用边界层负责二者
-转换，避免中文或 emoji 破坏切片边界。`source_map` 进一步保存排版文本字符边界到 Markdown
-UTF-8 源码边界的单调映射；实体解码后仍只返回合法字符边界。
+转换，避免中文或 emoji 破坏切片边界。视觉边界映射由 `VisualProjection` 单独作为编辑与排版
+的权威来源；删除了旧的矩形归一化 `source_map` 兼容层。
 
 块索引通过未变化内容锚点和相邻变化块匹配维持稳定 `BlockId`。在块前方插入内容或修改块
 自身后，活动块和 egui 控件 ID 不再依赖易变化的字节起点。标题、正文和代码块在编辑时使用
-对应的字号与字体。点击已排版块会结合块内渲染文本
-映射与点击相对位置定位到对应源码附近；逐字形像素命中和跨块选择仍需要更深的排版编辑模型。
+对应的字号与字体。点击已排版块直接查询实际 galley 字形位置；普通文本支持精确跨块选择，
+代码和媒体资源遵守全选或不选的原子规则。
 
 ## 恢复与持久化
 
