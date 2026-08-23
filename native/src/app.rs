@@ -4229,7 +4229,12 @@ impl RuporaApp {
                 }
             }
             if !copied_code_block {
-                self.status = "已更新当前 Markdown 块".to_owned();
+                self.status = if kind == EditKind::TaskList {
+                    "已更新任务列表"
+                } else {
+                    "已更新当前 Markdown 块"
+                }
+                .to_owned();
             }
         }
         if cursor_adjusted {
