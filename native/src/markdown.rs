@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
+    path::Path,
     sync::{Arc, OnceLock},
 };
 
@@ -455,11 +456,24 @@ pub fn local_image_destinations(source: &str) -> Vec<String> {
             Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.into_string()),
             _ => None,
         })
-        .filter(|destination| is_local_link(destination))
+        .filter(|destination| is_local_image_destination(destination))
         .collect::<Vec<_>>();
     destinations.sort();
     destinations.dedup();
     destinations
+}
+
+fn is_local_image_destination(destination: &str) -> bool {
+    if is_local_link(destination) {
+        return true;
+    }
+    let path = destination.split(['?', '#']).next().unwrap_or_default();
+    let bytes = path.as_bytes();
+    let windows_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    Path::new(path).is_absolute() || windows_absolute
 }
 
 pub fn synchronize_task_markers(source: &str, rendered_markdown: &str) -> Option<String> {
@@ -1690,12 +1704,21 @@ mod tests {
     }
 
     #[test]
-    fn collects_only_relative_document_images() {
-        let images = local_image_destinations(
-            "![local](assets/logo.png) ![web](https://example.com/x.png) \
-             ![data](data:image/png;base64,AAAA) ![again](assets/logo.png)",
+    fn collects_relative_and_absolute_local_images_but_not_remote_ones() {
+        let absolute = if cfg!(windows) {
+            "C:/assets/absolute.png"
+        } else {
+            "/assets/absolute.png"
+        };
+        let images = local_image_destinations(&format!(
+            "![local](assets/logo.png) ![absolute](<{absolute}>) \
+             ![web](https://example.com/x.png) ![data](data:image/png;base64,AAAA) \
+             ![again](assets/logo.png)"
+        ));
+        assert_eq!(
+            images,
+            vec![absolute.to_owned(), "assets/logo.png".to_owned()]
         );
-        assert_eq!(images, vec!["assets/logo.png"]);
     }
 
     #[test]

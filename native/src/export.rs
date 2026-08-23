@@ -4,6 +4,7 @@ use std::{
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, SystemTime},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -27,6 +28,8 @@ const MAX_PDF_HTML_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PDF_PAGES: usize = 10_000;
 const MAX_PDF_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PDF_SVG_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+const MAX_RETAINED_PRINT_JOBS: usize = 16;
+const MAX_PRINT_JOB_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug)]
 pub struct LocalImage {
@@ -204,9 +207,9 @@ fn add_pdf_svg_bytes(total: usize, page_bytes: usize) -> Result<usize, String> {
 
 pub fn load_local_images(
     source: &str,
-    document_path: Option<&Path>,
+    base_directory: Option<&Path>,
 ) -> Result<LocalImages, String> {
-    let Some(base_directory) = document_path.and_then(Path::parent) else {
+    let Some(base_directory) = base_directory else {
         return Ok(LocalImages::new());
     };
     let canonical_base = base_directory
@@ -222,7 +225,8 @@ pub fn load_local_images(
     let mut total_pixels = 0u64;
     for destination in destinations {
         let resource_path = local_resource_path(&canonical_base, &destination)?;
-        let bytes = read_local_image(&resource_path)?;
+        let source_bytes = read_local_image(&resource_path)?;
+        let (bytes, mime, width, height) = normalize_local_image(&source_bytes, &resource_path)?;
         total_bytes = total_bytes
             .checked_add(bytes.len())
             .filter(|total| *total <= MAX_LOCAL_IMAGE_TOTAL_BYTES)
@@ -232,39 +236,7 @@ pub fn load_local_images(
                     MAX_LOCAL_IMAGE_TOTAL_BYTES / 1024 / 1024
                 )
             })?;
-        let reader = ImageReader::new(Cursor::new(&bytes))
-            .with_guessed_format()
-            .map_err(|error| format!("无法识别图片 {}：{error}", resource_path.display()))?;
-        let format = reader
-            .format()
-            .ok_or_else(|| format!("无法识别图片格式：{}", resource_path.display()))?;
-        let mime = match format {
-            ImageFormat::Png => "image/png",
-            ImageFormat::Jpeg => "image/jpeg",
-            _ => {
-                return Err(format!(
-                    "图片 {} 不是受支持的 PNG 或 JPEG",
-                    resource_path.display()
-                ));
-            }
-        };
-        let (width, height) = reader
-            .into_dimensions()
-            .map_err(|error| format!("无法读取图片尺寸 {}：{error}", resource_path.display()))?;
         let pixels = u64::from(width).saturating_mul(u64::from(height));
-        if width == 0
-            || height == 0
-            || width > MAX_LOCAL_IMAGE_EDGE
-            || height > MAX_LOCAL_IMAGE_EDGE
-            || pixels > MAX_LOCAL_IMAGE_PIXELS
-        {
-            return Err(format!(
-                "图片 {} 的 {}×{} 像素超过导出上限",
-                resource_path.display(),
-                width,
-                height
-            ));
-        }
         total_pixels = total_pixels
             .checked_add(pixels)
             .filter(|pixels| *pixels <= MAX_LOCAL_IMAGE_TOTAL_PIXELS)
@@ -274,11 +246,99 @@ pub fn load_local_images(
                     MAX_LOCAL_IMAGE_TOTAL_PIXELS / 1_000_000
                 )
             })?;
-        image::load_from_memory_with_format(&bytes, format)
-            .map_err(|error| format!("图片数据不完整 {}：{error}", resource_path.display()))?;
         images.insert(destination, LocalImage { bytes, mime });
     }
     Ok(images)
+}
+
+fn normalize_local_image(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<(Vec<u8>, &'static str, u32, u32), String> {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+    {
+        return rasterize_svg(bytes, path);
+    }
+
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| format!("无法识别图片 {}：{error}", path.display()))?;
+    let format = reader
+        .format()
+        .ok_or_else(|| format!("无法识别图片格式：{}", path.display()))?;
+    if !matches!(
+        format,
+        ImageFormat::Png
+            | ImageFormat::Jpeg
+            | ImageFormat::Gif
+            | ImageFormat::WebP
+            | ImageFormat::Bmp
+            | ImageFormat::Ico
+    ) {
+        return Err(format!("图片 {} 的格式不受支持", path.display()));
+    }
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|error| format!("无法读取图片尺寸 {}：{error}", path.display()))?;
+    validate_image_dimensions(path, width, height)?;
+    let decoded = image::load_from_memory_with_format(bytes, format)
+        .map_err(|error| format!("图片数据不完整 {}：{error}", path.display()))?;
+    match format {
+        ImageFormat::Png => Ok((bytes.to_vec(), "image/png", width, height)),
+        ImageFormat::Jpeg => Ok((bytes.to_vec(), "image/jpeg", width, height)),
+        _ => {
+            let mut encoded = Cursor::new(Vec::new());
+            decoded
+                .write_to(&mut encoded, ImageFormat::Png)
+                .map_err(|error| format!("无法规范化图片 {}：{error}", path.display()))?;
+            Ok((encoded.into_inner(), "image/png", width, height))
+        }
+    }
+}
+
+fn rasterize_svg(bytes: &[u8], path: &Path) -> Result<(Vec<u8>, &'static str, u32, u32), String> {
+    let tree = usvg::Tree::from_data(bytes, &usvg::Options::default())
+        .map_err(|error| format!("无法解析 SVG {}：{error}", path.display()))?;
+    let size = tree.size();
+    if !size.width().is_finite() || !size.height().is_finite() {
+        return Err(format!("SVG {} 的尺寸无效", path.display()));
+    }
+    let width = size.width().ceil() as u32;
+    let height = size.height().ceil() as u32;
+    validate_image_dimensions(path, width, height)?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| format!("无法为 SVG {} 分配画布", path.display()))?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::identity(),
+        &mut pixmap.as_mut(),
+    );
+    let png = pixmap
+        .encode_png()
+        .map_err(|error| format!("无法规范化 SVG {}：{error}", path.display()))?;
+    Ok((png, "image/png", width, height))
+}
+
+fn validate_image_dimensions(path: &Path, width: u32, height: u32) -> Result<(), String> {
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width == 0
+        || height == 0
+        || width > MAX_LOCAL_IMAGE_EDGE
+        || height > MAX_LOCAL_IMAGE_EDGE
+        || pixels > MAX_LOCAL_IMAGE_PIXELS
+    {
+        Err(format!(
+            "图片 {} 的 {}×{} 像素超过导出上限",
+            path.display(),
+            width,
+            height
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn read_local_image(path: &Path) -> Result<Vec<u8>, String> {
@@ -380,15 +440,17 @@ pub fn embed_local_images(html: &str, images: &LocalImages) -> Result<String, St
 fn local_resource_path(base_directory: &Path, destination: &str) -> Result<PathBuf, String> {
     let path_part = destination.split(['?', '#']).next().unwrap_or_default();
     let decoded = percent_decode_path(path_part)?;
-    let relative = Path::new(&decoded);
-    if relative.is_absolute() {
-        return Err(format!("图片路径必须位于文档目录内：{destination}"));
-    }
-    let canonical = base_directory
-        .join(relative)
+    let path = Path::new(&decoded);
+    let absolute_destination = path.is_absolute();
+    let candidate = if absolute_destination {
+        path.to_path_buf()
+    } else {
+        base_directory.join(path)
+    };
+    let canonical = candidate
         .canonicalize()
         .map_err(|error| format!("无法解析图片 {destination}：{error}"))?;
-    if !canonical.starts_with(base_directory) {
+    if !absolute_destination && !canonical.starts_with(base_directory) {
         return Err(format!("图片路径越过文档目录：{destination}"));
     }
     Ok(canonical)
@@ -456,6 +518,7 @@ pub fn print_html(html: &str, images: &LocalImages) -> Result<PathBuf, String> {
         .join("print-jobs");
     fs::create_dir_all(&directory)
         .map_err(|error| format!("无法创建打印目录 {}：{error}", directory.display()))?;
+    let _ = cleanup_print_jobs(&directory, SystemTime::now());
     let bytes = render_pdf_with_images(html, images)?;
     let mut temporary = TempFileBuilder::new()
         .prefix("rupora-print-")
@@ -470,8 +533,47 @@ pub fn print_html(html: &str, images: &LocalImages) -> Result<PathBuf, String> {
         .keep()
         .map_err(|error| format!("无法保留打印文件：{}", error.error))?;
     sync_parent_directory(&directory)?;
-    send_pdf_to_printer(&path)?;
+    if let Err(error) = send_pdf_to_printer(&path) {
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
+    let _ = cleanup_print_jobs(&directory, SystemTime::now());
     Ok(path)
+}
+
+fn cleanup_print_jobs(directory: &Path, now: SystemTime) -> Result<usize, String> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("无法清理打印目录 {}：{error}", directory.display()))?;
+    let mut jobs = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("rupora-print-") || !name.ends_with(".pdf") {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        jobs.push((
+            entry.path(),
+            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        ));
+    }
+    jobs.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    let mut removed = 0usize;
+    for (index, (path, modified)) in jobs.into_iter().enumerate() {
+        let expired = now
+            .duration_since(modified)
+            .is_ok_and(|age| age > MAX_PRINT_JOB_AGE);
+        if (expired || index >= MAX_RETAINED_PRINT_JOBS) && fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -619,7 +721,7 @@ mod tests {
         fs::write(&document_path, "![icon](small%20icon.png)").unwrap();
         fs::write(&image_path, include_bytes!("../../assets/icons/32x32.png")).unwrap();
         let source = fs::read_to_string(&document_path).unwrap();
-        let images = load_local_images(&source, Some(&document_path)).unwrap();
+        let images = load_local_images(&source, Some(directory.path())).unwrap();
         assert_eq!(images.len(), 1);
 
         let html = markdown::render_html_document(&source, "images", false);
@@ -632,6 +734,61 @@ mod tests {
             pdf.windows(14).any(|bytes| bytes == b"/Subtype/Image")
                 || pdf.windows(15).any(|bytes| bytes == b"/Subtype /Image")
         );
+    }
+
+    #[test]
+    fn normalizes_every_insertable_image_format_for_html_and_pdf() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = image::DynamicImage::new_rgba8(2, 2);
+        let mut source = String::new();
+        for (extension, format) in [
+            ("bmp", ImageFormat::Bmp),
+            ("gif", ImageFormat::Gif),
+            ("ico", ImageFormat::Ico),
+            ("webp", ImageFormat::WebP),
+        ] {
+            let mut encoded = Cursor::new(Vec::new());
+            image.write_to(&mut encoded, format).unwrap();
+            fs::write(
+                directory.path().join(format!("image.{extension}")),
+                encoded.into_inner(),
+            )
+            .unwrap();
+            source.push_str(&format!("![{extension}](image.{extension})\n"));
+        }
+        fs::write(
+            directory.path().join("image.svg"),
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="red"/></svg>"#,
+        )
+        .unwrap();
+        source.push_str("![svg](image.svg)\n");
+
+        let images = load_local_images(&source, Some(directory.path())).unwrap();
+        assert_eq!(images.len(), 5);
+        assert!(images.values().all(|image| image.mime == "image/png"));
+        assert!(
+            images
+                .values()
+                .all(|image| image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"))
+        );
+
+        let html = markdown::render_html_document(&source, "formats", false);
+        let embedded = embed_local_images(&html, &images).unwrap();
+        assert_eq!(embedded.matches("data:image/png;base64,").count(), 5);
+        assert!(render_pdf_with_images(&html, &images).is_ok());
+    }
+
+    #[test]
+    fn unsaved_documents_and_absolute_images_use_the_preview_resource_base() {
+        let directory = tempfile::tempdir().unwrap();
+        let image_path = directory.path().join("absolute image.png");
+        fs::write(&image_path, include_bytes!("../../assets/icons/32x32.png")).unwrap();
+        let destination = image_path.to_string_lossy().replace('\\', "/");
+        let source = format!("![absolute](<{destination}>)");
+
+        let images = load_local_images(&source, Some(directory.path())).unwrap();
+        assert_eq!(images.len(), 1);
+        assert!(images.contains_key(&destination));
     }
 
     #[test]
@@ -649,7 +806,7 @@ mod tests {
 
         let error = load_local_images(
             &fs::read_to_string(&document_path).unwrap(),
-            Some(&document_path),
+            Some(&document_directory),
         )
         .unwrap_err();
         assert!(error.contains("越过文档目录"));
@@ -721,10 +878,52 @@ mod tests {
         assert!(
             load_local_images(
                 &fs::read_to_string(&document_path).unwrap(),
-                Some(&document_path)
+                Some(directory.path())
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn print_job_cleanup_removes_expired_and_excess_pdfs_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        for index in 0..MAX_RETAINED_PRINT_JOBS + 3 {
+            fs::write(
+                directory
+                    .path()
+                    .join(format!("rupora-print-{index:02}.pdf")),
+                b"pdf",
+            )
+            .unwrap();
+        }
+        let old = directory.path().join("rupora-print-expired.pdf");
+        fs::write(&old, b"old").unwrap();
+        File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(now - MAX_PRINT_JOB_AGE - Duration::from_secs(1)),
+            )
+            .unwrap();
+        let unrelated = directory.path().join("keep.pdf");
+        fs::write(&unrelated, b"keep").unwrap();
+
+        cleanup_print_jobs(directory.path(), now).unwrap();
+        let retained_jobs = fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("rupora-print-")
+            })
+            .count();
+        assert_eq!(retained_jobs, MAX_RETAINED_PRINT_JOBS);
+        assert!(!old.exists());
+        assert!(unrelated.exists());
     }
 
     #[test]

@@ -61,7 +61,14 @@ egui_extras = { version = "0.35.0", default-features = false, features = [
 ] }
 encoding_rs = "0.8.35"
 fs2 = "0.4.3"
-image = { version = "0.25.9", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25.9", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "webp",
+] }
 libc = "0.2.177"
 mermaid-svg = "0.7.0"
 open = "5.4.0"
@@ -72,6 +79,7 @@ ratex-layout = "0.1.14"
 ratex-parser = "0.1.14"
 ratex-svg = { version = "0.1.14", features = ["embed-fonts"] }
 rfd = "0.17.2"
+resvg = "0.45.1"
 semver = "1.0.28"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -84,7 +92,6 @@ usvg = "0.45.1"
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
-resvg = "0.45.1"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.31"

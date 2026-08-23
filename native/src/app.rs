@@ -704,7 +704,8 @@ impl RuporaApp {
 
         let output =
             markdown::render_html_document(&document.content, &document.title(), self.state.dark);
-        let images = match export::load_local_images(&document.content, document.path.as_deref()) {
+        let resource_base = self.preview_base_path(index);
+        let images = match export::load_local_images(&document.content, Some(&resource_base)) {
             Ok(images) => images,
             Err(error) => {
                 self.show_error("导出失败", &error);
@@ -744,7 +745,8 @@ impl RuporaApp {
         };
         let html =
             markdown::render_html_document(&document.content, &document.title(), self.state.dark);
-        let images = match export::load_local_images(&document.content, document.path.as_deref()) {
+        let resource_base = self.preview_base_path(index);
+        let images = match export::load_local_images(&document.content, Some(&resource_base)) {
             Ok(images) => images,
             Err(error) => {
                 self.show_error("PDF 导出失败", &error);
@@ -764,7 +766,8 @@ impl RuporaApp {
         let document = &self.documents[index];
         let html =
             markdown::render_html_document(&document.content, &document.title(), self.state.dark);
-        let images = match export::load_local_images(&document.content, document.path.as_deref()) {
+        let resource_base = self.preview_base_path(index);
+        let images = match export::load_local_images(&document.content, Some(&resource_base)) {
             Ok(images) => images,
             Err(error) => {
                 self.show_error("打印失败", &error);
