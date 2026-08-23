@@ -4745,8 +4745,14 @@ fn cursor_range_to_char_range(range: CCursorRange) -> std::ops::Range<usize> {
 
 fn cursor_range_saturating_sub(range: CCursorRange, offset: usize) -> CCursorRange {
     CCursorRange {
-        primary: range.primary - offset,
-        secondary: range.secondary - offset,
+        primary: CCursor {
+            index: range.primary.index.saturating_sub(offset),
+            prefer_next_row: range.primary.prefer_next_row,
+        },
+        secondary: CCursor {
+            index: range.secondary.index.saturating_sub(offset),
+            prefer_next_row: range.secondary.prefer_next_row,
+        },
         h_pos: range.h_pos,
     }
 }
@@ -4816,6 +4822,8 @@ fn source_selection_after_visual_input(
 ) -> std::ops::Range<usize> {
     if previous_visual_selection == Some(&visual_selection)
         && let Some(previous) = previous_source_selection
+        && previous.end <= source.chars().count()
+        && projection.visual_char_range(source, previous.clone()) == visual_selection
     {
         return previous.clone();
     }
@@ -5360,24 +5368,31 @@ fn supports_text_projection_preview(source: &str) -> bool {
     // correct for a read-only preview, but surprising in a WYSIWYG editing
     // canvas where the source line structure must remain visible.
     let mut needs_projection = contains_footnote_reference(source) || source.contains(['\n', '\r']);
+    let mut contains_html = false;
     for event in Parser::new_ext(source, markdown::parser_options()) {
         match event {
             MarkdownEvent::Code(_) | MarkdownEvent::FootnoteReference(_) => {
                 needs_projection = true;
+            }
+            MarkdownEvent::Html(_) | MarkdownEvent::InlineHtml(_) => {
+                needs_projection = true;
+                contains_html = true;
             }
             MarkdownEvent::Start(
                 Tag::Paragraph
                 | Tag::Heading { .. }
                 | Tag::Emphasis
                 | Tag::Strong
-                | Tag::Strikethrough,
+                | Tag::Strikethrough
+                | Tag::HtmlBlock,
             )
             | MarkdownEvent::End(
                 TagEnd::Paragraph
                 | TagEnd::Heading(_)
                 | TagEnd::Emphasis
                 | TagEnd::Strong
-                | TagEnd::Strikethrough,
+                | TagEnd::Strikethrough
+                | TagEnd::HtmlBlock,
             )
             | MarkdownEvent::SoftBreak
             | MarkdownEvent::HardBreak => {}
@@ -5386,6 +5401,11 @@ fn supports_text_projection_preview(source: &str) -> bool {
         }
     }
     needs_projection
+        && (!contains_html
+            || !VisualProjection::from_markdown(source)
+                .text()
+                .trim()
+                .is_empty())
 }
 
 fn accessible_markdown_block_text(source: &str) -> String {
@@ -5956,23 +5976,18 @@ fn clamp_char_range(text: &str, range: std::ops::Range<usize>) -> std::ops::Rang
 fn next_footnote_number(source: &str) -> usize {
     let mut used = HashSet::new();
     let bytes = source.as_bytes();
-    let mut index = 0usize;
-    while index + 3 < bytes.len() {
-        if bytes[index] == b'[' && bytes[index + 1] == b'^' {
-            let digits_start = index + 2;
-            let mut end = digits_start;
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end > digits_start
-                && bytes.get(end) == Some(&b']')
-                && let Ok(number) = source[digits_start..end].parse::<usize>()
-            {
-                used.insert(number);
-            }
-            index = end;
+    for (index, _) in source.match_indices("[^") {
+        let digits_start = index + 2;
+        let mut end = digits_start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
         }
-        index += 1;
+        if end > digits_start
+            && bytes.get(end) == Some(&b']')
+            && let Ok(number) = source[digits_start..end].parse::<usize>()
+        {
+            used.insert(number);
+        }
     }
     (1..).find(|number| !used.contains(number)).unwrap_or(1)
 }
@@ -6171,6 +6186,8 @@ mod tests {
         assert_eq!(next_footnote_number("plain"), 1);
         assert_eq!(next_footnote_number("[^1] and [^3]"), 2);
         assert_eq!(next_footnote_number("[^2]: definition"), 1);
+        assert_eq!(next_footnote_number("[^1][^2]"), 3);
+        assert_eq!(next_footnote_number("[^[^1][^2]"), 3);
     }
 
     #[test]
@@ -6324,6 +6341,8 @@ mod tests {
             "脚注引用[^1]",
             "soft\nline",
             "hard  \nline",
+            "before <span>重点</span> after",
+            "<div data-value=\"a > b\">文字</div>",
         ] {
             assert!(supports_text_projection_preview(source), "{source}");
         }
@@ -6334,6 +6353,7 @@ mod tests {
             "[link](note.md) and `code`",
             "![image](image.png) and `code`",
             "```rust\ncode\n```",
+            "<img alt=\"diagram\" src=\"image.png\">",
         ] {
             assert!(!supports_text_projection_preview(source), "{source}");
         }
@@ -6767,6 +6787,76 @@ mod tests {
             ),
             3..3
         );
+
+        let changed_source = "x";
+        let changed_projection = VisualProjection::from_markdown(changed_source);
+        assert_eq!(
+            source_selection_after_visual_input(
+                &changed_projection,
+                changed_source,
+                Some(&(99..99)),
+                Some(&(0..0)),
+                0..0,
+            ),
+            0..0
+        );
+    }
+
+    #[test]
+    fn cursor_localization_saturates_both_selection_ends() {
+        let range = CCursorRange::two(CCursor::new(1), CCursor::new(3));
+        let localized = cursor_range_saturating_sub(range, 10);
+        assert_eq!(localized.primary.index.0, 0);
+        assert_eq!(localized.secondary.index.0, 0);
+    }
+
+    #[test]
+    fn source_code_editor_enter_continues_one_nested_list_prefix() {
+        use egui::{Event, Id, Modifiers, RawInput};
+
+        let context = Context::default();
+        let id = Id::new("source-list-enter-regression");
+        let mut source = "  - item".to_owned();
+        let mut cursor = None;
+        let _ = context.run_ui(
+            RawInput {
+                events: vec![Event::Key {
+                    key: Key::Enter,
+                    physical_key: Some(Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..RawInput::default()
+            },
+            |ui| {
+                let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+                state
+                    .cursor
+                    .set_char_range(Some(CCursorRange::one(CCursor::new(
+                        source.chars().count(),
+                    ))));
+                state.store(ui.ctx(), id);
+                ui.memory_mut(|memory| memory.request_focus(id));
+                let output = TextEdit::multiline(&mut source)
+                    .id(id)
+                    .code_editor()
+                    .show(ui);
+                cursor = output
+                    .cursor_range
+                    .map(cursor_range_to_char_range)
+                    .map(|range| range.end);
+            },
+        );
+
+        assert!(
+            matches!(source.as_str(), "  - item\n" | "  - item\n  "),
+            "egui may change its code-editor auto-indent policy between releases: {source:?}"
+        );
+        let cursor = cursor.expect("the focused source editor should retain its cursor");
+        let selection = editing::continue_markdown_line(&mut source, cursor).unwrap();
+        assert_eq!(source, "  - item\n  - ");
+        assert_eq!(selection.end, source.chars().count());
     }
 
     #[test]

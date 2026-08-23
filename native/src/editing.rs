@@ -117,8 +117,12 @@ pub fn char_index_for_line(text: &str, one_based_line: usize) -> usize {
 pub fn continue_markdown_line(text: &mut String, cursor: usize) -> Option<Range<usize>> {
     let cursor = cursor.min(text.chars().count());
     let cursor_byte = char_to_byte(text, cursor);
-    let previous_newline = cursor_byte.checked_sub(1)?;
-    if text.as_bytes().get(previous_newline) != Some(&b'\n') {
+    let previous_newline = text[..cursor_byte].rfind('\n')?;
+    let editor_indent = &text[previous_newline + 1..cursor_byte];
+    if !editor_indent
+        .bytes()
+        .all(|byte| matches!(byte, b' ' | b'\t'))
+    {
         return None;
     }
 
@@ -128,18 +132,22 @@ pub fn continue_markdown_line(text: &mut String, cursor: usize) -> Option<Range<
     let previous_line = &text[line_start..previous_newline];
     let continuation = continuation_prefix(previous_line)?;
     let content = &previous_line[continuation.content_start..];
+    let editor_indent_chars = editor_indent.chars().count();
 
     if content.trim().is_empty() {
         let removed_chars = previous_line[..continuation.source_prefix_len]
             .chars()
             .count();
+        text.replace_range(previous_newline + 1..cursor_byte, "");
         text.replace_range(line_start..line_start + continuation.source_prefix_len, "");
-        let next = cursor.saturating_sub(removed_chars);
+        let next = cursor
+            .saturating_sub(editor_indent_chars)
+            .saturating_sub(removed_chars);
         return Some(next..next);
     }
 
-    text.insert_str(cursor_byte, &continuation.next_prefix);
-    let next = cursor + continuation.next_prefix.chars().count();
+    text.replace_range(previous_newline + 1..cursor_byte, &continuation.next_prefix);
+    let next = cursor - editor_indent_chars + continuation.next_prefix.chars().count();
     Some(next..next)
 }
 
@@ -445,8 +453,11 @@ fn strip_heading_prefix(line: &str) -> &str {
 
 fn strip_ordered_prefix(line: &str) -> Option<&str> {
     let digit_count = line.bytes().take_while(u8::is_ascii_digit).count();
-    (digit_count > 0 && line.get(digit_count..digit_count + 2) == Some(". "))
-        .then(|| &line[digit_count + 2..])
+    let delimiter = line.as_bytes().get(digit_count);
+    (digit_count > 0
+        && matches!(delimiter, Some(b'.' | b')'))
+        && line.as_bytes().get(digit_count + 1) == Some(&b' '))
+    .then(|| &line[digit_count + 2..])
 }
 
 struct ContinuationPrefix {
@@ -489,13 +500,21 @@ fn continuation_prefix(line: &str) -> Option<ContinuationPrefix> {
     }
 
     let digit_count = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if digit_count > 0 && rest.get(digit_count..digit_count + 2) == Some(". ") {
+    let delimiter = rest.as_bytes().get(digit_count).copied();
+    if digit_count > 0
+        && matches!(delimiter, Some(b'.' | b')'))
+        && rest.as_bytes().get(digit_count + 1) == Some(&b' ')
+    {
         let ordinal = rest[..digit_count].parse::<u64>().unwrap_or(0);
         let source_prefix_len = cursor + digit_count + 2;
         return Some(ContinuationPrefix {
             source_prefix_len,
             content_start: source_prefix_len,
-            next_prefix: format!("{structural_prefix}{}. ", ordinal.saturating_add(1)),
+            next_prefix: format!(
+                "{structural_prefix}{}{} ",
+                ordinal.saturating_add(1),
+                char::from(delimiter.unwrap_or(b'.'))
+            ),
         });
     }
 
@@ -604,10 +623,30 @@ mod tests {
     }
 
     #[test]
+    fn replaces_code_editor_auto_indent_when_continuing_markdown() {
+        for (before, expected) in [
+            ("  - item\n  ", "  - item\n  - "),
+            ("  9) item\n  ", "  9) item\n  10) "),
+            ("  > quote\n  ", "  > quote\n  > "),
+        ] {
+            let mut text = before.to_owned();
+            let cursor = text.chars().count();
+            let selection = continue_markdown_line(&mut text, cursor).unwrap();
+            assert_eq!(text, expected, "source: {before:?}");
+            assert_eq!(selection.end, expected.chars().count());
+        }
+    }
+
+    #[test]
     fn exits_an_empty_list_item() {
         let mut text = "- item\n- \n".to_owned();
         assert_eq!(continue_markdown_line(&mut text, 10), Some(8..8));
         assert_eq!(text, "- item\n\n");
+
+        let mut nested = "  - item\n  - \n  ".to_owned();
+        let cursor = nested.chars().count();
+        assert_eq!(continue_markdown_line(&mut nested, cursor), Some(10..10));
+        assert_eq!(nested, "  - item\n\n");
     }
 
     #[test]
@@ -617,6 +656,16 @@ mod tests {
         assert_eq!(text, "    一\n    二");
         indent_selected_lines(&mut text, selected, true);
         assert_eq!(text, "一\n二");
+    }
+
+    #[test]
+    fn toggles_parenthesized_ordered_lists_without_stacking_markers() {
+        let mut text = "1) one\n2) two".to_owned();
+        let end = text.chars().count();
+        let selection = apply_markdown_command(&mut text, 0..end, MarkdownCommand::OrderedList);
+        assert_eq!(text, "one\ntwo");
+        apply_markdown_command(&mut text, selection, MarkdownCommand::OrderedList);
+        assert_eq!(text, "1. one\n2. two");
     }
 
     #[test]

@@ -28,6 +28,13 @@ pub struct VisualProjection {
     text: String,
     source_boundaries: Vec<usize>,
     runs: Vec<VisualRun>,
+    atomic_ranges: Vec<AtomicVisualRange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AtomicVisualRange {
+    visual: Range<usize>,
+    source: Range<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,13 +119,32 @@ impl VisualProjection {
                         Tag::Item => {
                             builder.ensure_line_break(range.start, format.visual());
                             if let Some((prefix_range, prefix)) = item_prefix(source, range.start) {
-                                builder.append_marker(&prefix, prefix_range, format.visual());
+                                builder.append_marker(
+                                    source,
+                                    &prefix,
+                                    prefix_range,
+                                    format.visual(),
+                                );
                             }
                         }
                         Tag::TableRow => table_cells = 0,
                         Tag::TableCell => {
                             if table_cells > 0 {
-                                builder.append_virtual("  │  ", range.start, marker_style(format));
+                                if let Some(separator) = table_separator_range(source, range.start)
+                                {
+                                    builder.append_marker(
+                                        source,
+                                        "  │  ",
+                                        separator,
+                                        marker_style(format),
+                                    );
+                                } else {
+                                    builder.append_virtual(
+                                        "  │  ",
+                                        range.start,
+                                        marker_style(format),
+                                    );
+                                }
                             }
                             table_cells += 1;
                         }
@@ -132,6 +158,7 @@ impl VisualProjection {
                                 .find('[')
                                 .map_or(range.start, |offset| range.start + offset + 1);
                             builder.append_marker(
+                                source,
                                 "▧ ",
                                 range.start..marker_end,
                                 marker_style(format),
@@ -143,6 +170,7 @@ impl VisualProjection {
                                 .find(':')
                                 .map_or(range.start, |offset| range.start + offset + 1);
                             builder.append_marker(
+                                source,
                                 &marker,
                                 range.start..marker_end,
                                 marker_style(format),
@@ -193,6 +221,7 @@ impl VisualProjection {
                             range,
                             format.visual(),
                             &standalone_footnotes,
+                            source_selection.as_ref(),
                         );
                     } else {
                         builder.append_mapped(source, &text, range, format.visual());
@@ -217,22 +246,28 @@ impl VisualProjection {
                     style.code = true;
                     builder.append_mapped(source, &text, range, style);
                 }
-                Event::Html(text) => {
+                Event::Html(_) => {
                     builder.append_container_prefix(source, range.start, format);
-                    let rendered = strip_html_tags(&text);
-                    builder.append_transformed(&rendered, range, format.visual());
+                    builder.append_html(source, range, format.visual(), source_selection.as_ref());
                 }
-                Event::InlineHtml(_) => {}
+                Event::InlineHtml(_) => {
+                    builder.append_html(source, range, format.visual(), source_selection.as_ref());
+                }
                 Event::FootnoteReference(label) => {
-                    let rendered = format!("〔{label}〕");
                     let mut style = format.visual();
                     style.link = true;
                     style.footnote = true;
-                    builder.append_transformed(&rendered, range, style);
+                    builder.append_footnote_reference(
+                        source,
+                        &label,
+                        range,
+                        style,
+                        source_selection.as_ref(),
+                    );
                 }
                 Event::SoftBreak | Event::HardBreak => {
                     let next_line_start = range.end;
-                    builder.append_transformed("\n", range, format.visual());
+                    builder.append_transformed(source, "\n", range, format.visual());
                     builder.append_container_prefix_at_line_start(source, next_line_start, format);
                 }
                 Event::Rule => {
@@ -241,6 +276,7 @@ impl VisualProjection {
                         trailing_fenced_code_block = false;
                     }
                     builder.append_transformed(
+                        source,
                         "────────────────",
                         range.clone(),
                         marker_style(format),
@@ -291,8 +327,16 @@ impl VisualProjection {
         visual_selection: Range<usize>,
     ) -> Option<VisualSourceEdit> {
         let change = text_change(&self.text, edited)?;
-        let source_start = self.source_boundaries[change.old.start];
-        let source_end = self.source_boundaries[change.old.end];
+        let mut source_start = self.source_boundaries[change.old.start];
+        let mut source_end = self.source_boundaries[change.old.end];
+        for atomic in self
+            .atomic_ranges
+            .iter()
+            .filter(|atomic| visual_change_intersects(&change.old, &atomic.visual))
+        {
+            source_start = source_start.min(atomic.source.start);
+            source_end = source_end.max(atomic.source.end);
+        }
         let replacement_start = char_to_byte(edited, change.new.start);
         let replacement_end = char_to_byte(edited, change.new.end);
         let replacement = &edited[replacement_start..replacement_end];
@@ -387,12 +431,19 @@ impl VisualProjection {
         delta: isize,
     ) -> usize {
         if visual_index <= change.new.start {
-            return self.source_boundaries[visual_index.min(change.old.start)];
+            let old_byte = self.source_boundaries[visual_index.min(change.old.start)];
+            return if source_start < source_end && (source_start..source_end).contains(&old_byte) {
+                source_start
+            } else {
+                old_byte
+            };
         }
         if visual_index >= change.new.end {
             let old_index = change.old.end + visual_index - change.new.end;
             let old_byte = self.source_boundaries[old_index.min(self.char_count())];
-            return if old_byte >= source_end {
+            return if source_start < source_end && (source_start..=source_end).contains(&old_byte) {
+                shift_index(source_end, delta)
+            } else if old_byte >= source_end {
                 shift_index(old_byte, delta)
             } else {
                 old_byte
@@ -760,6 +811,7 @@ struct ProjectionBuilder {
     text: String,
     source_boundaries: Vec<usize>,
     runs: Vec<VisualRun>,
+    atomic_ranges: Vec<AtomicVisualRange>,
 }
 
 impl ProjectionBuilder {
@@ -768,6 +820,7 @@ impl ProjectionBuilder {
             text: String::new(),
             source_boundaries: vec![0],
             runs: Vec::new(),
+            atomic_ranges: Vec::new(),
         }
     }
 
@@ -849,10 +902,15 @@ impl ProjectionBuilder {
             run.range.end = run.range.end.min(length);
             run.range.start < run.range.end
         });
+        self.atomic_ranges.retain_mut(|atomic| {
+            atomic.visual.end = atomic.visual.end.min(length);
+            atomic.visual.start < atomic.visual.end
+        });
         VisualProjection {
             text: self.text,
             source_boundaries: self.source_boundaries,
             runs: self.runs,
+            atomic_ranges: self.atomic_ranges,
         }
     }
 
@@ -867,6 +925,7 @@ impl ProjectionBuilder {
         let (consumed, visual) = container_prefix(raw);
         if !visual.is_empty() {
             self.append_marker(
+                source,
                 &visual,
                 line_start..line_start + consumed,
                 marker_style(format),
@@ -889,6 +948,7 @@ impl ProjectionBuilder {
         let (consumed, visual) = container_prefix(&source[line_start..line_end]);
         if !visual.is_empty() {
             self.append_marker(
+                source,
                 &visual,
                 line_start..line_start + consumed,
                 marker_style(format),
@@ -927,7 +987,7 @@ impl ProjectionBuilder {
             };
             style.marker = true;
             self.ensure_line_break(line_start, style);
-            self.append_marker(&visual, line_start..line_start + consumed, style);
+            self.append_marker(source, &visual, line_start..line_start + consumed, style);
         }
     }
 
@@ -989,7 +1049,7 @@ impl ProjectionBuilder {
             );
             return;
         }
-        self.append_transformed(rendered, range, style);
+        self.append_transformed(source, rendered, range, style);
     }
 
     fn append_text_with_footnote_references(
@@ -999,6 +1059,7 @@ impl ProjectionBuilder {
         range: Range<usize>,
         style: VisualStyle,
         references: &[Range<usize>],
+        source_selection: Option<&Range<usize>>,
     ) {
         let first = references.partition_point(|reference| reference.end <= range.start);
         let count = references[first..].partition_point(|reference| reference.start < range.end);
@@ -1023,10 +1084,12 @@ impl ProjectionBuilder {
                 let mut reference_style = style;
                 reference_style.link = true;
                 reference_style.footnote = true;
-                self.append_transformed(
-                    &format!("〔{label}〕"),
+                self.append_footnote_reference(
+                    source,
+                    label,
                     reference.clone(),
                     reference_style,
+                    source_selection,
                 );
             }
             cursor = cursor.max(reference.end);
@@ -1071,8 +1134,80 @@ impl ProjectionBuilder {
         }
     }
 
+    fn append_footnote_reference(
+        &mut self,
+        source: &str,
+        label: &str,
+        source_range: Range<usize>,
+        style: VisualStyle,
+        source_selection: Option<&Range<usize>>,
+    ) {
+        if source_selection
+            .is_some_and(|selection| selection_reveals_hidden_source(selection, &source_range))
+        {
+            let mut revealed_style = style;
+            revealed_style.marker = true;
+            self.append_mapped(
+                source,
+                &source[source_range.clone()],
+                source_range,
+                revealed_style,
+            );
+        } else {
+            self.append_transformed(source, &format!("〔{label}〕"), source_range, style);
+        }
+    }
+
+    fn append_html(
+        &mut self,
+        source: &str,
+        source_range: Range<usize>,
+        style: VisualStyle,
+        source_selection: Option<&Range<usize>>,
+    ) {
+        let tags = html_tag_ranges(&source[source_range.clone()], source_range.start);
+        let mut visible_cursor = source_range.start;
+        let mut has_visible_text = false;
+        for tag in &tags {
+            has_visible_text |= !source[visible_cursor..tag.start].trim().is_empty();
+            visible_cursor = tag.end;
+        }
+        has_visible_text |= !source[visible_cursor..source_range.end].trim().is_empty();
+        let reveal_tag_only_html = source_selection.is_some()
+            && !has_visible_text
+            && source_range.start == 0
+            && source_range.end == source.len();
+
+        let mut cursor = source_range.start;
+        for tag in tags {
+            if cursor < tag.start {
+                self.append_mapped(source, &source[cursor..tag.start], cursor..tag.start, style);
+            }
+            if reveal_tag_only_html
+                || source_selection
+                    .is_some_and(|selection| selection_reveals_hidden_source(selection, &tag))
+            {
+                let mut marker = style;
+                marker.marker = true;
+                self.append_mapped(source, &source[tag.clone()], tag.clone(), marker);
+            } else {
+                self.set_current_boundary(tag.end);
+            }
+            cursor = tag.end;
+        }
+        if cursor < source_range.end {
+            self.append_mapped(
+                source,
+                &source[cursor..source_range.end],
+                cursor..source_range.end,
+                style,
+            );
+        }
+    }
+
     fn append_transformed(
         &mut self,
+        source: &str,
         rendered: &str,
         source_range: Range<usize>,
         style: VisualStyle,
@@ -1085,32 +1220,50 @@ impl ProjectionBuilder {
         let rendered_chars = rendered.chars().count();
         let visual_start = self.text.chars().count();
         self.text.push_str(rendered);
+        let source_boundaries = source[source_range.clone()]
+            .char_indices()
+            .map(|(index, _)| source_range.start + index)
+            .chain(std::iter::once(source_range.end))
+            .collect::<Vec<_>>();
         for index in 1..=rendered_chars {
-            self.source_boundaries.push(if index == rendered_chars {
-                source_range.end
-            } else {
-                source_range.start
+            let source_index = index * source_boundaries.len().saturating_sub(1) / rendered_chars;
+            self.source_boundaries.push(source_boundaries[source_index]);
+        }
+        let visual_end = self.text.chars().count();
+        if !source_range.is_empty() {
+            self.atomic_ranges.push(AtomicVisualRange {
+                visual: visual_start..visual_end,
+                source: source_range,
             });
         }
-        push_run(
-            &mut self.runs,
-            visual_start..self.text.chars().count(),
-            style,
-        );
+        push_run(&mut self.runs, visual_start..visual_end, style);
     }
 
     fn append_marker(
         &mut self,
+        source: &str,
         rendered: &str,
         source_range: Range<usize>,
         mut style: VisualStyle,
     ) {
         style.marker = true;
-        self.append_transformed(rendered, source_range, style);
+        self.append_transformed(source, rendered, source_range, style);
     }
 
     fn append_virtual(&mut self, rendered: &str, source_byte: usize, style: VisualStyle) {
-        self.append_transformed(rendered, source_byte..source_byte, style);
+        if rendered.is_empty() {
+            return;
+        }
+        self.set_current_boundary(source_byte);
+        let visual_start = self.text.chars().count();
+        self.text.push_str(rendered);
+        self.source_boundaries
+            .extend(std::iter::repeat_n(source_byte, rendered.chars().count()));
+        push_run(
+            &mut self.runs,
+            visual_start..self.text.chars().count(),
+            style,
+        );
     }
 
     fn ensure_line_break(&mut self, source_byte: usize, style: VisualStyle) {
@@ -1199,6 +1352,87 @@ fn selection_reveals_inline_code(
             && source_selection.start <= content_range.end;
     }
     source_selection.start <= content_range.end && source_selection.end >= content_range.start
+}
+
+fn selection_reveals_hidden_source(
+    source_selection: &Range<usize>,
+    source_range: &Range<usize>,
+) -> bool {
+    if source_selection.is_empty() {
+        return source_range.start < source_selection.start
+            && source_selection.start < source_range.end;
+    }
+    source_selection.start <= source_range.end && source_selection.end >= source_range.start
+}
+
+fn visual_change_intersects(change: &Range<usize>, atomic: &Range<usize>) -> bool {
+    if change.is_empty() {
+        atomic.start < change.start && change.start < atomic.end
+    } else {
+        change.start < atomic.end && change.end > atomic.start
+    }
+}
+
+fn html_tag_ranges(fragment: &str, source_offset: usize) -> Vec<Range<usize>> {
+    let bytes = fragment.as_bytes();
+    let mut ranges = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'<' || !looks_like_html_tag_start(bytes.get(cursor + 1).copied()) {
+            cursor += fragment[cursor..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
+
+        let start = cursor;
+        if fragment[start..].starts_with("<!--") {
+            cursor = fragment[start + 4..]
+                .find("-->")
+                .map_or(bytes.len(), |end| start + 4 + end + 3);
+        } else {
+            cursor += 1;
+            let mut quote = None;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'\'' | b'"' if quote.is_none() => quote = Some(bytes[cursor]),
+                    byte if quote == Some(byte) => quote = None,
+                    b'>' if quote.is_none() => {
+                        cursor += 1;
+                        break;
+                    }
+                    _ => {}
+                }
+                cursor += 1;
+            }
+        }
+        ranges.push(source_offset + start..source_offset + cursor);
+    }
+    ranges
+}
+
+fn looks_like_html_tag_start(character: Option<u8>) -> bool {
+    character.is_some_and(|character| {
+        character.is_ascii_alphabetic() || matches!(character, b'/' | b'!' | b'?')
+    })
+}
+
+fn table_separator_range(source: &str, cell_start: usize) -> Option<Range<usize>> {
+    let line_start = source[..cell_start]
+        .rfind(['\n', '\r'])
+        .map_or(0, |index| index + 1);
+    source[line_start..cell_start]
+        .match_indices('|')
+        .rev()
+        .find_map(|(relative, _)| {
+            let pipe = line_start + relative;
+            let escaped = source[line_start..pipe]
+                .bytes()
+                .rev()
+                .take_while(|byte| *byte == b'\\')
+                .count()
+                % 2
+                == 1;
+            (!escaped).then_some(pipe..pipe + 1)
+        })
 }
 
 fn fenced_code_content_start(source: &str, block_start: usize) -> usize {
@@ -1310,20 +1544,6 @@ fn container_prefix(raw: &str) -> (usize, String) {
         }
     }
     (cursor, visual)
-}
-
-fn strip_html_tags(source: &str) -> String {
-    let mut output = String::with_capacity(source.len());
-    let mut inside_tag = false;
-    for character in source.chars() {
-        match character {
-            '<' => inside_tag = true,
-            '>' if inside_tag => inside_tag = false,
-            _ if !inside_tag => output.push(character),
-            _ => {}
-        }
-    }
-    output
 }
 
 fn trailing_line_break_boundary(source: &str, range: &Range<usize>) -> usize {
@@ -1523,6 +1743,83 @@ mod tests {
                 .runs_for(code.text())
                 .iter()
                 .any(|run| run.style.footnote)
+        );
+    }
+
+    #[test]
+    fn footnote_references_reveal_for_exact_edits_and_fall_back_to_atomic_replacement() {
+        let source = "脚注[^12]";
+        let collapsed = VisualProjection::from_markdown(source);
+        assert_eq!(collapsed.text(), "脚注〔12〕");
+
+        let label_start = source[..source.find("12").unwrap()].chars().count();
+        let revealed =
+            VisualProjection::from_markdown_with_selection(source, Some(label_start..label_start));
+        assert_eq!(revealed.text(), source);
+        let edited = revealed.text().replacen('1', "9", 1);
+        let update = revealed
+            .apply_edit(source, &edited, label_start + 1..label_start + 1)
+            .unwrap();
+        assert_eq!(update.source, "脚注[^92]");
+
+        let one = collapsed.text().find('1').unwrap();
+        let visual_one = collapsed.text()[..one].chars().count();
+        let mut edited = collapsed.text().to_owned();
+        edited.replace_range(one..one + 1, "替换");
+        let update = collapsed
+            .apply_edit(source, &edited, visual_one + 2..visual_one + 2)
+            .unwrap();
+        assert_eq!(update.source, "脚注替换");
+        assert_eq!(update.selection, 4..4);
+    }
+
+    #[test]
+    fn html_projection_preserves_visible_text_and_quoted_angle_brackets() {
+        let source = "before <span title=\"a > b\">重点</span> after";
+        let projection = VisualProjection::from_markdown(source);
+        assert_eq!(projection.text(), "before 重点 after");
+        assert!(!projection.text().contains("title"));
+
+        let content_byte = source.find("重点").unwrap();
+        let content_start = source[..content_byte].chars().count();
+        let update = type_visual_frame(source, content_start..content_start + 2, "关键");
+        assert_eq!(
+            update.source,
+            "before <span title=\"a > b\">关键</span> after"
+        );
+
+        let tag_cursor = source[..source.find("a > b").unwrap() + 2].chars().count();
+        let revealed =
+            VisualProjection::from_markdown_with_selection(source, Some(tag_cursor..tag_cursor));
+        assert_eq!(revealed.text(), "before <span title=\"a > b\">重点 after");
+        assert!(revealed.runs.iter().any(|run| run.style.marker));
+
+        let block = "<div data-value=\"a > b\">文字</div>";
+        assert_eq!(VisualProjection::from_markdown(block).text(), "文字");
+
+        let tag_only = "<img alt=\"diagram\" src=\"image.png\">";
+        assert_eq!(VisualProjection::from_markdown(tag_only).text(), "");
+        assert_eq!(
+            VisualProjection::from_markdown_with_selection(tag_only, Some(0..0)).text(),
+            tag_only
+        );
+    }
+
+    #[test]
+    fn table_separator_edits_modify_the_backing_pipe_instead_of_being_discarded() {
+        let source = "| a | b |\n| --- | --- |\n| 1 | 2 |";
+        let projection = VisualProjection::from_markdown(source);
+        let separator_byte = projection.text().find('│').unwrap();
+        let separator = projection.text()[..separator_byte].chars().count();
+        let mut edited = projection.text().to_owned();
+        edited.remove(separator_byte);
+        let update = projection
+            .apply_edit(source, &edited, separator..separator)
+            .unwrap();
+
+        assert_eq!(
+            update.source.matches('|').count(),
+            source.matches('|').count() - 1
         );
     }
 

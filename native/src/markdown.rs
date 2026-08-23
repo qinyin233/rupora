@@ -816,15 +816,27 @@ fn expand_front_matter_and_toc(source: &str) -> String {
         output.push('\n');
     }
 
-    let mut in_fence = false;
+    let mut code_ranges = Parser::new_ext(body, parser_options())
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            matches!(event, Event::Start(Tag::CodeBlock(_))).then_some(range)
+        })
+        .peekable();
+    let mut body_offset = 0usize;
     let mut toc_expansion_bytes = 0usize;
     let mut toc_limit_reported = false;
     for line in body.split_inclusive('\n') {
         let trimmed = line.trim();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
+        while code_ranges
+            .peek()
+            .is_some_and(|range| range.end <= body_offset)
+        {
+            code_ranges.next();
         }
-        if !in_fence && trimmed.eq_ignore_ascii_case("[TOC]") {
+        let in_code = code_ranges
+            .peek()
+            .is_some_and(|range| range.start <= body_offset && body_offset < range.end);
+        if !in_code && trimmed.eq_ignore_ascii_case("[TOC]") {
             if toc_expansion_bytes
                 .checked_add(toc.len())
                 .is_some_and(|bytes| bytes <= MAX_TOC_EXPANSION_BYTES)
@@ -843,6 +855,7 @@ fn expand_front_matter_and_toc(source: &str) -> String {
         } else {
             output.push_str(line);
         }
+        body_offset += line.len();
     }
     if !body.is_empty() && !body.ends_with('\n') && output.is_empty() {
         output.push_str(body);
@@ -1168,9 +1181,15 @@ fn validate_generated_svg_size(tree: &usvg::Tree, kind: &str) -> Result<(), Stri
     let width = size.width();
     let height = size.height();
     let pixels = f64::from(width) * f64::from(height);
-    let aspect_ratio = width.max(height) / width.min(height);
+    let aspect_ratio = if width > 0.0 && height > 0.0 {
+        width.max(height) / width.min(height)
+    } else {
+        f32::INFINITY
+    };
     if !width.is_finite()
         || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
         || width > MAX_GENERATED_SVG_EDGE
         || height > MAX_GENERATED_SVG_EDGE
         || pixels > MAX_GENERATED_SVG_PIXELS
@@ -1274,7 +1293,9 @@ fn escape_html(text: &str) -> String {
 }
 
 fn is_local_link(destination: &str) -> bool {
-    if destination.is_empty() || destination.starts_with('#') {
+    let bytes = destination.as_bytes();
+    let windows_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if destination.is_empty() || destination.starts_with(['#', '/', '\\']) || windows_drive {
         return false;
     }
     let before_slash = destination
@@ -1369,6 +1390,22 @@ mod tests {
         let html = render_html_fragment(source);
         assert!(html.contains("href=\"#same-1\""));
         assert!(html.contains("<h2 id=\"same-1\">Same</h2>"));
+    }
+
+    #[test]
+    fn toc_expansion_uses_parsed_code_block_ranges() {
+        let source = "    ```\n    [TOC]\n\n[TOC]\n\n# Real heading\n";
+        let expanded = expand_front_matter_and_toc(source);
+
+        assert!(expanded.starts_with("    ```\n    [TOC]\n"));
+        assert_eq!(expanded.matches("[TOC]").count(), 1);
+        assert_eq!(expanded.matches("[Real heading](#real-heading)").count(), 1);
+
+        let fenced = "```text\n[TOC]\n```\n\n[TOC]\n\n# Outside\n";
+        let expanded = expand_front_matter_and_toc(fenced);
+        assert!(expanded.starts_with("```text\n[TOC]\n```"));
+        assert_eq!(expanded.matches("[TOC]").count(), 1);
+        assert!(expanded.contains("[Outside](#outside)"));
     }
 
     #[test]
@@ -1485,6 +1522,12 @@ mod tests {
     }
 
     #[test]
+    fn rejects_generated_svg_with_degenerate_geometry() {
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"0\" height=\"0\"></svg>";
+        assert!(bound_generated_svg(svg.to_owned(), "test").is_err());
+    }
+
+    #[test]
     fn generated_placeholder_text_cannot_expand_user_content() {
         let marker = "RUPORA_GENERATED_BLOCK_0_B5C4718D_0__";
         let html = render_html_fragment(&format!("{marker}\n\n$x$"));
@@ -1509,6 +1552,9 @@ mod tests {
              [mail](mailto:test@example.com) [local anchor](other.md#section)",
         );
         assert_eq!(links, vec!["notes/today.md", "other.md#section"]);
+        assert!(!is_local_link(r"C:\notes\a.md"));
+        assert!(!is_local_link(r"\\server\share\a.md"));
+        assert!(!is_local_link("/absolute/a.md"));
     }
 
     #[test]
