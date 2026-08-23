@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7f0790ebab0516c8ed5f9b624d11bb74da4ba56ebfe60f68ed0474d87a9b82f2 # shrinks to prefix = "", content = "文", suffix = "a", delimiter_index = 0, raw_start = 0, raw_end = 0, delete = false
+cc 845692ba3a77292e0bbd22706cc1c75c1ba53e9985d75287fcf6771f56847100 # shrinks to prefix = "", content = "aaaaaaaaaaaaa文中文", suffix = "中", delimiter_index = 0, raw_start = 3549715600852855182, raw_end = 7044008895293762327, delete = true
+cc 4a17236b8a2d6fca182548bd0b0c5ce1d7af188a49dc86022fc1d4993d5a7d14 # shrinks to prefix = "", content = "aaaaa中🙂aaaaaa", suffix = "", delimiter_index = 0, raw_start = 5210324996853209261, raw_end = 4137080253359784855, delete = false
+cc 330d8ed4b13fcd833248d3a0dca363c396073963e780f53a1b4214c8ac33b361 # shrinks to prefix = "a", content = "aaaaa🙂aa", suffix = "", delimiter_index = 0, raw_start = 8363946934358971929, raw_end = 9686478735552000866, delete = true
+cc 0acb773bc28e11e32d67aeb493f6f91cc1abe711d131c22e6e94e502259d9dad # shrinks to prefix = "", content = "aaa", suffix = "", delimiter_index = 3, raw_start = 1367629006111427800, raw_end = 5575506298168256251, delete = true

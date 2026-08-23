@@ -25,5 +25,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "wysiwyg_projection"
+path = "fuzz_targets/wysiwyg_projection.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

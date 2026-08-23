@@ -15,6 +15,6 @@ pub mod recovery;
 pub mod table;
 pub mod updater;
 pub mod workspace;
-mod wysiwyg;
+pub mod wysiwyg;
 
 pub use app::RuporaApp;

@@ -295,6 +295,8 @@ impl VisualProjection {
                     }
                 }
                 Event::Code(text) => {
+                    let syntax_end = range.end;
+                    builder.begin_inline_wrapper(range.start);
                     builder.append_container_prefix(source, range.start, format);
                     let mut style = format.visual();
                     style.code = true;
@@ -306,6 +308,7 @@ impl VisualProjection {
                     } else {
                         builder.append_mapped(source, &text, range, style);
                     }
+                    builder.end_inline_wrapper(syntax_end);
                 }
                 Event::InlineMath(text) | Event::DisplayMath(text) => {
                     builder.append_container_prefix(source, range.start, format);
@@ -403,7 +406,8 @@ impl VisualProjection {
         edited: &str,
         visual_selection: Range<usize>,
     ) -> Option<VisualSourceEdit> {
-        let change = text_change(&self.text, edited)?;
+        let selection = clamp_range(visual_selection, edited.chars().count());
+        let change = text_change_anchored_at_selection(&self.text, edited, &selection)?;
         let insertion = change.old.is_empty();
         let mut source_start = self.source_boundaries[change.old.start];
         let mut source_end = if insertion {
@@ -442,8 +446,7 @@ impl VisualProjection {
         let mut output = source.to_owned();
         output.replace_range(source_start..source_end, replacement);
         let delta = replacement.len() as isize - (source_end - source_start) as isize;
-        let selection = clamp_range(visual_selection, edited.chars().count());
-        let start_byte = self.edited_source_byte(
+        let mut start_byte = self.edited_source_byte(
             edited,
             selection.start,
             &change,
@@ -451,7 +454,7 @@ impl VisualProjection {
             source_end,
             delta,
         );
-        let end_byte = self.edited_source_byte(
+        let mut end_byte = self.edited_source_byte(
             edited,
             selection.end,
             &change,
@@ -459,11 +462,80 @@ impl VisualProjection {
             source_end,
             delta,
         );
+        let repair_bytes = self.repair_inline_flanking_boundaries(
+            source,
+            edited,
+            &change.old,
+            source_start,
+            source_end,
+            delta,
+            &mut output,
+        );
+        if !repair_bytes.is_empty() {
+            const REPAIR: &str = "<!---->";
+            start_byte += repair_bytes
+                .iter()
+                .filter(|repair| start_byte >= **repair)
+                .count()
+                * REPAIR.len();
+            end_byte += repair_bytes
+                .iter()
+                .filter(|repair| end_byte >= **repair)
+                .count()
+                * REPAIR.len();
+        }
 
         Some(VisualSourceEdit {
             selection: output[..start_byte].chars().count()..output[..end_byte].chars().count(),
             source: output,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn repair_inline_flanking_boundaries(
+        &self,
+        original_source: &str,
+        edited_visual: &str,
+        changed_visual: &Range<usize>,
+        source_start: usize,
+        source_end: usize,
+        delta: isize,
+        output: &mut String,
+    ) -> Vec<usize> {
+        const REPAIR: &str = "<!---->";
+        let wrapper = self
+            .inline_wrappers
+            .iter()
+            .filter(|wrapper| {
+                wrapper.visual.start <= changed_visual.start
+                    && changed_visual.end <= wrapper.visual.end
+                    && source_start >= wrapper.source.start
+                    && source_end <= wrapper.source.end
+            })
+            .filter(|wrapper| inline_flanking_wrapper(original_source, &wrapper.source))
+            .min_by_key(|wrapper| wrapper.source.end - wrapper.source.start);
+        let Some(wrapper) = wrapper else {
+            return Vec::new();
+        };
+        if VisualProjection::from_markdown(output).text() == edited_visual {
+            return Vec::new();
+        }
+        let start = wrapper.source.start;
+        let end = shift_index(wrapper.source.end, delta);
+        if !output.is_char_boundary(start) || !output.is_char_boundary(end) {
+            return Vec::new();
+        }
+        for positions in [vec![end], vec![start], vec![start, end]] {
+            let mut candidate = output.clone();
+            for position in positions.iter().copied().rev() {
+                candidate.insert_str(position, REPAIR);
+            }
+            if VisualProjection::from_markdown(&candidate).text() == edited_visual {
+                *output = candidate;
+                return positions;
+            }
+        }
+        Vec::new()
     }
 
     pub fn runs_for(&self, edited: &str) -> Vec<VisualRun> {
@@ -601,6 +673,18 @@ impl VisualProjection {
         );
         source_start + relative
     }
+}
+
+fn inline_flanking_wrapper(source: &str, range: &Range<usize>) -> bool {
+    source.get(range.clone()).is_some_and(|fragment| {
+        ["***", "___", "**", "__", "~~", "*", "_"]
+            .into_iter()
+            .any(|delimiter| {
+                fragment.len() >= delimiter.len() * 2
+                    && fragment.starts_with(delimiter)
+                    && fragment.ends_with(delimiter)
+            })
+    })
 }
 
 fn empty_inline_wrapper_at(
@@ -1776,6 +1860,50 @@ fn text_change(before: &str, after: &str) -> Option<TextChange> {
     })
 }
 
+fn text_change_anchored_at_selection(
+    before: &str,
+    after: &str,
+    after_selection: &Range<usize>,
+) -> Option<TextChange> {
+    let fallback = text_change(before, after)?;
+    if !after_selection.is_empty() {
+        return Some(fallback);
+    }
+    let old_length = fallback.old.len();
+    let new_length = fallback.new.len();
+    let new_end = after_selection.end;
+    let Some(new_start) = new_end.checked_sub(new_length) else {
+        return Some(fallback);
+    };
+    let old_start = new_start;
+    let Some(old_end) = old_start.checked_add(old_length) else {
+        return Some(fallback);
+    };
+    let before_length = before.chars().count();
+    let after_length = after.chars().count();
+    if old_end > before_length || new_end > after_length {
+        return Some(fallback);
+    }
+    let candidate = TextChange {
+        old: old_start..old_end,
+        new: new_start..new_end,
+    };
+    if text_change_ranges_match(before, after, &candidate) {
+        Some(candidate)
+    } else {
+        Some(fallback)
+    }
+}
+
+fn text_change_ranges_match(before: &str, after: &str, change: &TextChange) -> bool {
+    let before_old_start = char_to_byte(before, change.old.start);
+    let before_old_end = char_to_byte(before, change.old.end);
+    let after_new_start = char_to_byte(after, change.new.start);
+    let after_new_end = char_to_byte(after, change.new.end);
+    before[..before_old_start] == after[..after_new_start]
+        && before[before_old_end..] == after[after_new_end..]
+}
+
 fn item_prefix(source: &str, item_start: usize) -> Option<(Range<usize>, String)> {
     let line_start = source[..item_start]
         .rfind('\n')
@@ -1959,6 +2087,22 @@ mod tests {
         projection
             .apply_edit(source, &edited, cursor..cursor)
             .expect("typed frame should update the source")
+    }
+
+    fn safe_inline_text(length: Range<usize>) -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                Just('a'),
+                Just('b'),
+                Just('Z'),
+                Just('0'),
+                Just('中'),
+                Just('文'),
+                Just('🙂'),
+            ],
+            length,
+        )
+        .prop_map(|characters| characters.into_iter().collect())
     }
 
     #[test]
@@ -2873,6 +3017,57 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn visible_inline_format_edits_round_trip_without_losing_hidden_syntax(
+            prefix in safe_inline_text(0..8),
+            content in safe_inline_text(1..20),
+            suffix in safe_inline_text(0..8),
+            delimiter_index in 0usize..4,
+            raw_start in any::<usize>(),
+            raw_end in any::<usize>(),
+            delete in any::<bool>(),
+        ) {
+            let delimiter = ["*", "**", "~~", "`"][delimiter_index];
+            let source = format!("{prefix}{delimiter}{content}{delimiter}{suffix}");
+            let projection = VisualProjection::from_markdown(&source);
+            let expected_visual = format!("{prefix}{content}{suffix}");
+            prop_assume!(projection.text() == expected_visual);
+
+            let content_len = content.chars().count();
+            let mut local_start = raw_start % (content_len + 1);
+            let mut local_end = raw_end % (content_len + 1);
+            if local_start > local_end {
+                std::mem::swap(&mut local_start, &mut local_end);
+            }
+            if local_start == local_end {
+                local_end = (local_end + 1).min(content_len);
+                if local_start == local_end {
+                    local_start = local_start.saturating_sub(1);
+                }
+            }
+            let visual_start = prefix.chars().count() + local_start;
+            let visual_end = prefix.chars().count() + local_end;
+            let replacement = if delete { "" } else { "中🙂" };
+            let mut edited = expected_visual;
+            edited.replace_range(
+                char_to_byte(&edited, visual_start)..char_to_byte(&edited, visual_end),
+                replacement,
+            );
+            prop_assume!(edited != projection.text());
+            let cursor = visual_start + replacement.chars().count();
+            let update = projection
+                .apply_edit(&source, &edited, cursor..cursor)
+                .expect("a visible inline edit must map back to Markdown");
+            let reparsed = VisualProjection::from_markdown(&update.source);
+            prop_assert_eq!(
+                reparsed.text(),
+                edited,
+                "updated source: {:?}",
+                update.source
+            );
+            prop_assert!(update.selection.end <= update.source.chars().count());
+        }
+
         #[test]
         fn visual_boundaries_and_unicode_edits_stay_utf8_safe(source in any::<String>()) {
             let projection = VisualProjection::from_markdown(&source);

@@ -75,7 +75,7 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
 
   fuzz-build:
-    name: Build fuzz targets
+    name: Run fuzz targets
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -97,8 +97,11 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version '=0.13.2' --locked
 
-      - name: Build fuzz targets
+      - name: Build and run fuzz targets
         working-directory: fuzz
         run: |
           cargo fuzz build
+          for target in markdown_pipeline table_parser wysiwyg_projection; do
+            cargo fuzz run "$target" -- -max_total_time=30 -rss_limit_mb=4096
+          done
           git -C .. diff --exit-code -- fuzz/Cargo.lock

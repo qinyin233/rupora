@@ -52,6 +52,7 @@ const APP_STATE_KEY: &str = "rupora-native-state";
 const UI_EXPERIENCE_KEY: &str = "rupora-native-ui-experience";
 const CURRENT_UI_EXPERIENCE: u32 = 3;
 const WYSIWYG_STRONG_FAMILY: &str = "rupora-wysiwyg-strong";
+const MAX_HYBRID_BLOCK_HEIGHT_CACHE: usize = 65_536;
 const WYSIWYG_BODY_LINE_HEIGHT: f32 = 27.0;
 const WYSIWYG_INLINE_CODE_LINE_HEIGHT: f32 = 20.0;
 const WYSIWYG_INLINE_CODE_VERTICAL_PADDING: f32 = 2.0;
@@ -233,6 +234,7 @@ pub struct RuporaApp {
     shortcut_settings_open: bool,
     external_diff_view: Option<String>,
     generated_svg_cache: Rc<RefCell<HashMap<String, Arc<[u8]>>>>,
+    hybrid_block_heights: HashMap<HybridBlockLayoutKey, f32>,
     table_editor: Option<TableEditorState>,
     instance_coordinator: Option<InstanceCoordinator>,
     update_receiver: Option<Receiver<Result<UpdateStatus, String>>>,
@@ -335,6 +337,7 @@ impl RuporaApp {
             shortcut_settings_open: false,
             external_diff_view: None,
             generated_svg_cache: Rc::new(RefCell::new(HashMap::new())),
+            hybrid_block_heights: HashMap::new(),
             table_editor: None,
             instance_coordinator,
             update_receiver: None,
@@ -3325,6 +3328,9 @@ impl RuporaApp {
 
     fn hybrid_pane(&mut self, ui: &mut Ui, index: usize) {
         self.apply_hybrid_cross_selection_input(ui, index);
+        if self.hybrid_block_heights.len() > MAX_HYBRID_BLOCK_HEIGHT_CACHE {
+            self.hybrid_block_heights.clear();
+        }
         let viewport_height = ui.available_height();
         let source = self.documents[index].content.clone();
         let document_id = self.documents[index].id();
@@ -3335,6 +3341,7 @@ impl RuporaApp {
         let base_path = self.preview_base_path(index);
         let svg_cache = self.generated_svg_cache.clone();
         let dark = self.state.dark;
+        let screen_reader = ui.ctx().options(|options| options.screen_reader);
 
         let mut pending_source_cursor = self.pending_editor_cursor.take();
         if let Some(cursor_range) = pending_source_cursor {
@@ -3400,22 +3407,8 @@ impl RuporaApp {
                                 ui.set_min_height((viewport_height - 142.0).max(480.0));
                                 for (block_index, block) in blocks.iter().enumerate() {
                                     let source_block = &source[block.range.clone()];
-                                    let generated_preview = if block.range.start == 0 {
-                                        front_matter.as_ref().and_then(|front| {
-                                            (block.range.end <= front.body_start).then(|| {
-                                                markdown::front_matter_preview_markdown(front)
-                                            })
-                                        })
-                                    } else if source_block.trim().eq_ignore_ascii_case("[TOC]") {
-                                        Some(markdown::toc_preview_markdown(&source))
-                                    } else {
-                                        None
-                                    };
-                                    let preview_source =
-                                        generated_preview.as_deref().unwrap_or(source_block);
                                     let code_content = fenced_code_content(source_block);
                                     let block_is_code = code_content.is_some();
-                                    let mut code_surface_rect = None;
                                     if block_index > 0
                                         && Some(blocks[block_index - 1].id) != active_id
                                     {
@@ -3460,6 +3453,54 @@ impl RuporaApp {
                                             }
                                         }
                                     }
+                                    let block_layout_start = ui.next_widget_position().y;
+                                    let layout_key = HybridBlockLayoutKey {
+                                        document_id,
+                                        block_id: block.id,
+                                        width: ui.available_width().round().clamp(0.0, u16::MAX as f32)
+                                            as u16,
+                                        dark,
+                                    };
+                                    let block_height = self
+                                        .hybrid_block_heights
+                                        .get(&layout_key)
+                                        .copied()
+                                        .unwrap_or_else(|| {
+                                            estimated_hybrid_block_height(
+                                                source_block,
+                                                ui.available_width(),
+                                                block_is_code,
+                                            )
+                                        });
+                                    let predicted_rect = egui::Rect::from_min_size(
+                                        egui::pos2(ui.min_rect().left(), block_layout_start),
+                                        egui::vec2(ui.available_width(), block_height),
+                                    );
+                                    let prefetch_rect = ui
+                                        .clip_rect()
+                                        .expand2(egui::vec2(0.0, viewport_height.max(200.0)));
+                                    if !screen_reader
+                                        && Some(block.id) != active_id
+                                        && !prefetch_rect.intersects(predicted_rect)
+                                    {
+                                        ui.add_space(block_height);
+                                        continue;
+                                    }
+
+                                    let generated_preview = if block.range.start == 0 {
+                                        front_matter.as_ref().and_then(|front| {
+                                            (block.range.end <= front.body_start).then(|| {
+                                                markdown::front_matter_preview_markdown(front)
+                                            })
+                                        })
+                                    } else if source_block.trim().eq_ignore_ascii_case("[TOC]") {
+                                        Some(markdown::toc_preview_markdown(&source))
+                                    } else {
+                                        None
+                                    };
+                                    let preview_source =
+                                        generated_preview.as_deref().unwrap_or(source_block);
+                                    let mut code_surface_rect = None;
                                     ui.push_id(("hybrid-block", block.id), |ui| {
                                         if Some(block.id) == active_id {
                                             let edit_range =
@@ -4226,6 +4267,10 @@ impl RuporaApp {
                                     } else {
                                         ui.add_space(8.0);
                                     }
+                                    let measured_height =
+                                        (ui.next_widget_position().y - block_layout_start).max(1.0);
+                                    self.hybrid_block_heights
+                                        .insert(layout_key, measured_height);
                                 }
                                 ui.add_space(60.0);
                             });
@@ -5382,6 +5427,14 @@ struct NativeBlockPreview {
     atomic: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct HybridBlockLayoutKey {
+    document_id: u64,
+    block_id: BlockId,
+    width: u16,
+    dark: bool,
+}
+
 #[derive(Clone)]
 struct HybridPointerRegion {
     block_id: BlockId,
@@ -5393,9 +5446,6 @@ struct HybridPointerRegion {
 
 impl HybridPointerRegion {
     fn source_char_at_position(&self, source: &str, position: egui::Pos2) -> Option<usize> {
-        if !self.rect.expand(3.0).contains(position) {
-            return None;
-        }
         let block_source = source.get(self.source_range.clone())?;
         let local_byte = self
             .mapping
@@ -5410,11 +5460,65 @@ fn hybrid_pointer_hit(
     regions: &[HybridPointerRegion],
     position: egui::Pos2,
 ) -> Option<(BlockId, usize)> {
-    regions.iter().find_map(|region| {
-        region
-            .source_char_at_position(source, position)
-            .map(|cursor| (region.block_id, cursor))
-    })
+    regions
+        .iter()
+        .filter(|region| region.rect.expand(3.0).contains(position))
+        .min_by(|left, right| {
+            pointer_rect_distance(left.rect, position)
+                .total_cmp(&pointer_rect_distance(right.rect, position))
+                .then_with(|| {
+                    left.rect
+                        .center()
+                        .distance_sq(position)
+                        .total_cmp(&right.rect.center().distance_sq(position))
+                })
+        })
+        .and_then(|region| {
+            region
+                .source_char_at_position(source, position)
+                .map(|cursor| (region.block_id, cursor))
+        })
+}
+
+fn pointer_rect_distance(rect: egui::Rect, position: egui::Pos2) -> f32 {
+    let horizontal = if position.x < rect.left() {
+        rect.left() - position.x
+    } else if position.x > rect.right() {
+        position.x - rect.right()
+    } else {
+        0.0
+    };
+    let vertical = if position.y < rect.top() {
+        rect.top() - position.y
+    } else if position.y > rect.bottom() {
+        position.y - rect.bottom()
+    } else {
+        0.0
+    };
+    horizontal.mul_add(horizontal, vertical * vertical)
+}
+
+fn estimated_hybrid_block_height(source: &str, width: f32, fenced_code: bool) -> f32 {
+    let characters_per_row = (width / if fenced_code { 8.4 } else { 7.6 })
+        .floor()
+        .max(12.0) as usize;
+    let visual_rows = source
+        .lines()
+        .map(|line| line.chars().count().max(1).div_ceil(characters_per_row))
+        .sum::<usize>()
+        .max(1);
+    let trimmed = source.trim_start();
+    if trimmed.starts_with("![") {
+        360.0
+    } else if fenced_code {
+        visual_rows as f32 * 19.0 + 72.0
+    } else if trimmed.starts_with('|') && source.lines().count() >= 2 {
+        visual_rows as f32 * 30.0 + 24.0
+    } else if trimmed.starts_with('#') {
+        visual_rows as f32 * 38.0 + 18.0
+    } else {
+        visual_rows as f32 * 22.0 + 20.0
+    }
 }
 
 fn paint_hybrid_cross_selection(
@@ -6815,6 +6919,100 @@ mod tests {
             ),
             17
         );
+    }
+
+    #[test]
+    fn overlapping_pointer_slop_prefers_the_region_actually_under_the_pointer() {
+        let source = "aaa\n\nbbb";
+        let blocks = markdown::blocks(source);
+        let regions = [
+            HybridPointerRegion {
+                block_id: blocks[0].id,
+                source_range: blocks[0].range.clone(),
+                rect: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 10.0)),
+                atomic_range: None,
+                mapping: NativePointerMapping::Atomic { source_range: 0..3 },
+            },
+            HybridPointerRegion {
+                block_id: blocks[1].id,
+                source_range: blocks[1].range.clone(),
+                rect: egui::Rect::from_min_max(egui::pos2(0.0, 11.0), egui::pos2(100.0, 21.0)),
+                atomic_range: None,
+                mapping: NativePointerMapping::Atomic { source_range: 0..3 },
+            },
+        ];
+
+        assert_eq!(
+            hybrid_pointer_hit(source, &regions, egui::pos2(50.0, 9.5)).map(|(block, _)| block),
+            Some(blocks[0].id)
+        );
+        assert_eq!(
+            hybrid_pointer_hit(source, &regions, egui::pos2(50.0, 11.5)).map(|(block, _)| block),
+            Some(blocks[1].id)
+        );
+    }
+
+    #[test]
+    #[ignore = "manual large-document WYSIWYG frame measurement"]
+    fn measures_large_native_wysiwyg_layout_cost() {
+        for block_count in [1_000usize, 5_000, 20_000] {
+            let source = (0..block_count)
+                .map(|index| format!("Paragraph {index} with **bold** and 中文。"))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let blocks = markdown::blocks(&source);
+            let context = Context::default();
+            install_fonts(&context);
+            apply_theme(&context, false);
+            let started = Instant::now();
+            let mut rendered = 0usize;
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1_280.0, 800.0),
+                    )),
+                    ..egui::RawInput::default()
+                },
+                |ui| {
+                    ui.set_width(1_280.0);
+                    let mut svg_cache = HashMap::new();
+                    for block in &blocks {
+                        let block_source = &source[block.range.clone()];
+                        let estimated = estimated_hybrid_block_height(
+                            block_source,
+                            ui.available_width(),
+                            false,
+                        );
+                        let predicted = egui::Rect::from_min_size(
+                            ui.next_widget_position(),
+                            egui::vec2(ui.available_width(), estimated),
+                        );
+                        if ui
+                            .clip_rect()
+                            .expand2(egui::vec2(0.0, 800.0))
+                            .intersects(predicted)
+                        {
+                            rendered += 1;
+                            let _ = show_native_block_preview(
+                                ui,
+                                block_source,
+                                Path::new("."),
+                                false,
+                                &mut svg_cache,
+                                app_palette(false),
+                            );
+                        } else {
+                            ui.add_space(estimated);
+                        }
+                    }
+                },
+            );
+            eprintln!(
+                "virtualized native WYSIWYG layout: {block_count} blocks ({rendered} rendered) in {:?}",
+                started.elapsed()
+            );
+        }
     }
 
     #[test]
