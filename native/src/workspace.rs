@@ -19,6 +19,7 @@ pub struct Workspace {
     pub root: PathBuf,
     pub entries: Vec<WorkspaceEntry>,
     pub truncated: bool,
+    pub skipped_directories: usize,
 }
 
 impl Workspace {
@@ -28,11 +29,19 @@ impl Workspace {
         }
         let mut count = 0;
         let mut truncated = false;
-        let entries = scan_directory(&root, 0, &mut count, &mut truncated)?;
+        let mut skipped_directories = 0;
+        let entries = scan_directory(
+            &root,
+            0,
+            &mut count,
+            &mut truncated,
+            &mut skipped_directories,
+        )?;
         Ok(Self {
             root,
             entries,
             truncated,
+            skipped_directories,
         })
     }
 
@@ -48,6 +57,7 @@ fn scan_directory(
     depth: usize,
     count: &mut usize,
     truncated: &mut bool,
+    skipped_directories: &mut usize,
 ) -> Result<Vec<WorkspaceEntry>, String> {
     if depth >= MAX_DEPTH || *count >= MAX_ENTRIES {
         *truncated = true;
@@ -78,7 +88,8 @@ fn scan_directory(
         }
 
         if metadata.is_dir() {
-            let children = scan_directory(&path, depth + 1, count, truncated)?;
+            let children =
+                scan_child_directory(&path, depth + 1, count, truncated, skipped_directories);
             if !children.is_empty() {
                 *count += 1;
                 entries.push(WorkspaceEntry {
@@ -106,6 +117,22 @@ fn scan_directory(
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
     Ok(entries)
+}
+
+fn scan_child_directory(
+    directory: &Path,
+    depth: usize,
+    count: &mut usize,
+    truncated: &mut bool,
+    skipped_directories: &mut usize,
+) -> Vec<WorkspaceEntry> {
+    match scan_directory(directory, depth, count, truncated, skipped_directories) {
+        Ok(children) => children,
+        Err(_) => {
+            *skipped_directories = (*skipped_directories).saturating_add(1);
+            Vec::new()
+        }
+    }
 }
 
 fn should_ignore(name: &str) -> bool {
@@ -151,6 +178,7 @@ mod tests {
         assert_eq!(workspace.entries[0].children[0].name, "two.MD");
         assert_eq!(workspace.entries[1].name, "README.md");
         assert!(!workspace.truncated);
+        assert_eq!(workspace.skipped_directories, 0);
     }
 
     #[test]
@@ -162,5 +190,22 @@ mod tests {
 
         let workspace = Workspace::open(directory.path().to_path_buf()).unwrap();
         assert!(workspace.entries.is_empty());
+    }
+
+    #[test]
+    fn unreadable_or_disappearing_child_directories_do_not_abort_the_scan() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut count = 0;
+        let mut truncated = false;
+        let mut skipped = 0;
+        let entries = scan_child_directory(
+            &directory.path().join("missing"),
+            1,
+            &mut count,
+            &mut truncated,
+            &mut skipped,
+        );
+        assert!(entries.is_empty());
+        assert_eq!(skipped, 1);
     }
 }

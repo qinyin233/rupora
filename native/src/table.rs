@@ -188,22 +188,16 @@ fn parse_row(line: &str) -> Vec<String> {
         .unwrap_or_else(|| trimmed.strip_prefix('|').unwrap_or(trimmed));
     let mut cells = Vec::new();
     let mut current = String::new();
-    let mut escaped = false;
-    for character in content.chars() {
-        if escaped {
-            current.push(character);
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
+    let mut characters = content.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' && matches!(characters.peek(), Some('|' | '\\')) {
+            current.push(characters.next().expect("peeked escaped table character"));
         } else if character == '|' {
             cells.push(current.trim().to_owned());
             current.clear();
         } else {
             current.push(character);
         }
-    }
-    if escaped {
-        current.push('\\');
     }
     cells.push(current.trim().to_owned());
     cells
@@ -221,7 +215,7 @@ fn parse_separator(line: &str) -> Option<Vec<Alignment>> {
             let left = trimmed.starts_with(':');
             let right = trimmed.ends_with(':');
             let dashes = trimmed.trim_matches(':');
-            if dashes.len() < 3 || !dashes.bytes().all(|byte| byte == b'-') {
+            if dashes.is_empty() || !dashes.bytes().all(|byte| byte == b'-') {
                 return None;
             }
             Some(match (left, right) {
@@ -267,6 +261,22 @@ mod tests {
         assert_eq!(table.alignments, vec![Alignment::Left, Alignment::Right]);
         assert_eq!(table.rows[0], vec!["甲|乙", "42"]);
         assert!(table.to_markdown().contains("甲\\|乙"));
+    }
+
+    #[test]
+    fn preserves_literal_backslashes_and_accepts_compact_gfm_separators() {
+        let source = "| Path | Literal |\n| - | :-: |\n| C:\\Temp | a\\\\b |";
+        let table = find_table(source, source.find("Temp").unwrap()).unwrap();
+
+        assert_eq!(table.rows[0], vec![r"C:\Temp", r"a\b"]);
+        let serialized = table.to_markdown();
+        assert!(serialized.contains(r"C:\\Temp"));
+        assert!(serialized.contains(r"a\\b"));
+        assert_eq!(
+            find_table(&serialized, 0).unwrap().rows,
+            table.rows,
+            "opening and applying the table editor must be lossless"
+        );
     }
 
     #[test]

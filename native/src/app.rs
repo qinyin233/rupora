@@ -177,6 +177,25 @@ fn extension_document_index(documents: &[Document], document_id: u64) -> Option<
         .position(|document| document.id() == document_id)
 }
 
+fn restorable_session_files(
+    documents: &[Document],
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Vec<PathBuf> {
+    let open_paths = documents
+        .iter()
+        .filter_map(|document| document.path.as_ref())
+        .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+        .collect::<HashSet<_>>();
+    paths
+        .into_iter()
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            !open_paths.contains(&canonical)
+        })
+        .collect()
+}
+
 pub struct RuporaApp {
     documents: Vec<Document>,
     active: Option<usize>,
@@ -328,9 +347,10 @@ impl RuporaApp {
             app.status = error;
         }
 
+        let mut recovered_count = 0usize;
         match recovered_entries {
             Ok(entries) if !entries.is_empty() => {
-                let recovered_count = entries.len();
+                recovered_count = entries.len();
                 let mut warning_count = 0usize;
                 let mut conflict_count = 0usize;
                 for entry in entries {
@@ -372,15 +392,15 @@ impl RuporaApp {
 
         if !startup_files.is_empty() {
             app.open_paths(startup_files);
-        } else if app.documents.is_empty() {
-            let session_files = app
-                .state
-                .session_files
-                .iter()
-                .filter(|path| path.is_file())
-                .cloned()
-                .collect::<Vec<_>>();
+        } else {
+            let recovered_active = app
+                .active
+                .and_then(|index| app.documents.get(index))
+                .map(Document::id);
+            let session_files =
+                restorable_session_files(&app.documents, app.state.session_files.iter().cloned());
             if !session_files.is_empty() {
+                let documents_before = app.documents.len();
                 app.open_paths(session_files);
                 if let Some(active_path) = app.state.active_session_file.as_ref()
                     && let Some(index) = app
@@ -388,9 +408,23 @@ impl RuporaApp {
                         .iter()
                         .position(|document| document.path.as_ref() == Some(active_path))
                 {
-                    app.active = Some(index);
+                    app.activate_document(index);
+                } else if let Some(recovered_active) = recovered_active
+                    && let Some(index) = app
+                        .documents
+                        .iter()
+                        .position(|document| document.id() == recovered_active)
+                {
+                    app.activate_document(index);
                 }
-                app.status = "已恢复上次会话".to_owned();
+                let reopened = app.documents.len().saturating_sub(documents_before);
+                app.status = if recovered_count > 0 {
+                    format!(
+                        "已恢复 {recovered_count} 个未保存文档，并重新打开 {reopened} 个会话文档"
+                    )
+                } else {
+                    format!("已恢复上次会话（{reopened} 个文档）")
+                };
             }
         }
         if app.documents.is_empty() {
@@ -480,15 +514,25 @@ impl RuporaApp {
     fn open_workspace(&mut self, path: PathBuf) {
         match Workspace::open(path.clone()) {
             Ok(workspace) => {
-                let suffix = if workspace.truncated {
-                    "（文件过多，列表已截断）"
-                } else {
-                    ""
-                };
+                let mut notices = Vec::new();
+                if workspace.truncated {
+                    notices.push("文件过多，列表已截断".to_owned());
+                }
+                if workspace.skipped_directories > 0 {
+                    notices.push(format!(
+                        "已跳过 {} 个不可读目录",
+                        workspace.skipped_directories
+                    ));
+                }
+                let suffix = (!notices.is_empty()).then(|| format!("（{}）", notices.join("；")));
                 self.workspace = Some(workspace);
                 self.state.workspace_root = Some(path.clone());
                 self.state.show_sidebar = true;
-                self.status = format!("已打开工作区：{}{suffix}", path.display());
+                self.status = format!(
+                    "已打开工作区：{}{}",
+                    path.display(),
+                    suffix.as_deref().unwrap_or_default()
+                );
             }
             Err(error) => self.show_error("打开工作区失败", &error),
         }
@@ -1111,7 +1155,23 @@ impl RuporaApp {
                 {
                     self.documents[document].content = replacement;
                     self.documents[document].record_edit(job.before, None, None, EditKind::Other);
-                    self.active = Some(document);
+                    if self.active == Some(document) {
+                        self.hybrid_active = None;
+                        self.hybrid_ime_session = None;
+                        self.hybrid_pointer_anchor = None;
+                        self.hybrid_cross_selection = None;
+                        let content_len = self.documents[document].content.chars().count();
+                        let selection = self
+                            .editor_cursor
+                            .map(cursor_range_to_char_range)
+                            .map(|selection| {
+                                selection.start.min(content_len)..selection.end.min(content_len)
+                            })
+                            .unwrap_or(content_len..content_len);
+                        self.queue_editor_selection(selection);
+                    } else {
+                        self.activate_document(document);
+                    }
                     self.status = job
                         .invocation
                         .message
@@ -6513,6 +6573,20 @@ mod tests {
 
         documents.remove(0);
         assert_eq!(extension_document_index(&documents, target_id), None);
+    }
+
+    #[test]
+    fn clean_session_documents_are_restored_alongside_recovered_tabs() {
+        let directory = tempfile::tempdir().unwrap();
+        let recovered_path = directory.path().join("recovered.md");
+        let clean_path = directory.path().join("clean.md");
+        fs::write(&recovered_path, "recovered").unwrap();
+        fs::write(&clean_path, "clean").unwrap();
+        let recovered = Document::open(&recovered_path).unwrap();
+
+        let paths =
+            restorable_session_files(&[recovered], [recovered_path.clone(), clean_path.clone()]);
+        assert_eq!(paths, vec![clean_path]);
     }
 
     #[test]

@@ -224,6 +224,7 @@ pub fn insert_resource_link(
 ) -> Range<usize> {
     let selection = clamp_char_range(text, selection);
     let label = escape_link_label(label);
+    let destination = escape_link_destination(destination);
     let replacement = if image {
         format!("![{label}]({destination})")
     } else {
@@ -449,7 +450,6 @@ fn escape_link_label(label: &str) -> String {
 
 fn escape_link_destination(destination: &str) -> String {
     destination
-        .replace('%', "%25")
         .replace(' ', "%20")
         .replace('<', "%3C")
         .replace('>', "%3E")
@@ -770,6 +770,14 @@ mod tests {
             paste_url_as_markdown_link(&mut text, 0..3, "https://example.com/a_(b)").unwrap();
         assert_eq!(text, "[a\\]b](https://example.com/a_%28b%29)");
         assert_eq!(cursor, text.chars().count()..text.chars().count());
+
+        let mut encoded = "label".to_owned();
+        paste_url_as_markdown_link(&mut encoded, 0..5, "https://example.com/a%20b").unwrap();
+        assert_eq!(encoded, "[label](https://example.com/a%20b)");
+
+        let mut resource = String::new();
+        insert_resource_link(&mut resource, 0..0, "a]b", "assets/a (1).png", true);
+        assert_eq!(resource, "![a\\]b](assets/a%20%281%29.png)");
     }
 
     #[test]

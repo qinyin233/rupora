@@ -1424,6 +1424,13 @@ mod tests {
     }
 
     #[test]
+    fn pulldown_accepts_compact_gfm_table_delimiters() {
+        let html = render_html_fragment("| A | B |\n| - | :-: |\n| 1 | 2 |");
+        assert!(html.contains("<table>"));
+        assert!(html.contains("<td>1</td>"));
+    }
+
+    #[test]
     fn synchronizes_preview_task_changes_back_to_the_source() {
         let source = "- [ ] first\n- [x] second\n";
         let rendered = "> metadata\n\n- [x] first\n- [ ] second\n";
