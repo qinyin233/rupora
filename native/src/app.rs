@@ -3268,6 +3268,7 @@ impl RuporaApp {
         let cursor_before = self.editor_cursor;
         let selection_before = cursor_before.map(cursor_range_to_char_range);
         let blocks = self.documents[index].blocks().to_vec();
+        let front_matter = markdown::parse_front_matter(&source);
         let base_path = self.preview_base_path(index);
         let svg_cache = self.generated_svg_cache.clone();
         let dark = self.state.dark;
@@ -3336,6 +3337,19 @@ impl RuporaApp {
                                 ui.set_min_height((viewport_height - 142.0).max(480.0));
                                 for (block_index, block) in blocks.iter().enumerate() {
                                     let source_block = &source[block.range.clone()];
+                                    let generated_preview = if block.range.start == 0 {
+                                        front_matter.as_ref().and_then(|front| {
+                                            (block.range.end <= front.body_start).then(|| {
+                                                markdown::front_matter_preview_markdown(front)
+                                            })
+                                        })
+                                    } else if source_block.trim().eq_ignore_ascii_case("[TOC]") {
+                                        Some(markdown::toc_preview_markdown(&source))
+                                    } else {
+                                        None
+                                    };
+                                    let preview_source =
+                                        generated_preview.as_deref().unwrap_or(source_block);
                                     let code_content = fenced_code_content(source_block);
                                     let block_is_code = code_content.is_some();
                                     let mut code_surface_rect = None;
@@ -3583,6 +3597,36 @@ impl RuporaApp {
                                                         },
                                                     ),
                                                 });
+                                                if output.response.clicked()
+                                                    && ui.input(|input| input.modifiers.command)
+                                                    && let Some(position) =
+                                                        output.response.interact_pointer_pos()
+                                                {
+                                                    let visual_cursor = usize::from(
+                                                        text_edit_cursor_at_position(
+                                                            &output, position,
+                                                        )
+                                                        .index,
+                                                    );
+                                                    let source_char = projection
+                                                        .source_char_range(
+                                                            &original_block,
+                                                            visual_cursor..visual_cursor,
+                                                        )
+                                                        .start;
+                                                    let source_byte = char_to_byte(
+                                                        &original_block,
+                                                        source_char,
+                                                    );
+                                                    if let Some(destination) =
+                                                        markdown::link_destination_at(
+                                                            &original_block,
+                                                            source_byte,
+                                                        )
+                                                    {
+                                                        clicked_destination = Some(destination);
+                                                    }
+                                                }
                                                 if let Some(shape_index) = inline_code_background {
                                                     let runs = projection.runs_for(&visual_content);
                                                     ui.painter().set(
@@ -3986,7 +4030,7 @@ impl RuporaApp {
                                             ui.add_space(6.0);
                                             let preview = show_native_block_preview(
                                                 ui,
-                                                source_block,
+                                                preview_source,
                                                 &base_path,
                                                 dark,
                                                 &mut svg_cache.borrow_mut(),
@@ -4007,14 +4051,16 @@ impl RuporaApp {
                                                 ));
                                             set_markdown_preview_accessibility(
                                                 &response,
-                                                source_block,
+                                                preview_source,
                                             );
                                             pointer_regions.push(HybridPointerRegion {
                                                 block_id: block.id,
                                                 source_range: block.range.clone(),
                                                 rect: preview.rect,
-                                                atomic_range: (block_is_code || preview.atomic)
-                                                    .then(|| block.range.clone()),
+                                                atomic_range: (block_is_code
+                                                    || preview.atomic
+                                                    || generated_preview.is_some())
+                                                .then(|| block.range.clone()),
                                                 mapping: preview.mapping.clone(),
                                             });
                                             if response.clicked() {
@@ -4022,7 +4068,7 @@ impl RuporaApp {
                                                     .interact_pointer_pos()
                                                     .map(|position| {
                                                         preview.mapping.source_byte_at_position(
-                                                            source_block,
+                                                            preview_source,
                                                             preview.rect,
                                                             position,
                                                         )
@@ -4030,11 +4076,12 @@ impl RuporaApp {
                                                     .unwrap_or_default();
                                                 let command_click =
                                                     ui.input(|input| input.modifiers.command);
-                                                if let Some(updated) =
-                                                    markdown::toggle_task_marker_at(
-                                                        source_block,
-                                                        local_source_byte,
-                                                    )
+                                                if generated_preview.is_none()
+                                                    && let Some(updated) =
+                                                        markdown::toggle_task_marker_at(
+                                                            source_block,
+                                                            local_source_byte,
+                                                        )
                                                 {
                                                     pending_edit = Some((
                                                         block.range.clone(),
@@ -4044,7 +4091,7 @@ impl RuporaApp {
                                                 } else if command_click
                                                     && let Some(destination) =
                                                         markdown::link_destination_at(
-                                                            source_block,
+                                                            preview_source,
                                                             local_source_byte,
                                                         )
                                                 {
@@ -4052,7 +4099,11 @@ impl RuporaApp {
                                                 } else {
                                                     activate = Some((
                                                         block.id,
-                                                        block.range.start + local_source_byte,
+                                                        if generated_preview.is_some() {
+                                                            block.range.start
+                                                        } else {
+                                                            block.range.start + local_source_byte
+                                                        },
                                                     ));
                                                 }
                                             }
@@ -4278,21 +4329,9 @@ impl RuporaApp {
 
     fn open_preview_destination(&mut self, index: usize, destination: &str) {
         if destination.starts_with('#') {
-            let anchor = destination.trim_start_matches('#');
-            let target = markdown::heading_anchors(&self.documents[index].content)
-                .into_iter()
-                .find(|heading| heading.id == anchor);
-            if let Some(target) = target {
-                let source = &self.documents[index].content;
-                let byte = line_start_byte(source, target.heading.line);
-                let cursor = source[..byte].chars().count();
-                let cursor = CCursorRange::one(CCursor::new(cursor));
-                self.editor_cursor = Some(cursor);
-                self.pending_editor_cursor = Some(cursor);
-                self.status = format!("已定位到：{}", target.heading.text);
-            } else {
-                self.status = format!("找不到文档内锚点：{destination}");
-            }
+            let anchor = decode_uri_fragment(destination.trim_start_matches('#'))
+                .unwrap_or_else(|| destination.trim_start_matches('#').to_owned());
+            self.jump_to_anchor(index, &anchor);
             return;
         }
         let path_part = destination.split(['#', '?']).next().unwrap_or(destination);
@@ -4304,6 +4343,9 @@ impl RuporaApp {
     }
 
     fn open_local_preview_link(&mut self, index: usize, destination: &str) {
+        let fragment = destination
+            .split_once('#')
+            .and_then(|(_, fragment)| decode_uri_fragment(fragment));
         let Some(path_part) = decode_local_resource_path(destination) else {
             self.status = format!("本地链接路径编码无效：{destination}");
             return;
@@ -4335,9 +4377,35 @@ impl RuporaApp {
         } else if !path_is_within(&resolved, allowed_root) {
             self.status = format!("已阻止打开工作区之外的本地路径：{}", resolved.display());
         } else if is_markdown_path(&resolved) {
+            let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
             self.open_paths([resolved]);
+            if let Some(fragment) = fragment
+                && let Some(target_index) = self.documents.iter().position(|document| {
+                    document.path.as_ref().is_some_and(|path| {
+                        path.canonicalize().unwrap_or_else(|_| path.clone()) == canonical
+                    })
+                })
+            {
+                self.jump_to_anchor(target_index, &fragment);
+            }
         } else if let Err(error) = open::that(&resolved) {
             self.status = format!("无法打开 {}：{error}", resolved.display());
+        }
+    }
+
+    fn jump_to_anchor(&mut self, index: usize, anchor: &str) {
+        let target = markdown::heading_anchors(&self.documents[index].content)
+            .into_iter()
+            .find(|heading| heading.id == anchor);
+        if let Some(target) = target {
+            self.activate_document(index);
+            let source = &self.documents[index].content;
+            let byte = line_start_byte(source, target.heading.line);
+            let cursor = source[..byte].chars().count();
+            self.queue_editor_selection(cursor..cursor);
+            self.status = format!("已定位到：{}", target.heading.text);
+        } else {
+            self.status = format!("找不到文档内锚点：#{anchor}");
         }
     }
 
@@ -6146,6 +6214,33 @@ fn markdown_resource_destination(path: &Path, base: &Path) -> String {
         .replace(')', "%29")
 }
 
+fn decode_uri_fragment(fragment: &str) -> Option<String> {
+    let bytes = fragment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = uri_hex_value(*bytes.get(index + 1)?)?;
+            let low = uri_hex_value(*bytes.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+const fn uri_hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn path_is_within(path: &Path, allowed_root: &Path) -> bool {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let allowed_root = allowed_root
@@ -6386,6 +6481,26 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_only_commonmark_indented_fences() {
+        assert!(is_fenced_code_block("```rust\nfn main() {}\n```"));
+        assert!(is_fenced_code_block("   ~~~\ncode\n   ~~~"));
+        assert!(!is_fenced_code_block("    ```\nnot a fence"));
+        assert!(!is_fenced_code_block("\t```\nnot a fence"));
+    }
+
+    #[test]
+    fn decodes_unicode_local_link_fragments_without_form_semantics() {
+        assert_eq!(
+            decode_uri_fragment("%E4%B8%AD%E6%96%87%20%E6%A0%87%E9%A2%98"),
+            Some("中文 标题".to_owned())
+        );
+        assert_eq!(decode_uri_fragment("c%2B%2B"), Some("c++".to_owned()));
+        assert_eq!(decode_uri_fragment("a+b"), Some("a+b".to_owned()));
+        assert_eq!(decode_uri_fragment("%ZZ"), None);
+        assert_eq!(decode_uri_fragment("%E4%B8"), None);
+    }
+
+    #[test]
     fn extension_results_follow_document_identity_after_tabs_shift() {
         let first = Document::untitled(1);
         let target = Document::untitled(2);
@@ -6422,8 +6537,7 @@ mod tests {
             );
         }
         assert_eq!(cache.len(), MAX_GENERATED_SVG_CACHE_ENTRIES);
-        assert!(cache.contains_key("key-0"));
-        assert!(!cache.contains_key(&format!("key-{MAX_GENERATED_SVG_CACHE_ENTRIES}")));
+        assert!(cache.contains_key(&format!("key-{MAX_GENERATED_SVG_CACHE_ENTRIES}")));
     }
 
     #[test]
@@ -6441,14 +6555,14 @@ mod tests {
         }
         assert_eq!(cache.len(), 4);
 
-        assert!(!cache_generated_svg(
+        assert!(cache_generated_svg(
             &context,
             &mut cache,
             "replacement".to_owned(),
             Arc::from([1]),
         ));
-        assert_eq!(cache.len(), 4);
-        assert!(!cache.contains_key("replacement"));
+        assert!(cache.len() <= 4);
+        assert!(cache.contains_key("replacement"));
     }
 
     #[test]

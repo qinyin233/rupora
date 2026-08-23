@@ -264,7 +264,7 @@ fn generated_svg_key(kind: &str, source: &str, dark: bool) -> String {
 }
 
 pub(crate) fn cache_generated_svg(
-    _ctx: &Context,
+    ctx: &Context,
     cache: &mut HashMap<String, Arc<[u8]>>,
     key: String,
     bytes: Arc<[u8]>,
@@ -272,15 +272,21 @@ pub(crate) fn cache_generated_svg(
     if bytes.len() > MAX_GENERATED_SVG_CACHE_BYTES {
         return false;
     }
-    let existing_bytes = cache.get(&key).map_or(0, |existing| existing.len());
-    let cached_bytes = cache.values().map(|value| value.len()).sum::<usize>();
-    let projected_bytes = cached_bytes
-        .saturating_sub(existing_bytes)
-        .saturating_add(bytes.len());
-    if (cache.len() >= MAX_GENERATED_SVG_CACHE_ENTRIES && !cache.contains_key(&key))
-        || projected_bytes > MAX_GENERATED_SVG_CACHE_BYTES
+    let replacing = cache.contains_key(&key);
+    while (!replacing && cache.len() >= MAX_GENERATED_SVG_CACHE_ENTRIES)
+        || cache
+            .values()
+            .map(|value| value.len())
+            .sum::<usize>()
+            .saturating_sub(cache.get(&key).map_or(0, |existing| existing.len()))
+            .saturating_add(bytes.len())
+            > MAX_GENERATED_SVG_CACHE_BYTES
     {
-        return false;
+        let Some(victim) = cache.keys().find(|candidate| *candidate != &key).cloned() else {
+            return false;
+        };
+        cache.remove(&victim);
+        ctx.forget_image(&format!("bytes://rupora/{victim}.svg"));
     }
     cache.insert(key, bytes);
     true

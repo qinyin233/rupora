@@ -122,6 +122,13 @@ impl VisualProjection {
             }
             match event {
                 Event::Start(tag) => {
+                    if block_depth == 0 && matches!(&tag, Tag::List(_) | Tag::BlockQuote(_)) {
+                        // A loose block separator is represented by the surrounding block
+                        // spacing. Do not let the first nested item mistake that separator for
+                        // an editable blank line inside the container.
+                        builder.set_current_boundary(range.start);
+                    }
+                    builder.append_source_line_breaks_until(source, range.start, format.visual());
                     if matches!(&tag, Tag::Link { .. } | Tag::Image { .. })
                         && source_selection.as_ref().is_some_and(|selection| {
                             selection_reveals_hidden_source(selection, &range)
@@ -1154,6 +1161,38 @@ impl ProjectionBuilder {
     fn begin_inline_wrapper(&mut self, source_start: usize) {
         self.inline_wrapper_stack
             .push((self.text.chars().count(), source_start));
+    }
+
+    fn append_source_line_breaks_until(
+        &mut self,
+        source: &str,
+        source_end: usize,
+        style: VisualStyle,
+    ) {
+        let mut cursor = self
+            .source_boundaries
+            .last()
+            .copied()
+            .unwrap_or_default()
+            .min(source_end);
+        while cursor < source_end {
+            let line_break_end = match source.as_bytes().get(cursor..) {
+                Some([b'\r', b'\n', ..]) => Some(cursor + 2),
+                Some([b'\r' | b'\n', ..]) => Some(cursor + 1),
+                Some(_) => None,
+                None => break,
+            };
+            if let Some(line_break_end) = line_break_end {
+                let visual_start = self.text.chars().count();
+                self.text.push('\n');
+                self.source_left_boundaries.push(line_break_end);
+                self.source_boundaries.push(line_break_end);
+                push_run(&mut self.runs, visual_start..visual_start + 1, style);
+                cursor = line_break_end;
+            } else {
+                cursor += source[cursor..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
     }
 
     fn end_inline_wrapper(&mut self, source_end: usize) {
@@ -2493,6 +2532,37 @@ mod tests {
             .apply_edit(&source, &edited, cursor..cursor)
             .unwrap();
         assert_eq!(update.source, "第一段\n\n\n\n第二段");
+    }
+
+    #[test]
+    fn container_internal_blank_lines_remain_visible_and_individually_editable() {
+        for source in ["- a\n\n\n- b", "> a\n>\n>\n> b"] {
+            let projection = VisualProjection::from_markdown(source);
+            assert_eq!(
+                projection.text().matches('\n').count(),
+                source.matches('\n').count(),
+                "source: {source:?}, visual: {:?}",
+                projection.text()
+            );
+
+            let middle_newline = projection
+                .text()
+                .match_indices('\n')
+                .nth(1)
+                .map(|(byte, _)| projection.text()[..byte].chars().count())
+                .unwrap();
+            let mut edited = projection.text().to_owned();
+            edited.remove(char_to_byte(&edited, middle_newline));
+            let update = projection
+                .apply_edit(source, &edited, middle_newline..middle_newline)
+                .unwrap();
+            assert_eq!(
+                update.source.matches('\n').count(),
+                source.matches('\n').count() - 1,
+                "source: {source:?}, updated: {:?}",
+                update.source
+            );
+        }
     }
 
     #[test]

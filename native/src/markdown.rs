@@ -195,13 +195,22 @@ pub fn analyze(source: &str) -> MarkdownAnalysis {
     let mut headings = Vec::new();
     let mut current_heading: Option<(HeadingLevel, usize, String)> = None;
     let mut line_scan_offset = 0usize;
-    let mut line_at_scan_offset = 1usize;
+    let (body, mut line_at_scan_offset) = parse_front_matter(source).map_or((source, 1), |front| {
+        (
+            &source[front.body_start..],
+            source[..front.body_start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1,
+        )
+    });
 
-    for (event, range) in Parser::new_ext(source, parser_options()).into_offset_iter() {
+    for (event, range) in Parser::new_ext(body, parser_options()).into_offset_iter() {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
                 debug_assert!(range.start >= line_scan_offset);
-                line_at_scan_offset += source.as_bytes()[line_scan_offset..range.start]
+                line_at_scan_offset += body.as_bytes()[line_scan_offset..range.start]
                     .iter()
                     .filter(|byte| **byte == b'\n')
                     .count();
@@ -248,18 +257,29 @@ pub fn analyze(source: &str) -> MarkdownAnalysis {
 
 pub fn heading_anchors(source: &str) -> Vec<HeadingAnchor> {
     let mut occurrences = HashMap::<String, usize>::new();
-    analyze(source)
-        .headings
+    let headings = analyze(source).headings;
+    let body = parse_front_matter(source).map_or(source, |front| &source[front.body_start..]);
+    let explicit_ids = Parser::new_ext(body, parser_options()).filter_map(|event| match event {
+        Event::Start(Tag::Heading { id, .. }) => Some(id.map(CowStr::into_string)),
+        _ => None,
+    });
+    headings
         .into_iter()
-        .map(|heading| {
-            let base = heading_slug(&heading.text);
-            let occurrence = occurrences.entry(base.clone()).or_default();
-            let id = if *occurrence == 0 {
-                base
+        .zip(explicit_ids)
+        .map(|(heading, explicit_id)| {
+            let id = if let Some(explicit_id) = explicit_id {
+                explicit_id
             } else {
-                format!("{base}-{}", *occurrence)
+                let base = heading_slug(&heading.text);
+                let occurrence = occurrences.entry(base.clone()).or_default();
+                let id = if *occurrence == 0 {
+                    base
+                } else {
+                    format!("{base}-{}", *occurrence)
+                };
+                *occurrence += 1;
+                id
             };
-            *occurrence += 1;
             HeadingAnchor { heading, id }
         })
         .collect()
@@ -328,6 +348,22 @@ pub fn mermaid_blocks(source: &str) -> Vec<MermaidBlock> {
 
 pub fn prepare_preview_markdown(source: &str) -> String {
     expand_front_matter_and_toc(source)
+}
+
+pub fn front_matter_preview_markdown(front_matter: &FrontMatter) -> String {
+    let mut output = String::from("> **文档元数据**\n");
+    for (key, value) in &front_matter.fields {
+        output.push_str("> - **");
+        output.push_str(&key.replace(['*', '[', ']'], ""));
+        output.push_str("：** ");
+        output.push_str(&value.replace('\n', " "));
+        output.push('\n');
+    }
+    output
+}
+
+pub fn toc_preview_markdown(source: &str) -> String {
+    render_toc_markdown(&heading_anchors(source))
 }
 
 pub fn render_math_svg(source: &str, inline: bool) -> Result<String, String> {
@@ -466,10 +502,22 @@ fn block_ranges(source: &str) -> Vec<Range<usize>> {
     }
 
     let mut ranges = Vec::<Range<usize>>::new();
+    let body_start = parse_front_matter(source).map_or(0, |front| front.body_start);
+    if body_start > 0 {
+        let mut front_matter_end = body_start;
+        while front_matter_end > 0
+            && matches!(source.as_bytes()[front_matter_end - 1], b'\n' | b'\r')
+        {
+            front_matter_end -= 1;
+        }
+        ranges.push(0..front_matter_end);
+    }
+    let body = &source[body_start..];
     let mut depth = 0usize;
     let mut block_start = None;
 
-    for (event, range) in Parser::new_ext(source, parser_options()).into_offset_iter() {
+    for (event, range) in Parser::new_ext(body, parser_options()).into_offset_iter() {
+        let range = range.start + body_start..range.end + body_start;
         match event {
             Event::Start(_) => {
                 if depth == 0 {
@@ -834,14 +882,7 @@ fn expand_front_matter_and_toc(source: &str) -> String {
     );
 
     if let Some(front_matter) = front_matter {
-        output.push_str("> **文档元数据**\n");
-        for (key, value) in front_matter.fields {
-            output.push_str("> - **");
-            output.push_str(&key.replace(['*', '[', ']'], ""));
-            output.push_str("：** ");
-            output.push_str(&value.replace('\n', " "));
-            output.push('\n');
-        }
+        output.push_str(&front_matter_preview_markdown(&front_matter));
         output.push('\n');
     }
 
@@ -1409,6 +1450,23 @@ mod tests {
     }
 
     #[test]
+    fn front_matter_is_one_native_editing_block() {
+        let source = "---\ntitle: Native\ntags: [rust, markdown]\n---\n\n# Body\n";
+        let blocks = blocks(source);
+        assert_eq!(
+            &source[blocks[0].range.clone()],
+            "---\ntitle: Native\ntags: [rust, markdown]\n---"
+        );
+        assert_eq!(&source[blocks[1].range.clone()], "# Body");
+
+        let front = parse_front_matter(source).unwrap();
+        let preview = front_matter_preview_markdown(&front);
+        assert!(preview.contains("文档元数据"));
+        assert!(preview.contains("title"));
+        assert!(!preview.contains("---"));
+    }
+
+    #[test]
     fn creates_unique_unicode_heading_anchors_and_expands_toc() {
         let source = "[TOC]\n\n# 开始\n\n## Same\n\n## Same\n";
         let anchors = heading_anchors(source);
@@ -1419,6 +1477,27 @@ mod tests {
         let html = render_html_fragment(source);
         assert!(html.contains("href=\"#same-1\""));
         assert!(html.contains("<h2 id=\"same-1\">Same</h2>"));
+    }
+
+    #[test]
+    fn explicit_heading_ids_drive_toc_export_and_navigation() {
+        let source = "[TOC]\n\n# Title {#custom}\n";
+        let anchors = heading_anchors(source);
+        assert_eq!(anchors[0].id, "custom");
+
+        let html = render_html_fragment(source);
+        assert!(html.contains("href=\"#custom\""));
+        assert!(html.contains("<h1 id=\"custom\">Title</h1>"));
+        assert!(!html.contains("href=\"#title\""));
+    }
+
+    #[test]
+    fn front_matter_fields_never_leak_into_the_outline() {
+        let source = "---\ntitle: Metadata\n---\n\n# Body\n";
+        let analysis = analyze(source);
+        assert_eq!(analysis.headings.len(), 1);
+        assert_eq!(analysis.headings[0].text, "Body");
+        assert_eq!(analysis.headings[0].line, 5);
     }
 
     #[test]
