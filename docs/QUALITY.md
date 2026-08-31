@@ -28,7 +28,7 @@ cargo check --manifest-path fuzz/Cargo.toml --bins --locked
 - 参考文档验证 HTML 结构，并把 PDF 页转为 SVG 和像素检查空白、裁切及布局坍缩。
 - Proptest 对任意 Unicode 文本验证格式往返、块索引、表格和三方合并性质。
 - 故障注入验证临时文件同步之后的提交失败不会破坏原文件。
-- `fuzz/` 提供 Markdown 流水线和表格解析两个 libFuzzer 目标。
+- `fuzz/` 提供 Markdown 流水线、表格解析和 WYSIWYG 投影三个 libFuzzer 目标。
 - 每周及手动 CI 使用 nightly 构建 fuzz 目标。
 
 ## 依赖策略
