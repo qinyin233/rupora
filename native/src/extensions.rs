@@ -578,7 +578,9 @@ fn validate_response(
         ));
     }
     Ok(ExtensionInvocation {
-        replacement: result.replacement,
+        replacement: result
+            .replacement
+            .map(|text| crate::document::normalize_line_endings(&text)),
         message: result
             .message
             .map(|message| sanitize_response_text(&message))
@@ -676,6 +678,17 @@ const fn default_output_bytes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_extension_replacement_obeys_the_document_line_ending_invariant() {
+        let service = service(&[
+            ExtensionPermission::ReadDocument,
+            ExtensionPermission::ReplaceDocument,
+        ]);
+        let response = br#"{"protocol":1,"requestId":42,"result":{"replacement":"a\r\nb\rc"}}"#;
+        let result = validate_response(&service, 42, response).unwrap();
+        assert_eq!(result.replacement.as_deref(), Some("a\nb\nc"));
+    }
 
     static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

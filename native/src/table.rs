@@ -95,50 +95,49 @@ impl MarkdownTable {
 }
 
 pub fn find_table(source: &str, cursor_byte: usize) -> Option<MarkdownTable> {
-    let lines = source_lines(source);
-    let candidates = lines
-        .windows(2)
-        .enumerate()
-        .filter(|(_, pair)| parse_separator(pair[1].text).is_some())
-        .filter_map(|(index, pair)| {
-            let headers = parse_row(pair[0].text);
-            let alignments = parse_separator(pair[1].text)?;
-            (headers.len() == alignments.len() && !headers.is_empty())
-                .then_some((index, headers, alignments))
-        })
-        .collect::<Vec<_>>();
-
-    let mut fallback = None;
-    for (header_index, headers, alignments) in candidates {
-        let mut end_index = header_index + 2;
-        let mut rows = Vec::new();
-        while let Some(line) = lines.get(end_index) {
-            if line.text.trim().is_empty() || !line.text.contains('|') {
-                break;
+    // The Markdown parser owns block boundaries. A line scanner also mistakes
+    // fenced examples and Setext headings for tables, and swallows later blocks.
+    let body_start =
+        crate::markdown::parse_front_matter(source).map_or(0, |front| front.body_start);
+    let mut depth = 0usize;
+    for (event, range) in
+        pulldown_cmark::Parser::new_ext(&source[body_start..], crate::markdown::parser_options())
+            .into_offset_iter()
+    {
+        match event {
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Table(alignments)) if depth == 0 => {
+                let start = body_start + range.start;
+                let text = source[start..body_start + range.end].trim_end_matches(['\r', '\n']);
+                let range = start..start + text.len();
+                if range.contains(&cursor_byte) || cursor_byte == range.end {
+                    let mut lines = text.lines();
+                    let headers = parse_row(lines.next()?);
+                    lines.next()?; // delimiter row
+                    let mut table = MarkdownTable {
+                        range,
+                        headers,
+                        alignments: alignments
+                            .into_iter()
+                            .map(|alignment| match alignment {
+                                pulldown_cmark::Alignment::None => Alignment::None,
+                                pulldown_cmark::Alignment::Left => Alignment::Left,
+                                pulldown_cmark::Alignment::Center => Alignment::Center,
+                                pulldown_cmark::Alignment::Right => Alignment::Right,
+                            })
+                            .collect(),
+                        rows: lines.map(parse_row).collect(),
+                    };
+                    table.normalize();
+                    return Some(table);
+                }
+                depth += 1;
             }
-            let row = parse_row(line.text);
-            if row.is_empty() {
-                break;
-            }
-            rows.push(row);
-            end_index += 1;
+            pulldown_cmark::Event::Start(_) => depth += 1,
+            pulldown_cmark::Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
         }
-
-        let range_start = lines[header_index].start;
-        let range_end = lines[end_index.saturating_sub(1)].end;
-        let mut table = MarkdownTable {
-            range: range_start..range_end,
-            headers,
-            alignments,
-            rows,
-        };
-        table.normalize();
-        if table.range.contains(&cursor_byte) || cursor_byte == table.range.end {
-            return Some(table);
-        }
-        fallback.get_or_insert(table);
     }
-    fallback
+    None
 }
 
 pub fn new_table(insert_at: usize) -> MarkdownTable {
@@ -150,42 +149,21 @@ pub fn new_table(insert_at: usize) -> MarkdownTable {
     }
 }
 
-#[derive(Clone, Copy)]
-struct SourceLine<'a> {
-    start: usize,
-    end: usize,
-    text: &'a str,
-}
-
-fn source_lines(source: &str) -> Vec<SourceLine<'_>> {
-    let mut output = Vec::new();
-    let mut start = 0usize;
-    for line in source.split_inclusive('\n') {
-        let end = start + line.len();
-        output.push(SourceLine {
-            start,
-            end: end.saturating_sub(usize::from(line.ends_with('\n'))),
-            text: line.trim_end_matches(['\r', '\n']),
-        });
-        start = end;
-    }
-    if source.is_empty() || source.ends_with('\n') {
-        output.push(SourceLine {
-            start,
-            end: start,
-            text: "",
-        });
-    }
-    output
-}
-
 fn parse_row(line: &str) -> Vec<String> {
     let trimmed = line.trim();
-    let content = trimmed
-        .strip_prefix('|')
-        .unwrap_or(trimmed)
-        .strip_suffix('|')
-        .unwrap_or_else(|| trimmed.strip_prefix('|').unwrap_or(trimmed));
+    let content = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let content = if let Some(prefix) = content.strip_suffix('|')
+        && prefix
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'\\')
+            .count()
+            .is_multiple_of(2)
+    {
+        prefix
+    } else {
+        content
+    };
     let mut cells = Vec::new();
     let mut current = String::new();
     let mut characters = content.chars().peekable();
@@ -201,31 +179,6 @@ fn parse_row(line: &str) -> Vec<String> {
     }
     cells.push(current.trim().to_owned());
     cells
-}
-
-fn parse_separator(line: &str) -> Option<Vec<Alignment>> {
-    let cells = parse_row(line);
-    if cells.is_empty() {
-        return None;
-    }
-    cells
-        .into_iter()
-        .map(|cell| {
-            let trimmed = cell.trim();
-            let left = trimmed.starts_with(':');
-            let right = trimmed.ends_with(':');
-            let dashes = trimmed.trim_matches(':');
-            if dashes.is_empty() || !dashes.bytes().all(|byte| byte == b'-') {
-                return None;
-            }
-            Some(match (left, right) {
-                (true, true) => Alignment::Center,
-                (true, false) => Alignment::Left,
-                (false, true) => Alignment::Right,
-                (false, false) => Alignment::None,
-            })
-        })
-        .collect()
 }
 
 fn escaped_cell(cell: &str) -> String {

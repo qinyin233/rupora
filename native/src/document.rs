@@ -107,6 +107,7 @@ pub struct Document {
     file_fingerprint: Option<FileFingerprint>,
     undo_history: Vec<EditTransaction>,
     redo_history: Vec<EditTransaction>,
+    typing_group_open: bool,
     block_index: BlockIndex,
     derived_state_stale: bool,
     last_content_edit: Option<Instant>,
@@ -130,6 +131,7 @@ impl Document {
             file_fingerprint: None,
             undo_history: Vec::new(),
             redo_history: Vec::new(),
+            typing_group_open: false,
             block_index,
             derived_state_stale: false,
             last_content_edit: None,
@@ -171,6 +173,7 @@ impl Document {
             file_fingerprint: Some(file_fingerprint),
             undo_history: Vec::new(),
             redo_history: Vec::new(),
+            typing_group_open: false,
             block_index,
             derived_state_stale: false,
             last_content_edit: None,
@@ -256,7 +259,8 @@ impl Document {
         let now = Instant::now();
         let before_hash = text_hash(&before);
         let after_hash = text_hash(&self.content);
-        let can_coalesce = kind == EditKind::Typing
+        let can_coalesce = self.typing_group_open
+            && kind == EditKind::Typing
             && self.undo_history.last().is_some_and(|previous| {
                 previous.kind == EditKind::Typing
                     && previous.after_hash == before_hash
@@ -299,6 +303,7 @@ impl Document {
             });
         }
         self.redo_history.clear();
+        self.typing_group_open = kind == EditKind::Typing;
         trim_history(&mut self.undo_history);
         self.mark_after_edit(now);
         true
@@ -324,6 +329,7 @@ impl Document {
             selection: transaction.selection_before.clone(),
         };
         self.redo_history.push(transaction);
+        self.typing_group_open = false;
         trim_history(&mut self.redo_history);
         self.mark_after_edit(Instant::now());
         Some(outcome)
@@ -341,6 +347,7 @@ impl Document {
             selection: transaction.selection_after.clone(),
         };
         self.undo_history.push(transaction);
+        self.typing_group_open = false;
         trim_history(&mut self.undo_history);
         self.mark_after_edit(Instant::now());
         Some(outcome)
@@ -441,6 +448,7 @@ impl Document {
         self.file_fingerprint = Some(fingerprint_from_bytes(path, &bytes));
         self.saved_content.clone_from(&self.content);
         self.dirty = false;
+        self.typing_group_open = false;
         Ok(())
     }
 
@@ -468,6 +476,7 @@ impl Document {
         self.file_fingerprint = Some(fingerprint_from_bytes(&path, &bytes));
         self.saved_content.clone_from(&self.content);
         self.dirty = false;
+        self.typing_group_open = false;
         Ok(())
     }
 
@@ -903,7 +912,7 @@ fn detect_line_ending(text: &str) -> LineEnding {
     }
 }
 
-fn normalize_line_endings(text: &str) -> String {
+pub(crate) fn normalize_line_endings(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 

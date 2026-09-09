@@ -17,6 +17,7 @@ cargo check --manifest-path fuzz/Cargo.toml --bins --locked
 - 在 2 万块文档中协调一次小修改不超过 1 秒。
 - 在 2 万段文档中记录一次不触发同步分析的编辑不超过 250 毫秒。
 - 将 2 千段 Markdown 导出为 HTML 不超过 2 秒。
+- 对包含中文和 emoji 的文本替换 2.5 万个匹配项不超过 1 秒。
 
 这些是回归预算，不是硬件性能宣传。Criterion 基准位于 `benches/editor_core.rs`。
 
@@ -30,6 +31,7 @@ cargo check --manifest-path fuzz/Cargo.toml --bins --locked
 - 故障注入验证临时文件同步之后的提交失败不会破坏原文件。
 - `fuzz/` 提供 Markdown 流水线、表格解析和 WYSIWYG 投影三个 libFuzzer 目标。
 - 每周及手动 CI 使用 nightly 构建 fuzz 目标。
+- 已发现的 fuzz 崩溃输入转为常规回归测试，每次 push 都会运行；fuzz 失败时保留崩溃样本 artifact 和调用栈。
 
 ## 依赖策略
 

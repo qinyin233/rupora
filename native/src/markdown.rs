@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
     path::Path,
@@ -260,27 +260,37 @@ pub fn heading_anchors(source: &str) -> Vec<HeadingAnchor> {
     let mut occurrences = HashMap::<String, usize>::new();
     let headings = analyze(source).headings;
     let body = parse_front_matter(source).map_or(source, |front| &source[front.body_start..]);
-    let explicit_ids = Parser::new_ext(body, parser_options()).filter_map(|event| match event {
-        Event::Start(Tag::Heading { id, .. }) => Some(id.map(CowStr::into_string)),
-        _ => None,
-    });
+    let explicit_ids = Parser::new_ext(body, parser_options())
+        .filter_map(|event| match event {
+            Event::Start(Tag::Heading { id, .. }) => Some(id.map(CowStr::into_string)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let reserved = explicit_ids
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut used = HashSet::new();
     headings
         .into_iter()
         .zip(explicit_ids)
         .map(|(heading, explicit_id)| {
-            let id = if let Some(explicit_id) = explicit_id {
-                explicit_id
-            } else {
-                let base = heading_slug(&heading.text);
+            let base = explicit_id
+                .clone()
+                .unwrap_or_else(|| heading_slug(&heading.text));
+            let mut id = base.clone();
+            if used.contains(&id) || (explicit_id.is_none() && reserved.contains(&id)) {
                 let occurrence = occurrences.entry(base.clone()).or_default();
-                let id = if *occurrence == 0 {
-                    base
-                } else {
-                    format!("{base}-{}", *occurrence)
-                };
-                *occurrence += 1;
-                id
-            };
+                loop {
+                    *occurrence += 1;
+                    id = format!("{base}-{occurrence}");
+                    if !used.contains(&id) && !reserved.contains(&id) {
+                        break;
+                    }
+                }
+            }
+            used.insert(id.clone());
             HeadingAnchor { heading, id }
         })
         .collect()
@@ -1133,7 +1143,7 @@ fn render_html_with_generated(source: &str, dark: bool) -> (String, String, Vec<
             }
             Event::Start(Tag::Heading {
                 level,
-                id,
+                id: _,
                 classes,
                 attrs,
             }) => {
@@ -1145,7 +1155,7 @@ fn render_html_with_generated(source: &str, dark: bool) -> (String, String, Vec<
                 events.push(Event::Start(
                     Tag::Heading {
                         level,
-                        id: id.or_else(|| Some(CowStr::Boxed(generated_id.into_boxed_str()))),
+                        id: Some(CowStr::Boxed(generated_id.into_boxed_str())),
                         classes,
                         attrs,
                     }

@@ -99,9 +99,20 @@ jobs:
 
       - name: Build and run fuzz targets
         working-directory: fuzz
+        env:
+          RUST_BACKTRACE: "1"
         run: |
           cargo fuzz build
           for target in markdown_pipeline table_parser wysiwyg_projection; do
             cargo fuzz run "$target" -- -max_total_time=30 -rss_limit_mb=4096
           done
           git -C .. diff --exit-code -- fuzz/Cargo.lock
+
+      - name: Preserve fuzz crash inputs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-crash-inputs
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14

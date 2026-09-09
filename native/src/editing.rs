@@ -64,13 +64,13 @@ pub fn find_previous(
         return None;
     }
     let before_byte = char_to_byte(text, before_char.min(text.chars().count()));
-    let mut matches = collect_matches(text, query, match_case);
+    let matches = collect_byte_matches(text, query, match_case);
     matches
         .iter()
         .rev()
-        .find(|range| char_to_byte(text, range.end) <= before_byte)
-        .cloned()
-        .or_else(|| matches.pop())
+        .find(|range| range.end <= before_byte)
+        .or_else(|| matches.last())
+        .map(|range| byte_range_to_char_range(text, range.clone()))
 }
 
 pub fn replace_range(text: &mut String, range: Range<usize>, replacement: &str) -> Range<usize> {
@@ -83,12 +83,19 @@ pub fn replace_range(text: &mut String, range: Range<usize>, replacement: &str) 
 }
 
 pub fn replace_all(text: &mut String, query: &str, replacement: &str, match_case: bool) -> usize {
-    let matches = collect_matches(text, query, match_case);
-    for range in matches.iter().rev() {
-        let start = char_to_byte(text, range.start);
-        let end = char_to_byte(text, range.end);
-        text.replace_range(start..end, replacement);
+    let matches = collect_byte_matches(text, query, match_case);
+    if matches.is_empty() {
+        return 0;
     }
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for range in &matches {
+        output.push_str(&text[cursor..range.start]);
+        output.push_str(replacement);
+        cursor = range.end;
+    }
+    output.push_str(&text[cursor..]);
+    *text = output;
     matches.len()
 }
 
@@ -160,10 +167,10 @@ pub fn indent_selected_lines(
     let collapsed = selection.is_empty();
     let start_byte = char_to_byte(text, selection.start);
     let end_byte = char_to_byte(text, selection.end);
-    let block_start = text[..start_byte].rfind('\n').map_or(0, |index| index + 1);
-    let block_end = text[end_byte..]
-        .find('\n')
-        .map_or(text.len(), |index| end_byte + index);
+    let Range {
+        start: block_start,
+        end: block_end,
+    } = selected_line_bytes(text, start_byte..end_byte);
     let original = text[block_start..block_end].to_owned();
     let transformed = original
         .split('\n')
@@ -284,8 +291,9 @@ fn find_from_byte(
         ));
     }
 
-    candidate_byte_starts(text)
-        .filter(|byte_start| *byte_start >= start_byte)
+    text[start_byte..]
+        .char_indices()
+        .map(|(offset, _)| start_byte + offset)
         .find_map(|byte_start| {
             let end = byte_start.checked_add(query.len())?;
             let candidate = text.get(byte_start..end)?;
@@ -295,19 +303,20 @@ fn find_from_byte(
         })
 }
 
-fn collect_matches(text: &str, query: &str, match_case: bool) -> Vec<Range<usize>> {
+fn collect_byte_matches(text: &str, query: &str, match_case: bool) -> Vec<Range<usize>> {
     if query.is_empty() {
         return Vec::new();
     }
     if match_case {
         return text
             .match_indices(query)
-            .map(|(start, matched)| byte_range_to_char_range(text, start..start + matched.len()))
+            .map(|(start, matched)| start..start + matched.len())
             .collect();
     }
 
     let mut last_end = 0;
-    candidate_byte_starts(text)
+    text.char_indices()
+        .map(|(index, _)| index)
         .filter_map(|start| {
             if start < last_end {
                 return None;
@@ -316,16 +325,12 @@ fn collect_matches(text: &str, query: &str, match_case: bool) -> Vec<Range<usize
             let candidate = text.get(start..end)?;
             if candidate.eq_ignore_ascii_case(query) {
                 last_end = end;
-                Some(byte_range_to_char_range(text, start..end))
+                Some(start..end)
             } else {
                 None
             }
         })
         .collect()
-}
-
-fn candidate_byte_starts(text: &str) -> impl Iterator<Item = usize> + '_ {
-    text.char_indices().map(|(index, _)| index)
 }
 
 fn toggle_wrap(
@@ -387,12 +392,10 @@ fn transform_selected_lines(
     let collapsed = selection.is_empty();
     let selection_start_byte = char_to_byte(text, selection.start);
     let selection_end_byte = char_to_byte(text, selection.end);
-    let block_start = text[..selection_start_byte]
-        .rfind('\n')
-        .map_or(0, |index| index + 1);
-    let block_end = text[selection_end_byte..]
-        .find('\n')
-        .map_or(text.len(), |index| selection_end_byte + index);
+    let Range {
+        start: block_start,
+        end: block_end,
+    } = selected_line_bytes(text, selection_start_byte..selection_end_byte);
     let original = text[block_start..block_end].to_owned();
     let lines = original.split('\n').collect::<Vec<_>>();
     let all_prefixed = lines
@@ -417,6 +420,20 @@ fn transform_selected_lines(
     } else {
         start..start + transformed.chars().count()
     }
+}
+
+fn selected_line_bytes(text: &str, selection: Range<usize>) -> Range<usize> {
+    let start = text[..selection.start]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let end = if !selection.is_empty() && text.as_bytes().get(selection.end - 1) == Some(&b'\n') {
+        selection.end - 1
+    } else {
+        text[selection.end..]
+            .find('\n')
+            .map_or(text.len(), |index| selection.end + index)
+    };
+    start..end
 }
 
 fn map_prefix_edit_cursor(original: &str, transformed: &str, original_byte_offset: usize) -> usize {
@@ -604,7 +621,7 @@ fn clamp_char_range(text: &str, range: Range<usize>) -> Range<usize> {
     range.start.min(length).min(range.end)..range.start.max(range.end).min(length)
 }
 
-fn char_to_byte(text: &str, char_index: usize) -> usize {
+pub(crate) fn char_to_byte(text: &str, char_index: usize) -> usize {
     text.char_indices()
         .nth(char_index)
         .map_or(text.len(), |(byte_index, _)| byte_index)

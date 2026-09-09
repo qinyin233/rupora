@@ -1,3 +1,5 @@
+use crate::editing::char_to_byte;
+
 use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
@@ -1210,10 +1212,15 @@ impl ProjectionBuilder {
         });
         let first_unrepresented = represented_breaks.max(collapsed_breaks);
         for line_break in trailing_breaks.iter().skip(first_unrepresented) {
+            let previous_boundary = self.source_boundaries.last().copied().unwrap_or_default();
+            if line_break.end <= previous_boundary {
+                // A bare CR can already be present in parser text rather than
+                // a SoftBreak event. Do not project that source break twice.
+                continue;
+            }
             let visual_start = self.text.chars().count();
             self.text.push('\n');
-            let previous_boundary = self.source_boundaries.last().copied().unwrap_or_default();
-            let boundary = line_break.end.max(previous_boundary).min(source.len());
+            let boundary = line_break.end;
             self.source_left_boundaries.push(boundary);
             self.source_boundaries.push(boundary);
             push_run(
@@ -1655,6 +1662,8 @@ impl ProjectionBuilder {
 
     fn ensure_line_break(&mut self, source_byte: usize, style: VisualStyle) {
         if !self.text.is_empty() && !self.text.ends_with('\n') {
+            let source_byte =
+                source_byte.max(self.source_boundaries.last().copied().unwrap_or_default());
             let start = self.text.chars().count();
             self.text.push('\n');
             self.source_left_boundaries.push(source_byte);
@@ -1983,18 +1992,21 @@ fn container_prefix(raw: &str) -> (usize, String) {
 }
 
 fn trailing_line_break_boundary(source: &str, range: &Range<usize>) -> usize {
-    let mut content_end = range.end;
-    while content_end > range.start && matches!(source.as_bytes()[content_end - 1], b'\n' | b'\r') {
-        content_end -= 1;
-    }
-    if source.as_bytes().get(content_end) == Some(&b'\r')
-        && source.as_bytes().get(content_end + 1) == Some(&b'\n')
+    // Container ranges can include indentation after their final newline.
+    // Anchor the visual break to that newline, leaving trailing spaces for
+    // append_trailing_editable_whitespace instead of mapping past them.
+    let fragment = &source[range.clone()];
+    let content_end = fragment.trim_end_matches([' ', '\t', '\n', '\r']).len();
+    let Some(relative) = fragment[content_end..].find(['\n', '\r']) else {
+        return range.end;
+    };
+    let line_break = range.start + content_end + relative;
+    if source.as_bytes().get(line_break) == Some(&b'\r')
+        && source.as_bytes().get(line_break + 1) == Some(&b'\n')
     {
-        (content_end + 2).min(range.end)
-    } else if matches!(source.as_bytes().get(content_end), Some(b'\n' | b'\r')) {
-        (content_end + 1).min(range.end)
+        (line_break + 2).min(range.end)
     } else {
-        range.end
+        (line_break + 1).min(range.end)
     }
 }
 
@@ -2054,12 +2066,6 @@ fn push_run(runs: &mut Vec<VisualRun>, range: Range<usize>, style: VisualStyle) 
 
 fn clamp_range(range: Range<usize>, length: usize) -> Range<usize> {
     range.start.min(length).min(range.end)..range.start.max(range.end).min(length)
-}
-
-fn char_to_byte(text: &str, char_index: usize) -> usize {
-    text.char_indices()
-        .nth(char_index)
-        .map_or(text.len(), |(index, _)| index)
 }
 
 fn shift_index(index: usize, delta: isize) -> usize {

@@ -114,7 +114,17 @@ pub(crate) fn document_image_uri(
         return Err(format!("找不到图片：{}", resolved.display()));
     }
     let absolute = resolved.canonicalize().unwrap_or(resolved);
-    Ok(path_to_file_uri(&absolute))
+    // egui_extras strips its file:// prefix but does not percent-decode the
+    // remaining path. Preserve the native path, including Windows verbatim
+    // prefixes and literal %, #, spaces and Unicode characters.
+    let path = absolute
+        .to_str()
+        .ok_or_else(|| "图片路径不能表示为 Unicode".to_owned())?;
+    Ok(if cfg!(windows) {
+        format!("file:///{path}")
+    } else {
+        format!("file://{path}")
+    })
 }
 
 pub(crate) fn decode_local_resource_path(destination: &str) -> Option<String> {
@@ -156,28 +166,6 @@ const fn hex_value(value: u8) -> Option<u8> {
         b'a'..=b'f' => Some(value - b'a' + 10),
         b'A'..=b'F' => Some(value - b'A' + 10),
         _ => None,
-    }
-}
-
-fn path_to_file_uri(path: &Path) -> String {
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    let mut encoded = String::with_capacity(normalized.len() + 16);
-    for byte in normalized.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/' | b':') {
-            encoded.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            let _ = write!(encoded, "%{byte:02X}");
-        }
-    }
-    if cfg!(target_os = "windows") {
-        if encoded.starts_with("//") {
-            format!("file:{encoded}")
-        } else {
-            format!("file:///{encoded}")
-        }
-    } else {
-        format!("file://{encoded}")
     }
 }
 
@@ -297,6 +285,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn audit_local_image_uri_is_loadable_by_the_installed_egui_loader() {
+        use egui::load::BytesPoll;
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let filename = "图片 space #%🙂.png";
+        let bytes = b"actual image bytes";
+        std::fs::write(directory.path().join(filename), bytes).unwrap();
+        let uri = document_image_uri(directory.path(), "图片%20space%20%23%25🙂.png").unwrap();
+        let context = Context::default();
+        egui_extras::install_image_loaders(&context);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match context.try_load_bytes(&uri).unwrap() {
+                BytesPoll::Ready { bytes: loaded, .. } => {
+                    assert_eq!(loaded.as_ref(), bytes);
+                    break;
+                }
+                BytesPoll::Pending { .. } => {
+                    assert!(Instant::now() < deadline, "image loader timed out");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn recognizes_only_standalone_markdown_images() {
         let image = standalone_image("![审计截图](missing%20image.png)").unwrap();
         assert_eq!(image.alt, "审计截图");
@@ -311,7 +326,7 @@ mod tests {
         std::fs::write(directory.path().join("present image.png"), b"image").unwrap();
         let uri = document_image_uri(directory.path(), "present%20image.png").unwrap();
         assert!(uri.starts_with("file://"));
-        assert!(uri.ends_with("present%20image.png"));
+        assert!(uri.ends_with("present image.png"));
         assert!(document_image_uri(directory.path(), "missing.png").is_err());
         assert!(document_image_uri(directory.path(), "https://example.invalid/image.png").is_err());
     }

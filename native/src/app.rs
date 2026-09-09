@@ -1,3 +1,5 @@
+use crate::editing::char_to_byte;
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -130,6 +132,12 @@ struct PaneScroll {
     hovered: bool,
 }
 
+#[derive(Clone, Copy)]
+struct DocumentViewState {
+    cursor: Option<CCursorRange>,
+    scroll_ratio: f32,
+}
+
 struct TableEditorState {
     document_id: u64,
     base_content: String,
@@ -210,6 +218,7 @@ pub struct RuporaApp {
     recovery_error_reported: bool,
     editor_cursor: Option<CCursorRange>,
     pending_editor_cursor: Option<CCursorRange>,
+    document_views: HashMap<u64, DocumentViewState>,
     find_open: bool,
     find_query: String,
     replace_query: String,
@@ -300,52 +309,13 @@ impl RuporaApp {
                 Err(error) => (ExtensionRegistry::disabled(extension_path), Some(error)),
             };
 
-        let mut app = Self {
-            documents: Vec::new(),
-            active: None,
-            next_untitled_id: 1,
+        let mut app = Self::from_state(
             state,
-            status: "纯 Rust 原生内核已就绪".to_owned(),
-            allow_close: false,
-            discard_recovery_on_exit: false,
             recovery_store,
-            last_recovery_write: Instant::now(),
-            recovery_error_reported: false,
-            editor_cursor: None,
-            pending_editor_cursor: None,
-            find_open: false,
-            find_query: String::new(),
-            replace_query: String::new(),
-            find_match_case: false,
-            find_focus_requested: false,
             workspace,
-            hybrid_active: None,
-            hybrid_ime_session: None,
-            hybrid_pointer_anchor: None,
-            hybrid_cross_selection: None,
-            external_conflicts: HashSet::new(),
-            last_external_check: Instant::now(),
-            external_scan_error_reported: false,
-            command_palette_open: false,
-            command_query: String::new(),
-            command_focus_requested: false,
-            split_scroll_ratio: 0.0,
-            split_scroll_driver: SplitScrollDriver::Editor,
-            split_editor_maximum: 0.0,
-            split_preview_maximum: 0.0,
-            split_scroll_document: None,
-            shortcut_settings_open: false,
-            external_diff_view: None,
-            generated_svg_cache: Rc::new(RefCell::new(HashMap::new())),
-            hybrid_block_heights: HashMap::new(),
-            table_editor: None,
-            instance_coordinator,
-            update_receiver: None,
             extension_registry,
-            extension_receiver: None,
-            available_update: None,
-            about_open: false,
-        };
+            instance_coordinator,
+        );
         if let Some(error) = extension_error {
             app.status = error;
         }
@@ -437,10 +407,73 @@ impl RuporaApp {
         app
     }
 
+    fn from_state(
+        state: PersistedState,
+        recovery_store: RecoveryStore,
+        workspace: Option<Workspace>,
+        extension_registry: ExtensionRegistry,
+        instance_coordinator: Option<InstanceCoordinator>,
+    ) -> Self {
+        Self {
+            documents: Vec::new(),
+            active: None,
+            next_untitled_id: 1,
+            state,
+            status: "纯 Rust 原生内核已就绪".to_owned(),
+            allow_close: false,
+            discard_recovery_on_exit: false,
+            recovery_store,
+            last_recovery_write: Instant::now(),
+            recovery_error_reported: false,
+            editor_cursor: None,
+            pending_editor_cursor: None,
+            document_views: HashMap::new(),
+            find_open: false,
+            find_query: String::new(),
+            replace_query: String::new(),
+            find_match_case: false,
+            find_focus_requested: false,
+            workspace,
+            hybrid_active: None,
+            hybrid_ime_session: None,
+            hybrid_pointer_anchor: None,
+            hybrid_cross_selection: None,
+            external_conflicts: HashSet::new(),
+            last_external_check: Instant::now(),
+            external_scan_error_reported: false,
+            command_palette_open: false,
+            command_query: String::new(),
+            command_focus_requested: false,
+            split_scroll_ratio: 0.0,
+            split_scroll_driver: SplitScrollDriver::Editor,
+            split_editor_maximum: 0.0,
+            split_preview_maximum: 0.0,
+            split_scroll_document: None,
+            shortcut_settings_open: false,
+            external_diff_view: None,
+            generated_svg_cache: Rc::new(RefCell::new(HashMap::new())),
+            hybrid_block_heights: HashMap::new(),
+            table_editor: None,
+            instance_coordinator,
+            update_receiver: None,
+            extension_registry,
+            extension_receiver: None,
+            available_update: None,
+            about_open: false,
+        }
+    }
+
     fn store_active_view_state(&mut self) {
         let Some(index) = self.active else {
             return;
         };
+        self.document_views.insert(
+            self.documents[index].id(),
+            DocumentViewState {
+                cursor: self.editor_cursor,
+                scroll_ratio: self.split_scroll_ratio,
+            },
+        );
         let Some(path) = self.documents[index].path.clone() else {
             return;
         };
@@ -461,6 +494,18 @@ impl RuporaApp {
         let Some(index) = self.active else {
             return;
         };
+        if let Some(view) = self.document_views.get(&self.documents[index].id()) {
+            let length = self.documents[index].content.chars().count();
+            let cursor = view.cursor.map(|mut cursor| {
+                cursor.primary.index.0 = cursor.primary.index.0.min(length);
+                cursor.secondary.index.0 = cursor.secondary.index.0.min(length);
+                cursor
+            });
+            self.editor_cursor = cursor;
+            self.pending_editor_cursor = cursor;
+            self.split_scroll_ratio = view.scroll_ratio;
+            return;
+        }
         let Some(path) = self.documents[index].path.clone() else {
             return;
         };
@@ -481,6 +526,8 @@ impl RuporaApp {
         self.active = Some(index);
         self.hybrid_active = None;
         self.hybrid_ime_session = None;
+        self.hybrid_pointer_anchor = None;
+        self.hybrid_cross_selection = None;
         self.split_scroll_document = Some(index);
         self.restore_active_view_state();
     }
@@ -491,10 +538,11 @@ impl RuporaApp {
         self.next_untitled_id += 1;
         self.documents.push(document);
         self.active = Some(self.documents.len() - 1);
-        self.editor_cursor = None;
-        self.pending_editor_cursor = None;
+        self.restore_active_view_state();
         self.hybrid_active = None;
         self.hybrid_ime_session = None;
+        self.hybrid_pointer_anchor = None;
+        self.hybrid_cross_selection = None;
         self.status = "已新建文档".to_owned();
     }
 
@@ -876,6 +924,8 @@ impl RuporaApp {
         if let Some(path) = self.documents[index].path.as_ref() {
             self.external_conflicts.remove(path);
         }
+        self.store_active_view_state();
+        self.document_views.remove(&self.documents[index].id());
         self.documents.remove(index);
         self.active = match (self.active, self.documents.is_empty()) {
             (_, true) => None,
@@ -887,6 +937,8 @@ impl RuporaApp {
         self.pending_editor_cursor = None;
         self.hybrid_active = None;
         self.hybrid_ime_session = None;
+        self.hybrid_pointer_anchor = None;
+        self.hybrid_cross_selection = None;
         self.restore_active_view_state();
         if self.documents.is_empty() {
             self.next_untitled_id = 1;
@@ -1586,13 +1638,20 @@ impl RuporaApp {
             }
         }
 
-        if let Some((index, path)) = reloaded.last() {
-            if self.active == Some(*index) {
+        if let Some((_, path)) = reloaded.last() {
+            if reloaded
+                .iter()
+                .any(|(index, _)| self.active == Some(*index))
+            {
                 self.editor_cursor = None;
                 self.pending_editor_cursor = None;
                 self.hybrid_active = None;
                 self.hybrid_ime_session = None;
+                self.hybrid_pointer_anchor = None;
+                self.hybrid_cross_selection = None;
             }
+            self.document_views
+                .retain(|id, _| self.documents.iter().any(|document| document.id() == *id));
             self.status = format!("已自动重新加载外部修改：{}", path.display());
         }
     }
@@ -2945,7 +3004,8 @@ impl RuporaApp {
 
     fn edit_pane(&mut self, ui: &mut Ui, index: usize, scroll_offset: Option<f32>) -> PaneScroll {
         let selection_before = self.editor_cursor.map(cursor_range_to_char_range);
-        let mut scroll_area = ScrollArea::vertical().id_salt(("editor-scroll", index));
+        let mut scroll_area =
+            ScrollArea::vertical().id_salt(("editor-scroll", self.documents[index].id()));
         if let Some(offset) = scroll_offset {
             scroll_area = scroll_area.vertical_scroll_offset(offset);
         }
@@ -2985,7 +3045,8 @@ impl RuporaApp {
                             let row_height =
                                 ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
                             let desired_rows = (available.y / row_height).max(20.0) as usize;
-                            let editor_id = ui.make_persistent_id(("editor", index));
+                            let editor_id =
+                                ui.make_persistent_id(("editor", self.documents[index].id()));
                             if let Some(cursor_range) = self.pending_editor_cursor.take() {
                                 let mut state =
                                     TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
@@ -3060,17 +3121,18 @@ impl RuporaApp {
                             let mut cursor_adjusted = false;
 
                             if focused
-                                && let (Some(url), Some(selection)) =
-                                    (input_action.pasted_url.as_deref(), selection_before.clone())
+                                && let (Some(url), Some(selection)) = (
+                                    input_action.pasted_text.as_deref(),
+                                    selection_before.clone(),
+                                )
                                 && !selection.is_empty()
                                 && let Some(before_content) = before_content.as_ref()
                             {
-                                self.documents[index].content.clone_from(before_content);
-                                if let Some(next) = editing::paste_url_as_markdown_link(
-                                    &mut self.documents[index].content,
-                                    selection,
-                                    url,
-                                ) {
+                                let mut linked = before_content.clone();
+                                if let Some(next) =
+                                    editing::paste_url_as_markdown_link(&mut linked, selection, url)
+                                {
+                                    self.documents[index].content = linked;
                                     selection_after = Some(next);
                                     kind = EditKind::Other;
                                     changed = true;
@@ -3172,7 +3234,7 @@ impl RuporaApp {
         let palette = app_palette(self.state.dark);
         let mut task_toggle = None;
         let mut clicked_destination = None;
-        let mut scroll_area = ScrollArea::vertical().id_salt(("preview-scroll", index));
+        let mut scroll_area = ScrollArea::vertical().id_salt(("preview-scroll", document_id));
         if let Some(offset) = scroll_offset {
             scroll_area = scroll_area.vertical_scroll_offset(offset);
         }
@@ -3217,7 +3279,11 @@ impl RuporaApp {
                                 );
                                 let response = ui.interact(
                                     preview.rect,
-                                    ui.make_persistent_id(("native-preview-block", block.id)),
+                                    ui.make_persistent_id((
+                                        "native-preview-block",
+                                        document_id,
+                                        block.id,
+                                    )),
                                     egui::Sense::click(),
                                 );
                                 if response.clicked()
@@ -3375,7 +3441,7 @@ impl RuporaApp {
         let palette = app_palette(self.state.dark);
 
         ScrollArea::vertical()
-            .id_salt(("hybrid-scroll", index))
+            .id_salt(("hybrid-scroll", document_id))
             .show(ui, |ui| {
                 ui.add_space(28.0);
                 let available_width = ui.available_width();
@@ -3501,7 +3567,7 @@ impl RuporaApp {
                                     let preview_source =
                                         generated_preview.as_deref().unwrap_or(source_block);
                                     let mut code_surface_rect = None;
-                                    ui.push_id(("hybrid-block", block.id), |ui| {
+                                    ui.push_id(("hybrid-block", document_id, block.id), |ui| {
                                         if Some(block.id) == active_id {
                                             let edit_range =
                                                 hybrid_edit_range(&source, &blocks, block.id);
@@ -3867,7 +3933,7 @@ impl RuporaApp {
                                                     && !defer_ime
                                                     && focused
                                                     && let (Some(url), Some(selection)) = (
-                                                        input_action.pasted_url.as_deref(),
+                                                        input_action.pasted_text.as_deref(),
                                                         visual_selection_before.clone(),
                                                     )
                                                     && !selection.is_empty()
@@ -6210,7 +6276,7 @@ struct EditorInputAction {
     tab: bool,
     right: bool,
     shift: bool,
-    pasted_url: Option<String>,
+    pasted_text: Option<String>,
     typed_text: Option<String>,
 }
 
@@ -6239,12 +6305,17 @@ fn take_cross_block_input(ui: &mut Ui) -> Option<CrossBlockInput> {
     let mut action = None;
     ui.input_mut(|input| {
         input.events.retain(|event| {
+            // Apply one action to the cross-block range. Remaining events must
+            // reach TextEdit at the resulting caret during this same frame.
+            if action.is_some() {
+                return true;
+            }
             let next = match event {
                 egui::Event::Copy => Some(CrossBlockInput::Copy),
                 egui::Event::Cut => Some(CrossBlockInput::Cut),
-                egui::Event::Paste(text) | egui::Event::Text(text) => {
-                    Some(CrossBlockInput::Replace(text.clone()))
-                }
+                egui::Event::Paste(text) | egui::Event::Text(text) => Some(
+                    CrossBlockInput::Replace(crate::document::normalize_line_endings(text)),
+                ),
                 egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty() => {
                     Some(CrossBlockInput::Replace(text.clone()))
                 }
@@ -6280,7 +6351,7 @@ fn editor_input_action(ui: &Ui) -> EditorInputAction {
         tab: input.key_pressed(Key::Tab),
         right: input.key_pressed(Key::ArrowRight),
         shift: input.modifiers.shift,
-        pasted_url: input.events.iter().rev().find_map(|event| match event {
+        pasted_text: input.events.iter().rev().find_map(|event| match event {
             egui::Event::Paste(text) => Some(text.trim().to_owned()),
             _ => None,
         }),
@@ -6425,12 +6496,6 @@ fn prompt_to_save(title: &str) -> MessageDialogResult {
         ))
         .set_buttons(MessageButtons::YesNoCancel)
         .show()
-}
-
-fn char_to_byte(text: &str, char_index: usize) -> usize {
-    text.char_indices()
-        .nth(char_index)
-        .map_or(text.len(), |(index, _)| index)
 }
 
 fn line_start_byte(text: &str, one_based_line: usize) -> usize {
@@ -6636,6 +6701,137 @@ fn cjk_bold_font_candidates() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn isolated_app(directory: &Path) -> RuporaApp {
+        RuporaApp::from_state(
+            PersistedState::default(),
+            RecoveryStore::at(directory.join("recovery.json")),
+            None,
+            ExtensionRegistry::disabled(directory.join("extensions.json")),
+            None,
+        )
+    }
+
+    #[test]
+    fn audit_cross_block_input_preserves_all_text_events_and_normalizes_pasted_newlines() {
+        for (events, expected) in [
+            (
+                vec![
+                    egui::Event::Text("你".to_owned()),
+                    egui::Event::Text("🙂".to_owned()),
+                ],
+                "你🙂",
+            ),
+            (
+                vec![egui::Event::Paste("甲\r\n乙\r丙".to_owned())],
+                "甲\n乙\n丙",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = isolated_app(directory.path());
+            app.new_document();
+            app.documents[0].content = "first\n\nsecond".to_owned();
+            app.documents[0].update_after_edit();
+            let cursor = CCursorRange::two(CCursor::new(0), CCursor::new(13));
+            app.editor_cursor = Some(cursor);
+            app.hybrid_cross_selection = Some(HybridCrossSelection {
+                document_id: app.documents[0].id(),
+                cursor,
+            });
+            let context = Context::default();
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.hybrid_pane(ui, 0),
+            );
+            assert_eq!(app.documents[0].content, expected);
+            app.undo_active();
+            assert_eq!(app.documents[0].content, "first\n\nsecond");
+        }
+    }
+
+    #[test]
+    fn audit_source_editor_pastes_plain_text_over_a_unicode_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.documents[0].content = "前中文🙂后".to_owned();
+        app.documents[0].update_after_edit();
+        app.queue_editor_selection(1..4);
+        let context = Context::default();
+        for events in [vec![], vec![egui::Event::Paste("替换".to_owned())]] {
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.edit_pane(ui, 0, None);
+                },
+            );
+        }
+        assert_eq!(app.documents[0].content, "前替换后");
+        app.undo_active();
+        assert_eq!(app.documents[0].content, "前中文🙂后");
+    }
+
+    #[test]
+    fn audit_switching_untitled_tabs_restores_each_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.documents[0].content = "甲乙🙂".to_owned();
+        app.queue_editor_selection(1..3);
+        app.new_document();
+        app.documents[1].content = "第二篇".to_owned();
+        app.queue_editor_selection(0..2);
+        app.activate_document(0);
+        assert_eq!(app.active_selection(0), 1..3);
+        app.activate_document(1);
+        assert_eq!(app.active_selection(1), 0..2);
+    }
+
+    #[test]
+    fn audit_closing_an_inactive_tab_preserves_the_active_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.new_document();
+        app.documents[1].content = "正文🙂".to_owned();
+        app.queue_editor_selection(0..2);
+        app.close_document(0);
+        assert_eq!(app.active, Some(0));
+        assert_eq!(app.active_selection(0), 0..2);
+    }
+
+    #[test]
+    fn audit_reloading_multiple_files_resets_the_active_editor_even_when_it_is_not_last() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        for name in ["first.md", "second.md"] {
+            let path = directory.path().join(name);
+            fs::write(&path, "original").unwrap();
+            app.documents.push(Document::open(&path).unwrap());
+            fs::write(path, "changed 中文🙂").unwrap();
+        }
+        app.active = Some(0);
+        app.queue_editor_selection(0..8);
+        app.last_external_check = Instant::now() - Duration::from_secs(3);
+        app.check_external_changes_if_due();
+        assert_eq!(app.documents[0].content, "changed 中文🙂");
+        assert!(app.editor_cursor.is_none());
+        assert!(app.pending_editor_cursor.is_none());
+    }
     use crate::native_preview::{
         MAX_GENERATED_SVG_CACHE_BYTES, MAX_GENERATED_SVG_CACHE_ENTRIES, cache_generated_svg,
     };

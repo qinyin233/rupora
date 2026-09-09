@@ -620,15 +620,26 @@ fn sync_parent_directory(_parent: &Path) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn send_pdf_to_printer(path: &Path) -> Result<(), String> {
-    let status = Command::new("powershell.exe")
+fn windows_print_command(path: &Path) -> Command {
+    use std::os::windows::process::CommandExt as _;
+    let mut command = Command::new("powershell.exe");
+    command
         .args([
             "-NoProfile",
             "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
             "-Command",
-            "Start-Process -FilePath $args[0] -Verb Print",
+            "Start-Process -FilePath $env:RUPORA_PRINT_PATH -Verb Print -WindowStyle Hidden -ErrorAction Stop",
         ])
-        .arg(path)
+        .env("RUPORA_PRINT_PATH", path)
+        .creation_flags(0x0800_0000);
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn send_pdf_to_printer(path: &Path) -> Result<(), String> {
+    let status = windows_print_command(path)
         .status()
         .map_err(|error| format!("无法调用系统打印服务：{error}"))?;
     if status.success() {
@@ -681,6 +692,43 @@ pub fn cjk_font_candidates() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn audit_windows_print_passes_the_literal_path_to_the_print_verb() {
+        use std::os::windows::process::CommandExt as _;
+        let path = Path::new(r"C:\print jobs\quote' & dollar$.pdf");
+        let command = windows_print_command(path);
+        let args = command.get_args().collect::<Vec<_>>();
+        let script_index = args.iter().position(|arg| *arg == "-Command").unwrap() + 1;
+        // Exercise the exact PowerShell invocation, replacing only the external
+        // print action with a recorder so this test never starts a print job.
+        let script = format!(
+            "function Start-Process {{ param($FilePath, $Verb, $WindowStyle, $ErrorAction); [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$FilePath)) }}; {}",
+            args[script_index].to_string_lossy(),
+        );
+        let output = Command::new(command.get_program())
+            .args(&args[..script_index])
+            .arg(script)
+            .args(&args[script_index + 1..])
+            .envs(
+                command
+                    .get_envs()
+                    .filter_map(|(key, value)| value.map(|value| (key, value))),
+            )
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            STANDARD.encode(path.to_str().unwrap())
+        );
+    }
 
     #[test]
     fn emits_a_valid_pdf_header() {

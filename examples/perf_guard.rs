@@ -1,5 +1,6 @@
 use rupora::{
     document::{Document, EditKind},
+    editing::replace_all,
     markdown::{BlockIndex, analyze, render_html_fragment},
 };
 use std::time::{Duration, Instant};
@@ -35,6 +36,15 @@ fn main() {
     measure("render 2k sections to HTML", Duration::from_secs(2), || {
         std::hint::black_box(render_html_fragment(&export_source));
     });
+
+    let mut repeated = "中文 Aa 🙂\n".repeat(25_000);
+    measure(
+        "replace 25k Unicode matches",
+        Duration::from_secs(1),
+        || {
+            assert_eq!(replace_all(&mut repeated, "aa", "替换", false), 25_000);
+        },
+    );
 }
 
 fn measure(name: &str, budget: Duration, operation: impl FnOnce()) {
