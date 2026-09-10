@@ -57,6 +57,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Test release publication guard
+        run: python3 scripts/test_release_guard.py -v
+
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update

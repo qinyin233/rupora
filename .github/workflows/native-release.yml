@@ -661,6 +661,8 @@ jobs:
           } elseif (($response -join "`n") -notmatch 'HTTP 404') {
             throw "Could not check existing release: $($response -join "`n")"
           }
+          # A handled 404 is expected for a new tag; pwsh must not propagate gh's exit code.
+          exit 0
 
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
