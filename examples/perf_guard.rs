@@ -33,6 +33,17 @@ fn main() {
     );
 
     let export_source = representative_document(2_000);
+    measure(
+        "atomic command on 20k sections",
+        Duration::from_millis(250),
+        || {
+            assert!(document.edit(EditKind::Format, None, |text| {
+                text.push_str("\nNew paragraph.\n");
+                None
+            }));
+            assert!(document.derived_state_is_stale());
+        },
+    );
     measure("render 2k sections to HTML", Duration::from_secs(2), || {
         std::hint::black_box(render_html_fragment(&export_source));
     });

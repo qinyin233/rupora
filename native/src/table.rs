@@ -12,6 +12,7 @@ pub enum Alignment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkdownTable {
     pub range: Range<usize>,
+    /// Inline Markdown source; only table-specific pipe escaping is decoded.
     pub headers: Vec<String>,
     pub alignments: Vec<Alignment>,
     pub rows: Vec<Vec<String>>,
@@ -168,8 +169,13 @@ fn parse_row(line: &str) -> Vec<String> {
     let mut current = String::new();
     let mut characters = content.chars().peekable();
     while let Some(character) = characters.next() {
-        if character == '\\' && matches!(characters.peek(), Some('|' | '\\')) {
-            current.push(characters.next().expect("peeked escaped table character"));
+        if character == '\\' && characters.peek() == Some(&'|') {
+            current.push(characters.next().expect("peeked escaped pipe"));
+        } else if character == '\\' && characters.peek() == Some(&'\\') {
+            // Preserve inline Markdown escapes, including paired backslashes;
+            // consume the pair so a following pipe remains a column boundary.
+            current.push(character);
+            current.push(characters.next().expect("peeked backslash"));
         } else if character == '|' {
             cells.push(current.trim().to_owned());
             current.clear();
@@ -182,9 +188,24 @@ fn parse_row(line: &str) -> Vec<String> {
 }
 
 fn escaped_cell(cell: &str) -> String {
-    cell.replace('\\', "\\\\")
-        .replace('|', "\\|")
-        .replace(['\r', '\n'], " ")
+    let mut escaped = String::new();
+    let mut backslashes = 0;
+    for character in cell.chars() {
+        if character == '|' && backslashes % 2 == 0 {
+            escaped.push('\\');
+        }
+        escaped.push(if matches!(character, '\r' | '\n') {
+            ' '
+        } else {
+            character
+        });
+        backslashes = if character == '\\' {
+            backslashes + 1
+        } else {
+            0
+        };
+    }
+    escaped
 }
 
 fn push_row(output: &mut String, cells: &[String], widths: &[usize]) {
@@ -205,6 +226,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_audit_table_editor_roundtrip_preserves_markdown_escapes() {
+        for cell in [
+            r"\*literal\*",
+            r"\\*emphasis*",
+            r"`a\*b`",
+            r"a\|b",
+            r"a\\\|b",
+        ] {
+            let source = format!("| Header |\n| --- |\n| {cell} |");
+            let table = find_table(&source, source.find(cell).unwrap()).unwrap();
+            assert_eq!(
+                crate::markdown::render_html_fragment(&table.to_markdown()),
+                crate::markdown::render_html_fragment(&source),
+                "cell={cell:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_and_serializes_alignment_unicode_and_escaped_pipes() {
         let source = "before\n\n| 名称 | Value |\n| :--- | ---: |\n| 甲\\|乙 | 42 |\n\nafter";
         let cursor = source.find("42").unwrap();
@@ -221,9 +261,9 @@ mod tests {
         let source = "| Path | Literal |\n| - | :-: |\n| C:\\Temp | a\\\\b |";
         let table = find_table(source, source.find("Temp").unwrap()).unwrap();
 
-        assert_eq!(table.rows[0], vec![r"C:\Temp", r"a\b"]);
+        assert_eq!(table.rows[0], vec![r"C:\Temp", r"a\\b"]);
         let serialized = table.to_markdown();
-        assert!(serialized.contains(r"C:\\Temp"));
+        assert!(serialized.contains(r"C:\Temp"));
         assert!(serialized.contains(r"a\\b"));
         assert_eq!(
             find_table(&serialized, 0).unwrap().rows,

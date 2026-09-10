@@ -1,8 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant, SystemTime},
 };
 
 use eframe::egui::{self, Context, Response, Ui};
@@ -12,6 +13,163 @@ use crate::markdown;
 
 pub(crate) const MAX_GENERATED_SVG_CACHE_ENTRIES: usize = 128;
 pub(crate) const MAX_GENERATED_SVG_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+const LOCAL_IMAGE_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Clone)]
+pub(crate) struct ResolvedLocalImage {
+    pub(crate) uri: Result<String, String>,
+    pub(crate) revision: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ImageFileStamp {
+    length: u64,
+    modified: Option<SystemTime>,
+}
+
+struct LocalImageEntry {
+    stamp: Option<ImageFileStamp>,
+    resolved: ResolvedLocalImage,
+    checked_at: Instant,
+    owners: HashSet<(u64, markdown::BlockId)>,
+    context: Context,
+}
+
+/// Owns local-resource freshness. URI syntax stays compatible with egui's file
+/// loader; an observed file change invalidates every egui image cache layer.
+pub(crate) struct LocalImageStore {
+    entries: HashMap<PathBuf, LocalImageEntry>,
+    owners: HashMap<(u64, markdown::BlockId), PathBuf>,
+    check_interval: Duration,
+    next_revision: u64,
+}
+
+impl Default for LocalImageStore {
+    fn default() -> Self {
+        Self::new(LOCAL_IMAGE_CHECK_INTERVAL)
+    }
+}
+
+impl LocalImageStore {
+    pub(crate) fn new(check_interval: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            owners: HashMap::new(),
+            check_interval,
+            next_revision: 0,
+        }
+    }
+
+    pub(crate) fn resolve(
+        &mut self,
+        ctx: &Context,
+        owner: (u64, markdown::BlockId),
+        base_directory: &Path,
+        destination: &str,
+    ) -> ResolvedLocalImage {
+        let path = match local_image_path(base_directory, destination) {
+            Ok(path) => std::path::absolute(&path).unwrap_or(path),
+            Err(error) => {
+                self.forget_block(owner);
+                return ResolvedLocalImage {
+                    uri: Err(error),
+                    revision: 0,
+                };
+            }
+        };
+        if self.owners.get(&owner) != Some(&path) {
+            self.forget_block(owner);
+            self.owners.insert(owner, path.clone());
+        }
+        let now = Instant::now();
+        if !self.check_interval.is_zero() {
+            ctx.request_repaint_after(self.check_interval);
+        }
+        if let Some(entry) = self.entries.get_mut(&path) {
+            entry.owners.insert(owner);
+            if now.duration_since(entry.checked_at) < self.check_interval {
+                return entry.resolved.clone();
+            }
+        }
+
+        let stamp = std::fs::metadata(&path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| ImageFileStamp {
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
+            });
+        let uri = image_uri_for_path(&path);
+        if let Some(entry) = self.entries.get_mut(&path)
+            && entry.stamp == stamp
+            && entry.resolved.uri == uri
+        {
+            entry.checked_at = now;
+            return entry.resolved.clone();
+        }
+
+        if let Some(entry) = self.entries.get(&path)
+            && let Ok(previous_uri) = &entry.resolved.uri
+        {
+            ctx.forget_image(previous_uri);
+        }
+        // The same canonical file may have been loaded through another spelling
+        // of its path, or before this store first observed it.
+        if let Ok(uri) = &uri {
+            ctx.forget_image(uri);
+        }
+        self.next_revision = self.next_revision.wrapping_add(1);
+        let resolved = ResolvedLocalImage {
+            uri,
+            revision: self.next_revision,
+        };
+        let mut owners = self
+            .entries
+            .remove(&path)
+            .map_or_else(HashSet::new, |entry| entry.owners);
+        owners.insert(owner);
+        self.entries.insert(
+            path,
+            LocalImageEntry {
+                stamp,
+                resolved: resolved.clone(),
+                checked_at: now,
+                owners,
+                context: ctx.clone(),
+            },
+        );
+        resolved
+    }
+
+    pub(crate) fn forget_block(&mut self, owner: (u64, markdown::BlockId)) {
+        let Some(path) = self.owners.remove(&owner) else {
+            return;
+        };
+        let remove = self.entries.get_mut(&path).is_some_and(|entry| {
+            entry.owners.remove(&owner);
+            entry.owners.is_empty()
+        });
+        if remove
+            && let Some(entry) = self.entries.remove(&path)
+            && let Ok(uri) = entry.resolved.uri
+        {
+            entry.context.forget_image(&uri);
+        }
+    }
+
+    pub(crate) fn forget_document(&mut self, document_id: u64) {
+        let owners = self
+            .owners
+            .keys()
+            .copied()
+            .filter(|(owner_document, _)| *owner_document == document_id)
+            .collect::<Vec<_>>();
+        for owner in owners {
+            self.forget_block(owner);
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NativeImage {
@@ -26,10 +184,18 @@ pub(crate) struct NativeMath {
     pub source: String,
 }
 
+#[cfg(test)]
 pub(crate) fn standalone_image(source: &str) -> Option<NativeImage> {
+    standalone_image_with_references(source, &Default::default())
+}
+
+pub(crate) fn standalone_image_with_references(
+    source: &str,
+    references: &markdown::ReferenceDefinitions,
+) -> Option<NativeImage> {
     let mut images = Vec::new();
     let mut active = None;
-    for (event, range) in Parser::new_ext(source, markdown::parser_options()).into_offset_iter() {
+    for (event, range) in markdown::events_with_references(source, references) {
         match event {
             Event::Start(Tag::Image { dest_url, .. }) => {
                 active = Some(NativeImage {
@@ -91,10 +257,15 @@ pub(crate) fn standalone_mermaid(source: &str) -> Option<markdown::MermaidBlock>
     source[block.range.end..].trim().is_empty().then_some(block)
 }
 
+#[cfg(test)]
 pub(crate) fn document_image_uri(
     base_directory: &Path,
     destination: &str,
 ) -> Result<String, String> {
+    image_uri_for_path(&local_image_path(base_directory, destination)?)
+}
+
+fn local_image_path(base_directory: &Path, destination: &str) -> Result<PathBuf, String> {
     let path_part = destination.split(['?', '#']).next().unwrap_or_default();
     if path_part.is_empty() {
         return Err("图片路径为空".to_owned());
@@ -105,15 +276,20 @@ pub(crate) fn document_image_uri(
     let decoded =
         decode_local_resource_path(destination).ok_or_else(|| "图片路径编码无效".to_owned())?;
     let path = PathBuf::from(decoded);
-    let resolved = if path.is_absolute() {
+    Ok(if path.is_absolute() {
         path
     } else {
         base_directory.join(path)
-    };
+    })
+}
+
+fn image_uri_for_path(resolved: &Path) -> Result<String, String> {
     if !resolved.is_file() {
         return Err(format!("找不到图片：{}", resolved.display()));
     }
-    let absolute = resolved.canonicalize().unwrap_or(resolved);
+    let absolute = resolved
+        .canonicalize()
+        .unwrap_or_else(|_| resolved.to_owned());
     // egui_extras strips its file:// prefix but does not percent-decode the
     // remaining path. Preserve the native path, including Windows verbatim
     // prefixes and literal %, #, spaces and Unicode characters.
@@ -283,6 +459,100 @@ pub(crate) fn cache_generated_svg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_test_image(path: &Path, width: u32, pixel: [u8; 4], timestamp: u64) {
+        image::RgbaImage::from_pixel(width, 1, image::Rgba(pixel))
+            .save(path)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp))
+            .unwrap();
+    }
+
+    fn load_test_image(context: &Context, uri: &str) -> Arc<egui::ColorImage> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match context
+                .try_load_image(uri, egui::load::SizeHint::default())
+                .unwrap()
+            {
+                egui::load::ImagePoll::Ready { image } => return image,
+                egui::load::ImagePoll::Pending { .. } => {
+                    assert!(Instant::now() < deadline, "image loader timed out");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overwriting_a_local_image_refreshes_decoded_pixels_at_the_same_file_uri() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("图片 space #%🙂.png");
+        let destination = "图片%20space%20%23%25🙂.png";
+        write_test_image(&path, 1, [255, 0, 0, 255], 10);
+        let context = Context::default();
+        egui_extras::install_image_loaders(&context);
+        let mut store = LocalImageStore::new(Duration::ZERO);
+        let block_id = markdown::blocks("image")[0].id;
+        let before = store.resolve(&context, (1, block_id), directory.path(), destination);
+        let before_uri = before.uri.unwrap();
+        let before_image = load_test_image(&context, &before_uri);
+        assert_eq!(before_image.size, [1, 1]);
+        assert_eq!(before_image.pixels, [egui::Color32::RED]);
+
+        write_test_image(&path, 2, [0, 0, 255, 255], 20);
+        let after = store.resolve(&context, (1, block_id), directory.path(), destination);
+        assert_eq!(after.uri.as_ref().unwrap(), &before_uri);
+        assert_ne!(after.revision, before.revision);
+        let after_image = load_test_image(&context, after.uri.as_ref().unwrap());
+        assert_eq!(after_image.size, [2, 1]);
+        assert_eq!(after_image.pixels, [egui::Color32::BLUE; 2]);
+    }
+
+    #[test]
+    fn resource_checks_are_shared_throttled_and_released_with_the_last_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared.png");
+        write_test_image(&path, 1, [255, 0, 0, 255], 10);
+        let context = Context::default();
+        let mut store = LocalImageStore::new(Duration::from_secs(60));
+        let block_id = markdown::blocks("image")[0].id;
+        let first = store.resolve(&context, (1, block_id), directory.path(), "shared.png");
+        write_test_image(&path, 2, [0, 0, 255, 255], 20);
+        let second = store.resolve(&context, (2, block_id), directory.path(), "shared.png");
+        assert_eq!(
+            second.revision, first.revision,
+            "same-path owners share the check interval"
+        );
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(store.owners.len(), 2);
+
+        store.forget_document(1);
+        assert_eq!(store.entries.len(), 1);
+        let retained = store.resolve(&context, (2, block_id), directory.path(), "shared.png");
+        assert_eq!(retained.revision, first.revision);
+        store.forget_document(2);
+        assert!(store.entries.is_empty());
+        assert!(store.owners.is_empty());
+
+        let reopened = store.resolve(&context, (3, block_id), directory.path(), "shared.png");
+        assert_ne!(reopened.revision, first.revision);
+        store.resolve(
+            &context,
+            (3, block_id),
+            directory.path(),
+            "https://example.invalid/image.png",
+        );
+        assert!(
+            store.entries.is_empty(),
+            "a nonlocal replacement releases the old path"
+        );
+        assert!(store.owners.is_empty());
+    }
 
     #[test]
     fn audit_local_image_uri_is_loadable_by_the_installed_egui_loader() {

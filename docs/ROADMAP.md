@@ -31,7 +31,7 @@ RUPORA 2 已完成从 WebView/Vditor 外壳到原生 Rust 编辑器的八个优�
 - 块索引消除逐块全文回扫，2 万块增量协调保持线性热路径。
 - Criterion 基准与可执行的大文档性能预算。
 - 单元测试、Proptest 属性测试、保存故障注入。
-- Markdown 与表格双 fuzz 目标，定时 nightly 构建。
+- Markdown 流水线、表格和 WYSIWYG 投影三个 fuzz 目标，定时及手动 nightly 构建并运行。
 - 严格 Clippy、三平台 CI，以及包含 RustSec advisory 检查的 cargo-deny 门禁。
 
 ## P5：桌面产品化

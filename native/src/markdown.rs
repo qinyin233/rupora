@@ -19,7 +19,8 @@ const MAX_GENERATED_SVG_EDGE: f32 = 8_192.0;
 const MAX_GENERATED_SVG_PIXELS: f64 = 16.0 * 1024.0 * 1024.0;
 const MAX_GENERATED_SVG_ASPECT_RATIO: f32 = 512.0;
 const MAX_GENERATED_BLOCKS: usize = 128;
-const MAX_GENERATED_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+/// Combined budget for generated math/diagram fragments in one HTML document.
+pub const MAX_GENERATED_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOC_BYTES: usize = 1024 * 1024;
 const MAX_TOC_EXPANSION_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BLOCK_MATCH_CANDIDATES: usize = 16 * 1024;
@@ -75,6 +76,7 @@ pub struct MarkdownBlock {
 #[derive(Clone, Debug)]
 pub struct BlockIndex {
     source: String,
+    references: std::sync::Arc<ReferenceDefinitions>,
     blocks: Vec<MarkdownBlock>,
     next_id: u64,
 }
@@ -99,6 +101,7 @@ impl BlockIndex {
             .collect();
         Self {
             source: source.to_owned(),
+            references: reference_definitions(source),
             blocks,
             next_id,
         }
@@ -108,10 +111,16 @@ impl BlockIndex {
         &self.blocks
     }
 
+    pub fn references(&self) -> std::sync::Arc<ReferenceDefinitions> {
+        self.references.clone()
+    }
+
     pub fn update(&mut self, source: &str) {
         if self.source == source {
             return;
         }
+
+        self.references = reference_definitions(source);
 
         let new_ranges = block_ranges(source);
         let mut assigned = vec![None; new_ranges.len()];
@@ -182,6 +191,50 @@ impl BlockIndex {
     }
 }
 
+/// Document-wide link definitions shared by block previews and edit projections.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReferenceDefinitions(HashMap<unicase::UniCase<String>, (String, String)>);
+
+pub fn reference_definitions(source: &str) -> std::sync::Arc<ReferenceDefinitions> {
+    let source = parse_front_matter(source).map_or(source, |front| &source[front.body_start..]);
+    let parser = Parser::new_ext(source, parser_options());
+    std::sync::Arc::new(ReferenceDefinitions(
+        parser
+            .reference_definitions()
+            .iter()
+            .map(|(label, definition)| {
+                (
+                    unicase::UniCase::new(label.to_owned()),
+                    (
+                        definition.dest.to_string(),
+                        definition
+                            .title
+                            .as_ref()
+                            .map_or_else(String::new, ToString::to_string),
+                    ),
+                )
+            })
+            .collect(),
+    ))
+}
+
+pub fn events_with_references<'a>(
+    source: &'a str,
+    references: &'a ReferenceDefinitions,
+) -> impl Iterator<Item = (Event<'a>, Range<usize>)> + 'a {
+    Parser::new_with_broken_link_callback(
+        source,
+        parser_options(),
+        Some(move |link: pulldown_cmark::BrokenLink<'_>| {
+            references
+                .0
+                .get(&unicase::UniCase::new(link.reference.to_string()))
+                .map(|(destination, title)| (destination.clone().into(), title.clone().into()))
+        }),
+    )
+    .into_offset_iter()
+}
+
 pub fn parser_options() -> Options {
     Options::ENABLE_GFM
         | Options::ENABLE_TABLES
@@ -218,7 +271,12 @@ pub fn analyze(source: &str) -> MarkdownAnalysis {
                 line_scan_offset = range.start;
                 current_heading = Some((level, line_at_scan_offset, String::new()));
             }
-            Event::Text(text) | Event::Code(text) if current_heading.is_some() => {
+            Event::Text(text)
+            | Event::Code(text)
+            | Event::InlineMath(text)
+            | Event::DisplayMath(text)
+                if current_heading.is_some() =>
+            {
                 if let Some((_, _, heading_text)) = current_heading.as_mut() {
                     heading_text.push_str(&text);
                 }
@@ -377,6 +435,19 @@ pub fn toc_preview_markdown(source: &str) -> String {
     render_toc_markdown(&heading_anchors(source))
 }
 
+pub fn is_toc_marker(source: &str, range: Range<usize>) -> bool {
+    source
+        .get(range.clone())
+        .is_some_and(|text| text.trim().eq_ignore_ascii_case("[TOC]"))
+        && !Parser::new_ext(source, parser_options())
+            .into_offset_iter()
+            .any(|(event, code)| {
+                matches!(event, Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock))
+                    && code.start < range.end
+                    && range.start < code.end
+            })
+}
+
 pub fn render_math_svg(source: &str, inline: bool) -> Result<String, String> {
     if source.len() > MAX_MATH_BYTES {
         return Err(format!("公式超过 {} KiB 渲染上限", MAX_MATH_BYTES / 1024));
@@ -432,16 +503,22 @@ pub fn local_link_destinations(source: &str) -> Vec<String> {
 }
 
 pub fn link_destination_at(source: &str, source_byte: usize) -> Option<String> {
-    Parser::new_ext(source, parser_options())
-        .into_offset_iter()
-        .find_map(|(event, range)| match event {
-            Event::Start(Tag::Link { dest_url, .. })
-                if range.start <= source_byte && source_byte <= range.end =>
-            {
-                Some(dest_url.into_string())
-            }
-            _ => None,
-        })
+    link_destination_with_references(source, source_byte, &Default::default())
+}
+
+pub fn link_destination_with_references(
+    source: &str,
+    source_byte: usize,
+    references: &ReferenceDefinitions,
+) -> Option<String> {
+    events_with_references(source, references).find_map(|(event, range)| match event {
+        Event::Start(Tag::Link { dest_url, .. })
+            if range.start <= source_byte && source_byte <= range.end =>
+        {
+            Some(dest_url.into_string())
+        }
+        _ => None,
+    })
 }
 
 pub fn toggle_task_marker_at(source: &str, source_byte: usize) -> Option<String> {
@@ -581,20 +658,90 @@ fn block_ranges(source: &str) -> Vec<Range<usize>> {
         merged.push(range);
     }
 
-    // A trailing blank paragraph is an addressable editing block in the
-    // WYSIWYG canvas. pulldown-cmark intentionally emits no event for it, but
-    // without an empty block the caret is forced back into the preceding
-    // fenced code block.
-    let ends_after_fenced_code = merged.last().is_some_and(|range| {
-        source.get(range.clone()).is_some_and(|block| {
-            block.trim_start().starts_with("```") || block.trim_start().starts_with("~~~")
-        })
-    });
-    if ends_after_fenced_code && (source.ends_with("\n\n") || source.ends_with("\r\n\r\n")) {
-        merged.push(source.len()..source.len());
-    }
+    editable_paragraph_ranges(source, merged)
+}
 
-    merged
+/// Empty paragraphs need their own cursor targets. They are omitted by the
+/// Markdown parser but must not appear only after the user starts typing.
+fn editable_paragraph_ranges(source: &str, mut blocks: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    fn breaks(source: &str, range: Range<usize>) -> impl Iterator<Item = usize> + '_ {
+        source[range.clone()]
+            .char_indices()
+            .filter_map(move |(offset, character)| {
+                (character == '\n'
+                    || character == '\r'
+                        && !source[range.start + offset + 1..range.end].starts_with('\n'))
+                .then_some(range.start + offset + 1)
+            })
+    }
+    if source.trim().is_empty() {
+        let mut ranges = std::iter::once(0..0).collect::<Vec<_>>();
+        ranges.extend(
+            breaks(source, 0..source.len())
+                .skip(1)
+                .step_by(2)
+                .map(|at| at..at),
+        );
+        for range in &mut ranges {
+            range.end = source[range.start..]
+                .find(['\r', '\n'])
+                .map_or(source.len(), |at| range.start + at);
+        }
+        return ranges;
+    }
+    // Retain explicit hard-break rows at a paragraph's end. Their spaces are
+    // Markdown syntax, including when the following visible line is empty.
+    for index in 0..blocks.len() {
+        let limit = blocks
+            .get(index + 1)
+            .map_or(source.len(), |next| next.start);
+        let mut end = blocks[index].end;
+        while source[..end].ends_with("  ") || source[..end].ends_with('\\') {
+            let Some(newline) = breaks(source, end..limit).next() else {
+                break;
+            };
+            if !source[end..newline].chars().all(char::is_whitespace) {
+                break;
+            }
+            end = newline;
+            let spaces = source[end..limit]
+                .bytes()
+                .take_while(|byte| *byte == b' ')
+                .count();
+            if spaces >= 2 {
+                end += spaces;
+            } else {
+                break;
+            }
+        }
+        blocks[index].end = end;
+    }
+    let mut result = Vec::new();
+    let mut previous_end = 0;
+    for (index, block) in blocks.into_iter().enumerate() {
+        let gap = previous_end..block.start;
+        if source[gap.clone()].chars().all(char::is_whitespace) {
+            let lines = breaks(source, gap).collect::<Vec<_>>();
+            if index == 0 && !lines.is_empty() {
+                result.push(0..0);
+            }
+            result.extend(
+                lines
+                    .into_iter()
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|at| *at < block.start)
+                    .map(|at| at..at),
+            );
+        }
+        previous_end = block.end;
+        result.push(block);
+    }
+    let tail = previous_end..source.len();
+    if source[tail.clone()].chars().all(char::is_whitespace) {
+        result.extend(breaks(source, tail).skip(1).step_by(2).map(|at| at..at));
+    }
+    result
 }
 
 fn block_hash(text: &str) -> u64 {
@@ -910,10 +1057,10 @@ fn expand_front_matter_and_toc(source: &str) -> String {
         output.push('\n');
     }
 
-    let mut code_ranges = Parser::new_ext(body, parser_options())
+    let mut literal_ranges = Parser::new_ext(body, parser_options())
         .into_offset_iter()
         .filter_map(|(event, range)| {
-            matches!(event, Event::Start(Tag::CodeBlock(_))).then_some(range)
+            matches!(event, Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock)).then_some(range)
         })
         .peekable();
     let mut body_offset = 0usize;
@@ -921,16 +1068,16 @@ fn expand_front_matter_and_toc(source: &str) -> String {
     let mut toc_limit_reported = false;
     for line in body.split_inclusive('\n') {
         let trimmed = line.trim();
-        while code_ranges
+        while literal_ranges
             .peek()
             .is_some_and(|range| range.end <= body_offset)
         {
-            code_ranges.next();
+            literal_ranges.next();
         }
-        let in_code = code_ranges
+        let in_literal = literal_ranges
             .peek()
-            .is_some_and(|range| range.start <= body_offset && body_offset < range.end);
-        if !in_code && trimmed.eq_ignore_ascii_case("[TOC]") {
+            .is_some_and(|range| range.start < body_offset + line.len() && body_offset < range.end);
+        if !in_literal && trimmed.eq_ignore_ascii_case("[TOC]") {
             if toc_expansion_bytes
                 .checked_add(toc.len())
                 .is_some_and(|bytes| bytes <= MAX_TOC_EXPANSION_BYTES)
@@ -973,15 +1120,26 @@ fn render_toc_markdown(anchors: &[HeadingAnchor]) -> String {
             .heading
             .text
             .chars()
-            .map(|character| {
-                character.len_utf8() + usize::from(matches!(character, '\\' | '[' | ']'))
-            })
+            .map(|character| character.len_utf8() + usize::from(character.is_ascii_punctuation()))
             .fold(0usize, usize::saturating_add);
         let entry_bytes = indent
             .saturating_mul(2)
             .saturating_add(8)
             .saturating_add(escaped_text_bytes)
-            .saturating_add(anchor.id.len());
+            .saturating_add(
+                anchor
+                    .id
+                    .chars()
+                    .map(|character| {
+                        character.len_utf8()
+                            + if matches!(character, '%' | '#') {
+                                2
+                            } else {
+                                usize::from(toc_fragment_needs_markdown_escape(character))
+                            }
+                    })
+                    .fold(0usize, usize::saturating_add),
+            );
         if output
             .len()
             .saturating_add(entry_bytes)
@@ -997,16 +1155,32 @@ fn render_toc_markdown(anchors: &[HeadingAnchor]) -> String {
         }
         output.push_str("- [");
         for character in anchor.heading.text.chars() {
-            if matches!(character, '\\' | '[' | ']') {
+            if character.is_ascii_punctuation() {
                 output.push('\\');
             }
             output.push(character);
         }
         output.push_str("](#");
-        output.push_str(&anchor.id);
+        for character in anchor.id.chars() {
+            // The Markdown parser consumes punctuation escapes, while URI
+            // navigation consumes percent escapes. Preserve the literal ID
+            // through both stages, including entities and a literal `%xx`.
+            if matches!(character, '%' | '#') {
+                output.push_str(if character == '%' { "%25" } else { "%23" });
+            } else {
+                if toc_fragment_needs_markdown_escape(character) {
+                    output.push('\\');
+                }
+                output.push(character);
+            }
+        }
         output.push_str(")\n");
     }
     output
+}
+
+fn toc_fragment_needs_markdown_escape(character: char) -> bool {
+    character.is_ascii_punctuation() && !matches!(character, '-' | '_' | '.' | '~')
 }
 
 fn heading_slug(text: &str) -> String {
@@ -1401,6 +1575,99 @@ fn is_local_link(destination: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_audit_toc_markers_inside_raw_html_remain_literal() {
+        for container in ["pre", "script", "style"] {
+            let source = format!("<{container}>\n[TOC]\n</{container}>\n\n# Heading\n");
+            assert_eq!(
+                prepare_preview_markdown(&source),
+                source,
+                "raw HTML contents must not be rewritten as Markdown TOC entries"
+            );
+        }
+    }
+
+    #[test]
+    fn full_audit_toc_preserves_explicit_heading_ids_with_parentheses() {
+        let source = "[TOC]\n\n# Heading {#part)}\n";
+        let anchors = heading_anchors(source);
+        assert_eq!(
+            anchors[0].id, "part)",
+            "fixture must contain an explicit ID"
+        );
+        let toc = toc_preview_markdown(source);
+        let links = events_with_references(&toc, &Default::default())
+            .filter_map(|(event, _)| match event {
+                Event::Start(Tag::Link { dest_url, .. }) => Some(dest_url.into_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            links,
+            vec!["#part)"],
+            "TOC Markdown must preserve the complete target: {toc}"
+        );
+    }
+
+    #[test]
+    fn full_audit_toc_encodes_literal_percent_and_hash_in_explicit_ids() {
+        for (id, fragment) in [("%61", "%2561"), ("#part", "%23part")] {
+            let source = format!("[TOC]\n\n# Heading {{#{id}}}\n");
+            assert_eq!(heading_anchors(&source)[0].id, id);
+            let toc = toc_preview_markdown(&source);
+            let destination = events_with_references(&toc, &Default::default()).find_map(
+                |(event, _)| match event {
+                    Event::Start(Tag::Link { dest_url, .. }) => Some(dest_url.into_string()),
+                    _ => None,
+                },
+            );
+            assert_eq!(
+                destination,
+                Some(format!("#{fragment}")),
+                "one URI decoding pass must recover the literal heading ID"
+            );
+            let html = render_html_fragment(&source);
+            assert!(html.contains(&format!("href=\"#{fragment}\"")));
+            assert!(html.contains(&format!("id=\"{id}\"")));
+        }
+    }
+
+    #[test]
+    fn full_audit_toc_preserves_literal_html_text_from_a_code_heading() {
+        let source = "[TOC]\n\n# `<Type>`\n";
+        let anchors = heading_anchors(source);
+        assert_eq!(anchors[0].heading.text, "<Type>");
+        let toc = toc_preview_markdown(source);
+        let mut link_text = String::new();
+        let mut in_link = false;
+        for (event, _) in events_with_references(&toc, &Default::default()) {
+            match event {
+                Event::Start(Tag::Link { .. }) => in_link = true,
+                Event::End(TagEnd::Link) => in_link = false,
+                Event::Text(text) | Event::Code(text) if in_link => link_text.push_str(&text),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            link_text, "<Type>",
+            "TOC labels are plain heading text, not HTML: {toc}"
+        );
+    }
+
+    #[test]
+    fn source_audit_toc_on_first_indented_code_line_stays_literal() {
+        for indent in ["    ", "\t"] {
+            let source = format!("{indent}[TOC]\n\n# Heading\n");
+            assert_eq!(prepare_preview_markdown(&source), source);
+        }
+    }
+
+    #[test]
+    fn source_audit_outline_keeps_math_in_heading_labels() {
+        let analysis = analyze("# Energy $E=mc^2$\n");
+        assert_eq!(analysis.headings[0].text, "Energy E=mc^2");
+    }
 
     #[test]
     fn extracts_atx_and_setext_headings() {

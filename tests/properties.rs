@@ -1,7 +1,7 @@
 use proptest::prelude::*;
 use rupora::{
     editing::{MarkdownCommand, apply_markdown_command},
-    markdown::{BlockIndex, analyze, render_html_fragment},
+    markdown::{BlockIndex, MAX_GENERATED_DOCUMENT_BYTES, analyze, render_html_fragment},
     merge,
     table::{self, Alignment, MarkdownTable},
 };
@@ -52,7 +52,10 @@ proptest! {
         index.update(&updated);
         prop_assert!(!index.blocks().is_empty());
         let html = render_html_fragment(&source);
-        prop_assert!(html.len() <= source.len().saturating_mul(128).saturating_add(4096));
+        // Embedded SVG glyph outlines are governed by the generated-document
+        // budget, not a fixed expansion ratio relative to a short formula.
+        let generated_budget = if html.contains("<svg") { MAX_GENERATED_DOCUMENT_BYTES } else { 0 };
+        prop_assert!(html.len() <= source.len().saturating_mul(128).saturating_add(4096).saturating_add(generated_budget));
     }
 
     #[test]
@@ -97,4 +100,15 @@ proptest! {
         prop_assert_eq!(unchanged_local.content, external);
         prop_assert_eq!(unchanged_local.conflicts, 0);
     }
+}
+
+#[test]
+fn source_audit_math_output_budget_accounts_for_embedded_glyphs() {
+    // Minimized by the full-suite property run on 2026-09-10. Its valid SVG
+    // exceeded the old source-length ratio when the installed CJK font was used.
+    let source = " ¡ $¡¡0 A00𠀀!!$ ";
+    let html = render_html_fragment(source);
+    assert!(html.contains("class=\"math-inline\""));
+    assert!(html.contains("<svg"));
+    assert!(html.len() <= source.len() * 128 + 4096 + MAX_GENERATED_DOCUMENT_BYTES);
 }

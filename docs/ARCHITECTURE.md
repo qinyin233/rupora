@@ -1,4 +1,70 @@
-# RUPORA 2 原生重写架构
+# RUPORA 2 原生模块架构
+
+## 模块所有权与依赖方向
+
+`RuporaApp` 是窗口与系统操作的组合入口。它不再持有正文光标、IME 会话、块选择、
+分栏滚动、SVG/块高缓存或后台线程接收器。领域状态由下列模块独占管理：
+
+| 模块 | 管理的状态与行为 | 对外协作方式 |
+| --- | --- | --- |
+| `document::Document` | 文本、路径、历史、dirty、派生状态与单调版本 | `edit` 原子提交；只读快照与版本校验；实际磁盘操作 |
+| `session::DocumentSession` | 文档集合、活动文档 ID、未命名编号；加入、切换、关闭、恢复文件去重 | 按 `Document::id()` 修改会话；`edit_if_current` 统一处理关闭和过期目标 |
+| `editor::EditorSurface` | 光标与焦点请求、IME、跨块选择、文档视图书签、滚动；输入、格式及撤销事务 | `show(ui, &mut Document, EditorOptions) -> EditorOutput`；选择、绑定、失效和历史操作 |
+| `rendering::RenderCache` | 文档渲染准备、原生块布局、galley 命中、无障碍、资源与块高缓存 | 准备的块统一提供高度估计、呈现和测量记录；拥有依赖失效规则 |
+| `external_changes::ExternalChanges` | 扫描节流、按文档身份记录冲突与错误；重载、合并、重新关联 | 接收 Session 与时间，返回文档变更结果；不接触对话框或编辑器 |
+| `background::BackgroundTasks` | 扩展配置、更新与扩展线程生命周期、非阻塞收取结果 | 启动任务、查询运行状态、`poll()` 返回带原文档身份和快照的结果 |
+| `presentation` | 颜色、字体、图标、页面和代码块外观 | 无应用状态的绘制函数与值类型 |
+
+```mermaid
+flowchart TD
+    App[RuporaApp / 窗口、菜单、系统操作] --> Session[DocumentSession]
+    App --> Editor[EditorSurface]
+    App --> Background[BackgroundTasks]
+    App --> External[ExternalChanges]
+    App --> Presentation[presentation]
+    Session --> Document[Document]
+    External --> Session
+    Editor --> Document
+    Editor --> Input[editor/input]
+    Editor --> Renderer[rendering]
+    Editor --> Projection[VisualProjection / markdown / editing]
+    Renderer --> Presentation
+    Renderer --> Resources[native_preview]
+    Background --> Protocol[extensions / updater]
+```
+
+编辑器内部的 `source.rs`、`hybrid.rs`、`preview.rs` 和 `input.rs` 是私有实现。
+它们不能取得整个 App、文档数组、工作区、恢复目录或文件对话框；当前文档通过唯一的
+`&mut Document` 传入。资源根目录由壳层解析后传入，渲染过程不能切换文档或打开外部程序。
+
+输入和历史事务在编辑器内部完成。一次回车引起结构变化后，后续输入重新读取块索引；
+同帧文字输入先提交，再执行延迟撤销，最后绘制分栏预览。源码编辑区的右键格式和历史
+操作遵守相同顺序。`EditorOutput` 只携带提示、点击的链接、粘贴图片或打开表格窗口请求，
+这些系统/附属窗口操作由 App 执行。
+
+切换文档先记录旧文档视图，再由 Session 切换稳定 ID，最后绑定新文档并恢复、钳位选区。
+关闭非活动标签不会重置当前输入状态。重载保留文档 ID，同时显式失效旧书签、输入状态和
+块高度。块 ID 可以在内容改变后保持不变，因此缓存复用还需要校验渲染依赖：自身源码、
+生成的目录、引用定义与本地图片版本。估计和测量必须使用同一个准备结果。
+
+扩展与表格的延迟写回都进入 Session 的条件编辑入口：先定位文档，再由 Document 比较
+快照版本，最后通过编辑事务一起提交正文、历史、dirty 和派生失效。后台模块只持有只读快照，
+不能直接修改文档。正文编辑、撤销、重做、重载、合并、重新关联及改变路径的另存为都会推进版本；
+正文恢复原样仍不能接受旧结果。失败操作、无变化的事务和原路径保存不推进版本。
+表格应用失败保留草稿，可复制其 Markdown。成功写回统一通知 EditorSurface 清理旧组合输入和跨块选择。
+
+ExternalChanges 以稳定文档身份去重扫描错误，健康标签不会清除其他标签的错误。
+自动重载和用户选择的解决操作由相同模块协调；App 只负责确认、提示及相应视图的失效。
+启动失败或线程断开会释放后台任务槽，后续启动可以恢复。
+
+模块边界的回归分别位于 `session.rs`、`background.rs`、`rendering.rs`、
+`editor/session_tests.rs`、`editor/input_tests.rs` 和 `paragraph_layout_tests.rs`。
+`app_tests.rs`、`product_input_tests.rs`、`product_document_tests.rs` 保留跨模块和菜单集成回归。
+
+当前兼容限制：`Document.content/path` 等旧公开字段，以及 Session 的可变文档借用仍然保留。
+直接修改正文必须调用 `record_edit` 或 `update_after_edit`；新功能应使用事务入口。
+这轮没有宣称类型系统已经封闭所有旧调用方式。输入适配器整体迁移时再收紧这些接口，
+同时保留空闲帧不克隆全文的性能约束。
 
 ## 重写边界
 
@@ -34,6 +100,7 @@ OS window + native input
 ## 文档不变量
 
 - `Document.content` 始终使用 Rust UTF-8 `String` 和内部 `\n`。
+- `Document::id()` 标识已打开的文档实例；重载和保存不会改变 ID，关闭后新建文档得到新的 ID。
 - 载入时记录原始编码、BOM 和换行风格；保存时恢复这些表示。
 - dirty 状态由当前内容和最后一次成功保存的内容比较，不使用“一旦编辑永远为真”的标志。
 - 已保存文件带有长度、修改时间和内容哈希指纹；覆盖外部修改前必须显式确认。

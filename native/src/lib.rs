@@ -18,3 +18,10 @@ pub mod workspace;
 pub mod wysiwyg;
 
 pub use app::RuporaApp;
+
+mod background;
+mod editor;
+mod external_changes;
+mod presentation;
+mod rendering;
+mod session;

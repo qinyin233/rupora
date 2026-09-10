@@ -1,214 +1,58 @@
-use crate::editing::char_to_byte;
-
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    fs,
-    path::{Path, PathBuf},
-    rc::Rc,
-    sync::{
-        Arc,
-        mpsc::{self, Receiver, TryRecvError},
-    },
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
-
+use crate::background::{BackgroundEvent, BackgroundTasks, ExtensionJobResult};
+#[cfg(test)]
+use crate::wysiwyg::*;
 use crate::{
     app_state::{AppCommand, KeyBindings, PersistedState, ShortcutAction, ViewMode},
     diagnostics,
-    document::{Document, EditKind},
-    editing::{self, MarkdownCommand},
-    editor_buffer::{TrackingTextBuffer, set_accessible_label},
+    document::{Document, DocumentSnapshot, EditKind},
+    editing::{self, MarkdownCommand, char_to_byte},
+    editor::{
+        EditorBookmark, EditorCommand, EditorOptions, EditorSurface, cursor_range_to_char_range,
+    },
     export,
-    extensions::{self, ExtensionInvocation, ExtensionRegistry},
+    extensions::ExtensionRegistry,
+    external_changes::{ExternalChanges, ExternalEvent, ExternalResolution},
     instance::InstanceCoordinator,
-    markdown::{self, BlockId, Heading},
-    native_preview::{
-        decode_local_resource_path, document_image_uri, render_math_widget, render_mermaid_widget,
-        standalone_display_math, standalone_image, standalone_mermaid,
-    },
+    markdown,
+    native_preview::decode_local_resource_path,
+    presentation::*,
     recovery::{RecoveryEntry, RecoveryStore},
+    session::{DocumentSession, SnapshotApplyError},
     table::{self, MarkdownTable},
-    updater::{self, UpdateInfo, UpdateStatus},
+    updater::{self, UpdateStatus},
     workspace::{Workspace, WorkspaceEntry},
-    wysiwyg::{
-        VisualProjection, VisualStyle, complete_bare_fenced_code_after_typing,
-        complete_fenced_code_on_enter, complete_visual_enter, consume_paired_fenced_code_closer,
-        fenced_code_content, fenced_code_language, move_across_hidden_inline_code_boundary,
-        paragraph_after_fenced_code,
-    },
 };
+#[cfg(test)]
+use eframe::egui::{FontDefinitions, FontFamily};
 use eframe::{
     CreationContext, Frame, Storage,
     egui::{
-        self, Align, Button, CentralPanel, Color32, Context, FontData, FontDefinitions, FontFamily,
-        FontId, Key, Layout, Margin, Panel, RichText, ScrollArea, Stroke, TextEdit, TextStyle, Ui,
-        Vec2, ViewportCommand,
-        text::{CCursor, CCursorRange, LayoutJob, TextFormat},
+        self, Align, Button, CentralPanel, Color32, Context, Key, Layout, Margin, Panel, RichText,
+        ScrollArea, Stroke, TextEdit, Ui, Vec2, ViewportCommand,
+        text::{CCursor, CCursorRange},
     },
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+#[cfg(test)]
+use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 const APP_STATE_KEY: &str = "rupora-native-state";
 const UI_EXPERIENCE_KEY: &str = "rupora-native-ui-experience";
 const CURRENT_UI_EXPERIENCE: u32 = 3;
-const WYSIWYG_STRONG_FAMILY: &str = "rupora-wysiwyg-strong";
-const MAX_HYBRID_BLOCK_HEIGHT_CACHE: usize = 65_536;
-const WYSIWYG_BODY_LINE_HEIGHT: f32 = 27.0;
-const WYSIWYG_INLINE_CODE_LINE_HEIGHT: f32 = 20.0;
-const WYSIWYG_INLINE_CODE_VERTICAL_PADDING: f32 = 2.0;
-
-#[derive(Clone, Copy)]
-struct AppPalette {
-    canvas: Color32,
-    surface: Color32,
-    toolbar: Color32,
-    sidebar: Color32,
-    text: Color32,
-    secondary: Color32,
-    border: Color32,
-    accent: Color32,
-    accent_soft: Color32,
-    code_bg: Color32,
-    code_keyword: Color32,
-    code_string: Color32,
-    code_comment: Color32,
-    code_number: Color32,
-    hover: Color32,
-}
-
-fn app_palette(dark: bool) -> AppPalette {
-    if dark {
-        AppPalette {
-            canvas: Color32::from_rgb(24, 25, 30),
-            surface: Color32::from_rgb(30, 31, 38),
-            toolbar: Color32::from_rgb(27, 28, 34),
-            sidebar: Color32::from_rgb(31, 32, 39),
-            text: Color32::from_rgb(232, 233, 239),
-            secondary: Color32::from_rgb(146, 150, 165),
-            border: Color32::from_rgb(51, 53, 64),
-            accent: Color32::from_rgb(139, 148, 255),
-            accent_soft: Color32::from_rgb(50, 52, 81),
-            code_bg: Color32::from_rgb(38, 39, 46),
-            code_keyword: Color32::from_rgb(198, 149, 255),
-            code_string: Color32::from_rgb(143, 203, 157),
-            code_comment: Color32::from_rgb(126, 132, 146),
-            code_number: Color32::from_rgb(235, 184, 116),
-            hover: Color32::from_rgb(42, 44, 53),
-        }
-    } else {
-        AppPalette {
-            canvas: Color32::from_rgb(246, 247, 250),
-            surface: Color32::WHITE,
-            toolbar: Color32::from_rgb(250, 250, 252),
-            sidebar: Color32::from_rgb(242, 244, 247),
-            text: Color32::from_rgb(30, 32, 38),
-            secondary: Color32::from_rgb(102, 108, 121),
-            border: Color32::from_rgb(222, 225, 232),
-            accent: Color32::from_rgb(91, 95, 235),
-            accent_soft: Color32::from_rgb(235, 236, 255),
-            code_bg: Color32::from_rgb(244, 245, 247),
-            code_keyword: Color32::from_rgb(126, 65, 196),
-            code_string: Color32::from_rgb(32, 128, 86),
-            code_comment: Color32::from_rgb(113, 121, 132),
-            code_number: Color32::from_rgb(177, 91, 22),
-            hover: Color32::from_rgb(234, 237, 243),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SplitScrollDriver {
-    #[default]
-    Editor,
-    Preview,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct PaneScroll {
-    offset: f32,
-    maximum: f32,
-    hovered: bool,
-}
-
-#[derive(Clone, Copy)]
-struct DocumentViewState {
-    cursor: Option<CCursorRange>,
-    scroll_ratio: f32,
-}
-
 struct TableEditorState {
-    document_id: u64,
-    base_content: String,
+    snapshot: DocumentSnapshot,
     table: MarkdownTable,
 }
 
-#[derive(Clone, Debug)]
-struct HybridImeSession {
-    document_id: u64,
-    block_id: BlockId,
-    base_source: String,
-    visual_content: String,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct HybridPointerAnchor {
-    document_id: u64,
-    block_id: BlockId,
-    source_char: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct HybridCrossSelection {
-    document_id: u64,
-    cursor: CCursorRange,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ImeFrameAction {
-    #[default]
-    None,
-    Preedit,
-    Commit,
-    Cancel,
-}
-
-struct ExtensionJobResult {
-    document_id: u64,
-    before: String,
-    invocation: ExtensionInvocation,
-}
-
-fn extension_document_index(documents: &[Document], document_id: u64) -> Option<usize> {
-    documents
-        .iter()
-        .position(|document| document.id() == document_id)
-}
-
-fn restorable_session_files(
-    documents: &[Document],
-    paths: impl IntoIterator<Item = PathBuf>,
-) -> Vec<PathBuf> {
-    let open_paths = documents
-        .iter()
-        .filter_map(|document| document.path.as_ref())
-        .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
-        .collect::<HashSet<_>>();
-    paths
-        .into_iter()
-        .filter(|path| path.is_file())
-        .filter(|path| {
-            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-            !open_paths.contains(&canonical)
-        })
-        .collect()
-}
-
 pub struct RuporaApp {
-    documents: Vec<Document>,
-    active: Option<usize>,
-    next_untitled_id: usize,
+    editor_surface: EditorSurface,
+    session: DocumentSession,
     state: PersistedState,
     status: String,
     allow_close: bool,
@@ -216,40 +60,21 @@ pub struct RuporaApp {
     recovery_store: RecoveryStore,
     last_recovery_write: Instant,
     recovery_error_reported: bool,
-    editor_cursor: Option<CCursorRange>,
-    pending_editor_cursor: Option<CCursorRange>,
-    document_views: HashMap<u64, DocumentViewState>,
     find_open: bool,
     find_query: String,
     replace_query: String,
     find_match_case: bool,
     find_focus_requested: bool,
     workspace: Option<Workspace>,
-    hybrid_active: Option<(usize, BlockId)>,
-    hybrid_ime_session: Option<HybridImeSession>,
-    hybrid_pointer_anchor: Option<HybridPointerAnchor>,
-    hybrid_cross_selection: Option<HybridCrossSelection>,
-    external_conflicts: HashSet<PathBuf>,
-    last_external_check: Instant,
-    external_scan_error_reported: bool,
+    external_changes: ExternalChanges,
     command_palette_open: bool,
     command_query: String,
     command_focus_requested: bool,
-    split_scroll_ratio: f32,
-    split_scroll_driver: SplitScrollDriver,
-    split_editor_maximum: f32,
-    split_preview_maximum: f32,
-    split_scroll_document: Option<usize>,
     shortcut_settings_open: bool,
     external_diff_view: Option<String>,
-    generated_svg_cache: Rc<RefCell<HashMap<String, Arc<[u8]>>>>,
-    hybrid_block_heights: HashMap<HybridBlockLayoutKey, f32>,
     table_editor: Option<TableEditorState>,
     instance_coordinator: Option<InstanceCoordinator>,
-    update_receiver: Option<Receiver<Result<UpdateStatus, String>>>,
-    extension_registry: ExtensionRegistry,
-    extension_receiver: Option<Receiver<Result<ExtensionJobResult, String>>>,
-    available_update: Option<UpdateInfo>,
+    background: BackgroundTasks,
     about_open: bool,
 }
 
@@ -341,17 +166,16 @@ impl RuporaApp {
                         base_content,
                         encoding.as_deref(),
                         line_ending.as_deref(),
-                        app.next_untitled_id,
+                        app.session.next_untitled_number(),
                     );
                     conflict_count += outcome.conflicts;
                     if let Some(warning) = outcome.warning {
                         warning_count += 1;
                         diagnostics::append_event("WARN", &warning).ok();
                     }
-                    app.next_untitled_id += 1;
-                    app.documents.push(outcome.document);
+                    app.session.insert(outcome.document);
                 }
-                app.active = Some(0);
+                app.session.activate(app.session[0].id());
                 app.status = format!(
                     "已恢复 {recovered_count} 个未保存文档；{warning_count} 项需要注意；{conflict_count} 处合并冲突"
                 );
@@ -367,30 +191,38 @@ impl RuporaApp {
             app.open_paths(startup_files);
         } else {
             let recovered_active = app
-                .active
-                .and_then(|index| app.documents.get(index))
+                .session
+                .active_index()
+                .and_then(|index| app.session.documents().get(index))
                 .map(Document::id);
-            let session_files =
-                restorable_session_files(&app.documents, app.state.session_files.iter().cloned());
+            let session_files = app
+                .session
+                .restorable_files(app.state.session_files.iter().cloned());
             if !session_files.is_empty() {
-                let documents_before = app.documents.len();
+                let documents_before = app.session.documents().len();
                 app.open_paths(session_files);
                 if let Some(active_path) = app.state.active_session_file.as_ref()
                     && let Some(index) = app
-                        .documents
+                        .session
+                        .documents()
                         .iter()
                         .position(|document| document.path.as_ref() == Some(active_path))
                 {
                     app.activate_document(index);
                 } else if let Some(recovered_active) = recovered_active
                     && let Some(index) = app
-                        .documents
+                        .session
+                        .documents()
                         .iter()
                         .position(|document| document.id() == recovered_active)
                 {
                     app.activate_document(index);
                 }
-                let reopened = app.documents.len().saturating_sub(documents_before);
+                let reopened = app
+                    .session
+                    .documents()
+                    .len()
+                    .saturating_sub(documents_before);
                 app.status = if recovered_count > 0 {
                     format!(
                         "已恢复 {recovered_count} 个未保存文档，并重新打开 {reopened} 个会话文档"
@@ -400,7 +232,7 @@ impl RuporaApp {
                 };
             }
         }
-        if app.documents.is_empty() {
+        if app.session.documents().is_empty() {
             app.new_document();
         }
         app.restore_active_view_state();
@@ -415,9 +247,8 @@ impl RuporaApp {
         instance_coordinator: Option<InstanceCoordinator>,
     ) -> Self {
         Self {
-            documents: Vec::new(),
-            active: None,
-            next_untitled_id: 1,
+            editor_surface: EditorSurface::default(),
+            session: DocumentSession::default(),
             state,
             status: "纯 Rust 原生内核已就绪".to_owned(),
             allow_close: false,
@@ -425,124 +256,75 @@ impl RuporaApp {
             recovery_store,
             last_recovery_write: Instant::now(),
             recovery_error_reported: false,
-            editor_cursor: None,
-            pending_editor_cursor: None,
-            document_views: HashMap::new(),
             find_open: false,
             find_query: String::new(),
             replace_query: String::new(),
             find_match_case: false,
             find_focus_requested: false,
             workspace,
-            hybrid_active: None,
-            hybrid_ime_session: None,
-            hybrid_pointer_anchor: None,
-            hybrid_cross_selection: None,
-            external_conflicts: HashSet::new(),
-            last_external_check: Instant::now(),
-            external_scan_error_reported: false,
+            external_changes: ExternalChanges::new(Instant::now()),
             command_palette_open: false,
             command_query: String::new(),
             command_focus_requested: false,
-            split_scroll_ratio: 0.0,
-            split_scroll_driver: SplitScrollDriver::Editor,
-            split_editor_maximum: 0.0,
-            split_preview_maximum: 0.0,
-            split_scroll_document: None,
             shortcut_settings_open: false,
             external_diff_view: None,
-            generated_svg_cache: Rc::new(RefCell::new(HashMap::new())),
-            hybrid_block_heights: HashMap::new(),
             table_editor: None,
             instance_coordinator,
-            update_receiver: None,
-            extension_registry,
-            extension_receiver: None,
-            available_update: None,
+            background: BackgroundTasks::new(extension_registry),
             about_open: false,
         }
     }
 
     fn store_active_view_state(&mut self) {
-        let Some(index) = self.active else {
+        let Some(document) = self.session.active() else {
             return;
         };
-        self.document_views.insert(
-            self.documents[index].id(),
-            DocumentViewState {
-                cursor: self.editor_cursor,
-                scroll_ratio: self.split_scroll_ratio,
-            },
-        );
-        let Some(path) = self.documents[index].path.clone() else {
-            return;
-        };
-        if let Some(cursor) = self.editor_cursor {
+        self.editor_surface.remember(document.id());
+        let view = self.editor_surface.bookmark();
+        if let Some(path) = document.path.as_ref() {
+            if let Some(cursor) = view.cursor {
+                self.state
+                    .cursor_positions
+                    .insert(path.clone(), cursor.primary.index.0);
+            }
             self.state
-                .cursor_positions
-                .insert(path.clone(), cursor.primary.index.0);
+                .scroll_positions
+                .insert(path.clone(), view.scroll_ratio);
         }
-        self.state
-            .scroll_positions
-            .insert(path, self.split_scroll_ratio);
     }
 
     fn restore_active_view_state(&mut self) {
-        self.editor_cursor = None;
-        self.pending_editor_cursor = None;
-        self.split_scroll_ratio = 0.0;
-        let Some(index) = self.active else {
-            return;
+        let document = self.session.active();
+        let path = document.and_then(|document| document.path.as_ref());
+        let fallback = EditorBookmark {
+            cursor: path
+                .and_then(|path| self.state.cursor_positions.get(path))
+                .map(|at| CCursorRange::one(CCursor::new(*at))),
+            scroll_ratio: path
+                .and_then(|path| self.state.scroll_positions.get(path))
+                .copied()
+                .unwrap_or(0.0),
         };
-        if let Some(view) = self.document_views.get(&self.documents[index].id()) {
-            let length = self.documents[index].content.chars().count();
-            let cursor = view.cursor.map(|mut cursor| {
-                cursor.primary.index.0 = cursor.primary.index.0.min(length);
-                cursor.secondary.index.0 = cursor.secondary.index.0.min(length);
-                cursor
-            });
-            self.editor_cursor = cursor;
-            self.pending_editor_cursor = cursor;
-            self.split_scroll_ratio = view.scroll_ratio;
-            return;
-        }
-        let Some(path) = self.documents[index].path.clone() else {
-            return;
-        };
-        let saved_cursor = self.state.cursor_positions.get(&path).copied();
-        let saved_scroll = self.state.scroll_positions.get(&path).copied();
-        if let Some(cursor) = saved_cursor {
-            let cursor = cursor.min(self.documents[index].content.chars().count());
-            self.queue_editor_selection(cursor..cursor);
-        }
-        self.split_scroll_ratio = saved_scroll.unwrap_or(0.0).clamp(0.0, 1.0);
+        self.editor_surface.bind_document(document, fallback);
     }
 
     fn activate_document(&mut self, index: usize) {
-        if index >= self.documents.len() || self.active == Some(index) {
+        let Some(document) = self.session.documents().get(index) else {
+            return;
+        };
+        let id = document.id();
+        if self.session.active_id() == Some(id) {
             return;
         }
         self.store_active_view_state();
-        self.active = Some(index);
-        self.hybrid_active = None;
-        self.hybrid_ime_session = None;
-        self.hybrid_pointer_anchor = None;
-        self.hybrid_cross_selection = None;
-        self.split_scroll_document = Some(index);
+        self.session.activate(id);
         self.restore_active_view_state();
     }
 
     fn new_document(&mut self) {
         self.store_active_view_state();
-        let document = Document::untitled(self.next_untitled_id);
-        self.next_untitled_id += 1;
-        self.documents.push(document);
-        self.active = Some(self.documents.len() - 1);
+        self.session.new_document();
         self.restore_active_view_state();
-        self.hybrid_active = None;
-        self.hybrid_ime_session = None;
-        self.hybrid_pointer_anchor = None;
-        self.hybrid_cross_selection = None;
         self.status = "已新建文档".to_owned();
     }
 
@@ -596,20 +378,8 @@ impl RuporaApp {
                 continue;
             }
 
-            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-            if let Some(index) = self.documents.iter().position(|document| {
-                document
-                    .path
-                    .as_ref()
-                    .map(|open_path| {
-                        open_path
-                            .canonicalize()
-                            .unwrap_or_else(|_| open_path.clone())
-                            == canonical
-                    })
-                    .unwrap_or(false)
-            }) {
-                self.activate_document(index);
+            if let Some(id) = self.session.document_id_for_path(&path) {
+                self.activate_document(self.session.index_of(id).expect("session document exists"));
                 continue;
             }
 
@@ -618,8 +388,9 @@ impl RuporaApp {
                     self.status =
                         format!("已打开：{} · {}", path.display(), document.encoding.label());
                     self.remove_initial_placeholder();
-                    self.documents.push(document);
-                    self.activate_document(self.documents.len() - 1);
+                    self.store_active_view_state();
+                    self.session.insert(document);
+                    self.restore_active_view_state();
                     self.remember_recent(path);
                 }
                 Err(error) => self.show_error("打开失败", &error),
@@ -628,11 +399,11 @@ impl RuporaApp {
     }
 
     fn remove_initial_placeholder(&mut self) {
-        if self.documents.len() == 1 {
-            let document = &self.documents[0];
+        if self.session.documents().len() == 1 {
+            let document = &self.session[0];
             if document.path.is_none() && !document.dirty && document.content.is_empty() {
-                self.documents.clear();
-                self.active = None;
+                self.editor_surface.forget(self.session[0].id());
+                self.session.remove(self.session[0].id());
             }
         }
     }
@@ -644,15 +415,14 @@ impl RuporaApp {
     }
 
     fn save_active(&mut self, force_dialog: bool) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
-        let previous_path = self.documents[index].path.clone();
 
-        let needs_path = self.documents[index].path.is_none() || force_dialog;
+        let needs_path = self.session[index].path.is_none() || force_dialog;
         let selected_path = needs_path
             .then(|| {
-                let title = self.documents[index].title();
+                let title = self.session[index].title();
                 FileDialog::new()
                     .add_filter("Markdown", &["md", "markdown"])
                     .set_file_name(title)
@@ -665,15 +435,17 @@ impl RuporaApp {
         }
 
         let overwrite_external = if !needs_path {
-            match self.documents[index].has_external_changes() {
+            match self.session[index].has_external_changes() {
                 Ok(true) => {
-                    let path = self.documents[index]
+                    self.external_changes
+                        .mark_conflict(self.session[index].id());
+                    let path = self.session[index]
                         .path
                         .as_deref()
                         .map(Path::display)
                         .map(|display| display.to_string())
                         .unwrap_or_default();
-                    MessageDialog::new()
+                    let confirmed = MessageDialog::new()
                         .set_level(MessageLevel::Warning)
                         .set_title("检测到外部修改")
                         .set_description(format!(
@@ -681,7 +453,11 @@ impl RuporaApp {
                         ))
                         .set_buttons(MessageButtons::YesNo)
                         .show()
-                        == MessageDialogResult::Yes
+                        == MessageDialogResult::Yes;
+                    if !confirmed {
+                        return;
+                    }
+                    true
                 }
                 Ok(false) => false,
                 Err(error) => {
@@ -693,24 +469,15 @@ impl RuporaApp {
             true
         };
 
-        if !needs_path
-            && self.documents[index]
-                .has_external_changes()
-                .unwrap_or(false)
-            && !overwrite_external
-        {
-            return;
-        }
-
         let result = if let Some(path) = selected_path {
-            self.documents[index].save_as(path, true)
+            self.session[index].save_as(path, true)
         } else {
-            self.documents[index].save(overwrite_external)
+            self.session[index].save(overwrite_external)
         };
 
         match result {
             Ok(()) => {
-                let document = &self.documents[index];
+                let document = &self.session[index];
                 self.status = format!(
                     "已保存：{} · {} · {}",
                     document
@@ -723,22 +490,19 @@ impl RuporaApp {
                     document.line_ending.label()
                 );
                 if let Some(path) = document.path.clone() {
-                    self.external_conflicts.remove(&path);
                     self.remember_recent(path);
                 }
-                if let Some(path) = previous_path {
-                    self.external_conflicts.remove(&path);
-                }
+                self.external_changes.forget(self.session[index].id());
             }
             Err(error) => self.show_error("保存失败", &error),
         }
     }
 
     fn export_html(&mut self) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
-        let document = &self.documents[index];
+        let document = &self.session[index];
         let default_name = document
             .title()
             .trim_end_matches(".markdown")
@@ -777,10 +541,10 @@ impl RuporaApp {
     }
 
     fn export_pdf(&mut self) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
-        let document = &self.documents[index];
+        let document = &self.session[index];
         let default_name = document
             .title()
             .trim_end_matches(".markdown")
@@ -811,10 +575,10 @@ impl RuporaApp {
     }
 
     fn print_active(&mut self) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
-        let document = &self.documents[index];
+        let document = &self.session[index];
         let html =
             markdown::render_html_document(&document.content, &document.title(), self.state.dark);
         let resource_base = self.preview_base_path(index);
@@ -832,51 +596,42 @@ impl RuporaApp {
     }
 
     fn insert_text(&mut self, text: &str, kind: EditKind) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
         let selection = self.active_selection(index);
-        let before = self.documents[index].content.clone();
-        let start = char_to_byte(&before, selection.start);
-        let end = char_to_byte(&before, selection.end);
-        self.documents[index]
-            .content
-            .replace_range(start..end, text);
         let cursor = selection.start + text.chars().count();
-        self.documents[index].record_edit(before, Some(selection), Some(cursor..cursor), kind);
-        self.queue_editor_selection(cursor..cursor);
+        self.session[index].edit(kind, Some(selection.clone()), |content| {
+            let start = char_to_byte(content, selection.start);
+            let end = char_to_byte(content, selection.end);
+            content.replace_range(start..end, text);
+            Some(cursor..cursor)
+        });
+        self.finish_document_edit(self.session[index].id(), Some(cursor..cursor));
         if self.state.view_mode == ViewMode::Preview {
             self.state.view_mode = ViewMode::Edit;
         }
     }
 
     fn insert_footnote(&mut self) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
-        let number = next_footnote_number(&self.documents[index].content);
+        let number = next_footnote_number(&self.session[index].content);
         let selection = self.active_selection(index);
-        let before = self.documents[index].content.clone();
-        let start = char_to_byte(&before, selection.start);
-        let end = char_to_byte(&before, selection.end);
         let reference = format!("[^{number}]");
-        self.documents[index]
-            .content
-            .replace_range(start..end, &reference);
-        if !self.documents[index].content.ends_with('\n') {
-            self.documents[index].content.push('\n');
-        }
-        self.documents[index]
-            .content
-            .push_str(&format!("\n[^{number}]: 脚注内容\n"));
         let cursor = selection.start + reference.chars().count();
-        self.documents[index].record_edit(
-            before,
-            Some(selection),
-            Some(cursor..cursor),
-            EditKind::Format,
-        );
-        self.queue_editor_selection(cursor..cursor);
+        self.session[index].edit(EditKind::Format, Some(selection.clone()), |content| {
+            let start = char_to_byte(content, selection.start);
+            let end = char_to_byte(content, selection.end);
+            content.replace_range(start..end, &reference);
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(&format!("\n[^{number}]: 脚注内容\n"));
+            Some(cursor..cursor)
+        });
+        self.finish_document_edit(self.session[index].id(), Some(cursor..cursor));
         if self.state.view_mode == ViewMode::Preview {
             self.state.view_mode = ViewMode::Edit;
         }
@@ -889,30 +644,29 @@ impl RuporaApp {
     }
 
     fn open_table_editor(&mut self) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
         let cursor = self.active_selection(index).start;
-        let cursor_byte = char_to_byte(&self.documents[index].content, cursor);
-        let table = table::find_table(&self.documents[index].content, cursor_byte)
+        let cursor_byte = char_to_byte(&self.session[index].content, cursor);
+        let table = table::find_table(&self.session[index].content, cursor_byte)
             .unwrap_or_else(|| table::new_table(cursor_byte));
         self.table_editor = Some(TableEditorState {
-            document_id: self.documents[index].id(),
-            base_content: self.documents[index].content.clone(),
+            snapshot: self.session[index].snapshot(),
             table,
         });
     }
 
     fn close_document(&mut self, index: usize) {
-        if index >= self.documents.len() {
+        if index >= self.session.documents().len() {
             return;
         }
-        if self.documents[index].dirty {
-            match prompt_to_save(&self.documents[index].title()) {
+        if self.session[index].dirty {
+            match prompt_to_save(&self.session[index].title()) {
                 MessageDialogResult::Yes => {
                     self.activate_document(index);
                     self.save_active(false);
-                    if self.documents[index].dirty {
+                    if self.session[index].dirty {
                         return;
                     }
                 }
@@ -921,29 +675,18 @@ impl RuporaApp {
             }
         }
 
-        if let Some(path) = self.documents[index].path.as_ref() {
-            self.external_conflicts.remove(path);
-        }
+        let id = self.session[index].id();
+        self.external_changes.forget(id);
+        let was_active = self.session.active_index() == Some(index);
         self.store_active_view_state();
-        self.document_views.remove(&self.documents[index].id());
-        self.documents.remove(index);
-        self.active = match (self.active, self.documents.is_empty()) {
-            (_, true) => None,
-            (Some(active), false) if active > index => Some(active - 1),
-            (Some(active), false) if active == index => Some(index.min(self.documents.len() - 1)),
-            (active, false) => active,
-        };
-        self.editor_cursor = None;
-        self.pending_editor_cursor = None;
-        self.hybrid_active = None;
-        self.hybrid_ime_session = None;
-        self.hybrid_pointer_anchor = None;
-        self.hybrid_cross_selection = None;
-        self.restore_active_view_state();
-        if self.documents.is_empty() {
-            self.next_untitled_id = 1;
+        self.editor_surface.forget(id);
+        self.session.remove(id);
+        if self.session.documents().is_empty() {
             self.new_document();
+        } else if was_active {
+            self.restore_active_view_state();
         }
+        self.save_recovery_snapshot();
     }
 
     fn show_error(&mut self, title: &str, message: &str) {
@@ -959,10 +702,74 @@ impl RuporaApp {
 
     fn handle_shortcuts(&mut self, ctx: &Context) {
         let bindings = self.state.key_bindings.clone();
+        let document_editing = ctx.memory(|memory| memory.focused()).is_none_or(|focused| {
+            Some(focused) == self.editor_surface.widget_id()
+                || TextEdit::load_state(ctx, focused).is_none()
+        });
+        if document_editing {
+            let shortcuts = [
+                (bindings.redo.as_str(), true),
+                ("Ctrl+Y", true),
+                (bindings.undo.as_str(), false),
+            ];
+            let deferred = ctx.input_mut(|input| {
+                let (position, redo) =
+                    input
+                        .events
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(position, event)| {
+                            let egui::Event::Key {
+                                key,
+                                pressed: true,
+                                modifiers,
+                                ..
+                            } = event
+                            else {
+                                return None;
+                            };
+                            shortcuts.iter().find_map(|(binding, redo)| {
+                                let shortcut = parse_shortcut(binding)?;
+                                (*key == shortcut.logical_key
+                                    && modifiers.matches_logically(shortcut.modifiers))
+                                .then_some((position, *redo))
+                            })
+                        })?;
+                let edits = |event: &egui::Event| {
+                    matches!(
+                        event,
+                        egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Cut
+                            | egui::Event::Ime(_)
+                            | egui::Event::Key {
+                                key: Key::Backspace | Key::Delete | Key::Enter | Key::Tab,
+                                pressed: true,
+                                ..
+                            }
+                    )
+                };
+                if input.events[..position].iter().any(edits)
+                    && !input.events[position + 1..].iter().any(edits)
+                {
+                    input.events.remove(position);
+                    Some(redo)
+                } else {
+                    None
+                }
+            });
+            if let Some(redo) = deferred {
+                self.editor_surface.defer_history(redo);
+                return;
+            }
+        }
         let action = ctx.input_mut(|input| {
-            if consume_shortcut(input, &bindings.redo) || consume_shortcut(input, "Ctrl+Y") {
+            if document_editing
+                && (consume_shortcut(input, &bindings.redo) || consume_shortcut(input, "Ctrl+Y"))
+            {
                 Some(ShortcutAction::Command(AppCommand::Redo))
-            } else if consume_shortcut(input, &bindings.undo) {
+            } else if document_editing && consume_shortcut(input, &bindings.undo) {
                 Some(ShortcutAction::Command(AppCommand::Undo))
             } else if consume_shortcut(input, &bindings.save_as) {
                 Some(ShortcutAction::Command(AppCommand::SaveAs))
@@ -976,15 +783,15 @@ impl RuporaApp {
                 Some(ShortcutAction::Command(AppCommand::New))
             } else if consume_shortcut(input, &bindings.command_palette) {
                 Some(ShortcutAction::Palette)
-            } else if consume_shortcut(input, &bindings.bold) {
+            } else if document_editing && consume_shortcut(input, &bindings.bold) {
                 Some(ShortcutAction::Command(AppCommand::Format(
                     MarkdownCommand::Bold,
                 )))
-            } else if consume_shortcut(input, &bindings.italic) {
+            } else if document_editing && consume_shortcut(input, &bindings.italic) {
                 Some(ShortcutAction::Command(AppCommand::Format(
                     MarkdownCommand::Italic,
                 )))
-            } else if consume_shortcut(input, &bindings.link) {
+            } else if document_editing && consume_shortcut(input, &bindings.link) {
                 Some(ShortcutAction::Command(AppCommand::Format(
                     MarkdownCommand::Link,
                 )))
@@ -1047,46 +854,37 @@ impl RuporaApp {
             AppCommand::About => self.about_open = true,
             AppCommand::Format(command) => self.apply_format(command),
             AppCommand::SetView(mode) => {
-                self.state.view_mode = mode;
-                if mode != ViewMode::Hybrid {
-                    self.hybrid_ime_session = None;
+                if self.state.view_mode != mode {
+                    self.editor_surface.change_mode(mode);
                 }
+                self.state.view_mode = mode;
             }
         }
     }
 
     fn start_update_check(&mut self) {
-        if self.update_receiver.is_some() {
-            self.status = "正在检查更新…".to_owned();
-            return;
-        }
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let result = updater::check_for_update(env!("CARGO_PKG_VERSION"));
-            let _ = sender.send(result);
-        });
-        self.update_receiver = Some(receiver);
-        self.status = "正在后台检查更新…".to_owned();
+        self.status = match self.background.start_update_check() {
+            Ok(()) => "正在后台检查更新…".to_owned(),
+            Err(error) => error,
+        };
     }
 
-    fn poll_update_check(&mut self) {
-        let result = match self.update_receiver.as_ref().map(Receiver::try_recv) {
-            Some(Ok(result)) => Some(result),
-            Some(Err(TryRecvError::Empty)) | None => None,
-            Some(Err(TryRecvError::Disconnected)) => Some(Err("更新检查线程意外结束".to_owned())),
-        };
-        let Some(result) = result else {
-            return;
-        };
-        self.update_receiver = None;
+    fn poll_background(&mut self) {
+        for event in self.background.poll() {
+            match event {
+                BackgroundEvent::UpdateChecked(result) => self.apply_update_result(result),
+                BackgroundEvent::ExtensionFinished(result) => self.apply_extension_result(result),
+            }
+        }
+    }
+
+    fn apply_update_result(&mut self, result: Result<UpdateStatus, String>) {
         match result {
             Ok(UpdateStatus::Current { latest }) => {
-                self.available_update = None;
                 self.status = format!("当前已是最新版本（{latest}）");
             }
             Ok(UpdateStatus::Available(info)) => {
                 self.status = format!("发现新版本 {}，可从“帮助”菜单打开发布页", info.version);
-                self.available_update = Some(info);
             }
             Err(error) => {
                 diagnostics::append_event("WARN", &format!("update check failed: {error}")).ok();
@@ -1097,8 +895,8 @@ impl RuporaApp {
 
     fn open_release_page(&mut self) {
         let url = self
-            .available_update
-            .as_ref()
+            .background
+            .available_update()
             .map(|update| update.page_url.as_str())
             .unwrap_or(updater::RELEASES_URL);
         if let Err(error) = open::that(url) {
@@ -1121,22 +919,22 @@ impl RuporaApp {
     }
 
     fn open_extension_config(&mut self) {
-        if let Err(error) = self.extension_registry.ensure_template() {
+        if let Err(error) = self.background.extensions().ensure_template() {
             self.show_error("无法创建扩展配置", &error);
             return;
         }
-        if let Err(error) = open::that(self.extension_registry.config_path()) {
+        if let Err(error) = open::that(self.background.extensions().config_path()) {
             self.show_error("无法打开扩展配置", &error.to_string());
         }
     }
 
     fn reload_extensions(&mut self) {
-        match self.extension_registry.reload() {
+        match self.background.reload_extensions() {
             Ok(()) => {
-                self.status = if self.extension_registry.is_enabled() {
+                self.status = if self.background.extensions().is_enabled() {
                     format!(
                         "已加载 {} 个扩展服务",
-                        self.extension_registry.services().len()
+                        self.background.extensions().services().len()
                     )
                 } else {
                     "扩展服务保持关闭".to_owned()
@@ -1147,101 +945,69 @@ impl RuporaApp {
     }
 
     fn start_extension(&mut self, service_index: usize) {
-        if self.extension_receiver.is_some() {
+        if self.background.extension_running() {
             self.status = "已有扩展服务正在运行".to_owned();
             return;
         }
-        let Some(document) = self.active else {
+        let Some(document) = self.session.active_index() else {
             self.status = "没有可交给扩展的活动文档".to_owned();
             return;
         };
-        let Some(service) = self
-            .extension_registry
-            .services()
-            .get(service_index)
-            .cloned()
-        else {
-            self.status = "扩展服务不存在或扩展功能已关闭".to_owned();
-            return;
+        let request = self.session[document].snapshot();
+        self.status = match self.background.start_extension(service_index, request) {
+            Ok(name) => format!("正在运行扩展“{name}”…"),
+            Err(error) => error,
         };
-        let before = self.documents[document].content.clone();
-        let path = self.documents[document].path.clone();
-        let document_id = self.documents[document].id();
-        let name = service.name.clone();
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let result = extensions::invoke(&service, &before, path.as_deref()).map(|invocation| {
-                ExtensionJobResult {
-                    document_id,
-                    before,
-                    invocation,
-                }
-            });
-            let _ = sender.send(result);
-        });
-        self.extension_receiver = Some(receiver);
-        self.status = format!("正在运行扩展“{name}”…");
     }
 
-    fn poll_extension(&mut self) {
-        let result = match self.extension_receiver.as_ref().map(Receiver::try_recv) {
-            Some(Ok(result)) => Some(result),
-            Some(Err(TryRecvError::Empty)) | None => None,
-            Some(Err(TryRecvError::Disconnected)) => Some(Err("扩展工作线程意外结束".to_owned())),
-        };
-        let Some(result) = result else {
-            return;
-        };
-        self.extension_receiver = None;
-        match result {
+    fn apply_extension_result(&mut self, result: Result<ExtensionJobResult, String>) {
+        let job = match result {
             Err(error) => {
                 diagnostics::append_event("WARN", &format!("extension failed: {error}")).ok();
                 self.status = format!("扩展失败：{error}");
+                return;
             }
-            Ok(job) => {
-                let Some(document) = extension_document_index(&self.documents, job.document_id)
-                else {
-                    self.status = "扩展运行期间目标文档已关闭，已丢弃过期结果".to_owned();
-                    return;
-                };
-                if self.documents[document].content != job.before {
-                    self.status = "扩展运行期间目标文档已变化，已丢弃过期结果".to_owned();
-                    return;
+            Ok(job) => job,
+        };
+        let id = job.token.document_id();
+        let outcome = self
+            .session
+            .edit_if_current(job.token, EditKind::Other, None, |text| {
+                if let Some(replacement) = job.invocation.replacement {
+                    *text = replacement;
                 }
-                if let Some(replacement) = job.invocation.replacement
-                    && replacement != job.before
-                {
-                    self.documents[document].content = replacement;
-                    self.documents[document].record_edit(job.before, None, None, EditKind::Other);
-                    if self.active == Some(document) {
-                        self.hybrid_active = None;
-                        self.hybrid_ime_session = None;
-                        self.hybrid_pointer_anchor = None;
-                        self.hybrid_cross_selection = None;
-                        let content_len = self.documents[document].content.chars().count();
-                        let selection = self
-                            .editor_cursor
-                            .map(cursor_range_to_char_range)
-                            .map(|selection| {
-                                selection.start.min(content_len)..selection.end.min(content_len)
-                            })
-                            .unwrap_or(content_len..content_len);
-                        self.queue_editor_selection(selection);
+                None
+            });
+        match outcome {
+            Err(SnapshotApplyError::Closed) => {
+                self.status = "扩展运行期间目标文档已关闭，已丢弃过期结果".to_owned();
+            }
+            Err(SnapshotApplyError::Changed) => {
+                self.status = "扩展运行期间目标文档或路径已变化，已丢弃过期结果".to_owned();
+            }
+            Ok(changed) => {
+                if changed {
+                    self.finish_document_edit(id, None);
+                }
+                self.status = job.invocation.message.unwrap_or_else(|| {
+                    if changed {
+                        "扩展已更新活动文档"
                     } else {
-                        self.activate_document(document);
+                        "扩展已完成，没有文档修改"
                     }
-                    self.status = job
-                        .invocation
-                        .message
-                        .unwrap_or_else(|| "扩展已更新活动文档".to_owned());
-                } else {
-                    self.status = job
-                        .invocation
-                        .message
-                        .unwrap_or_else(|| "扩展已完成，没有文档修改".to_owned());
-                }
+                    .to_owned()
+                });
             }
         }
+    }
+
+    fn finish_document_edit(&mut self, id: u64, selection: Option<std::ops::Range<usize>>) {
+        let Some(index) = self.session.index_of(id) else {
+            return;
+        };
+        self.activate_document(index);
+        self.editor_surface
+            .document_edited(&self.session[index], selection);
     }
 
     fn poll_instance_requests(&mut self, ctx: &Context) {
@@ -1265,87 +1031,46 @@ impl RuporaApp {
     }
 
     fn apply_format(&mut self, command: MarkdownCommand) {
-        let Some(index) = self.active else {
+        let Some(document) = self.session.active_mut() else {
             return;
         };
-        let selection = self.active_selection(index);
-        let before = self.documents[index].content.clone();
-        let next_selection = editing::apply_markdown_command(
-            &mut self.documents[index].content,
-            selection.clone(),
-            command,
-        );
-        self.documents[index].record_edit(
-            before,
-            Some(selection),
-            Some(next_selection.clone()),
-            EditKind::Format,
-        );
-        self.queue_editor_selection(next_selection);
+        self.status = self
+            .editor_surface
+            .apply_format(document, command)
+            .to_owned();
         if self.state.view_mode == ViewMode::Preview {
             self.state.view_mode = ViewMode::Edit;
         }
-        self.status = "已应用 Markdown 格式".to_owned();
     }
 
     fn undo_active(&mut self) {
-        let Some(index) = self.active else {
-            return;
-        };
-        let Some(outcome) = self.documents[index].undo() else {
-            self.status = "没有可撤销的操作".to_owned();
-            return;
-        };
-        if let Some(selection) = outcome.selection {
-            self.queue_editor_selection(selection);
-        } else {
-            self.editor_cursor = None;
-            self.pending_editor_cursor = None;
+        if let Some(document) = self.session.active_mut() {
+            self.status = self
+                .editor_surface
+                .apply_history(document, false)
+                .to_owned();
         }
-        self.status = "已撤销".to_owned();
     }
 
     fn redo_active(&mut self) {
-        let Some(index) = self.active else {
-            return;
-        };
-        let Some(outcome) = self.documents[index].redo() else {
-            self.status = "没有可重做的操作".to_owned();
-            return;
-        };
-        if let Some(selection) = outcome.selection {
-            self.queue_editor_selection(selection);
-        } else {
-            self.editor_cursor = None;
-            self.pending_editor_cursor = None;
+        if let Some(document) = self.session.active_mut() {
+            self.status = self.editor_surface.apply_history(document, true).to_owned();
         }
-        self.status = "已重做".to_owned();
     }
 
     fn active_selection(&self, index: usize) -> std::ops::Range<usize> {
-        self.editor_cursor
-            .map(|range| {
-                let [start, end] = range.sorted_cursors();
-                start.index.0..end.index.0
-            })
-            .unwrap_or_else(|| {
-                let end = self.documents[index].content.chars().count();
-                end..end
-            })
+        self.editor_surface.selection(&self.session[index])
     }
 
     fn queue_editor_selection(&mut self, range: std::ops::Range<usize>) {
-        let cursor_range = CCursorRange::two(CCursor::new(range.start), CCursor::new(range.end));
-        self.editor_cursor = Some(cursor_range);
-        self.pending_editor_cursor = Some(cursor_range);
+        self.editor_surface.queue_editor_selection(range);
     }
 
     fn jump_to_line(&mut self, one_based_line: usize) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
-        let char_index =
-            editing::char_index_for_line(&self.documents[index].content, one_based_line);
+        let char_index = editing::char_index_for_line(&self.session[index].content, one_based_line);
         self.queue_editor_selection(char_index..char_index);
         if self.state.view_mode == ViewMode::Preview {
             self.state.view_mode = ViewMode::Edit;
@@ -1354,7 +1079,7 @@ impl RuporaApp {
     }
 
     fn find_match(&mut self, forward: bool) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
         if self.find_query.is_empty() {
@@ -1364,14 +1089,14 @@ impl RuporaApp {
         let selection = self.active_selection(index);
         let found = if forward {
             editing::find_next(
-                &self.documents[index].content,
+                &self.session[index].content,
                 &self.find_query,
                 selection.end,
                 self.find_match_case,
             )
         } else {
             editing::find_previous(
-                &self.documents[index].content,
+                &self.session[index].content,
                 &self.find_query,
                 selection.start,
                 self.find_match_case,
@@ -1390,50 +1115,45 @@ impl RuporaApp {
     }
 
     fn replace_current(&mut self) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
         let selection = self.active_selection(index);
         if editing::selection_matches(
-            &self.documents[index].content,
+            &self.session[index].content,
             selection.clone(),
             &self.find_query,
             self.find_match_case,
         ) {
-            let before = self.documents[index].content.clone();
-            let cursor = editing::replace_range(
-                &mut self.documents[index].content,
-                selection.clone(),
-                &self.replace_query,
-            );
-            self.documents[index].record_edit(
-                before,
-                Some(selection),
-                Some(cursor.clone()),
-                EditKind::Replace,
-            );
-            self.queue_editor_selection(cursor);
+            let mut cursor = selection.clone();
+            self.session[index].edit(EditKind::Replace, Some(selection.clone()), |content| {
+                cursor = editing::replace_range(content, selection, &self.replace_query);
+                Some(cursor.clone())
+            });
+            self.finish_document_edit(self.session[index].id(), Some(cursor));
             self.status = "已替换 1 处".to_owned();
         }
         self.find_match(true);
     }
 
     fn replace_all_matches(&mut self) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
-        let before = self.documents[index].content.clone();
-        let selection_before = self.editor_cursor.map(cursor_range_to_char_range);
-        let count = editing::replace_all(
-            &mut self.documents[index].content,
-            &self.find_query,
-            &self.replace_query,
-            self.find_match_case,
-        );
+        let selection_before = self.editor_surface.cursor().map(cursor_range_to_char_range);
+        let mut count = 0;
+        self.session[index].edit(EditKind::Replace, selection_before, |content| {
+            count = editing::replace_all(
+                content,
+                &self.find_query,
+                &self.replace_query,
+                self.find_match_case,
+            );
+            None
+        });
         if count > 0 {
-            self.documents[index].record_edit(before, selection_before, None, EditKind::Replace);
-            self.editor_cursor = None;
-            self.pending_editor_cursor = None;
+            self.editor_surface.invalidate_content();
+            self.editor_surface.clear_selection();
         }
         self.status = format!("已替换 {count} 处");
     }
@@ -1467,7 +1187,7 @@ impl RuporaApp {
     }
 
     fn insert_resource(&mut self, path: PathBuf) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
         if !path.is_file() {
@@ -1475,7 +1195,7 @@ impl RuporaApp {
             return;
         }
 
-        let base = self.documents[index]
+        let base = self.session[index]
             .path
             .as_deref()
             .and_then(Path::parent)
@@ -1492,21 +1212,12 @@ impl RuporaApp {
             .unwrap_or_else(|| "resource".to_owned());
         let image = is_image_path(&path);
         let selection = self.active_selection(index);
-        let before = self.documents[index].content.clone();
-        let next = editing::insert_resource_link(
-            &mut self.documents[index].content,
-            selection.clone(),
-            &label,
-            &destination,
-            image,
-        );
-        self.documents[index].record_edit(
-            before,
-            Some(selection),
-            Some(next.clone()),
-            EditKind::Other,
-        );
-        self.queue_editor_selection(next);
+        let mut next = selection.clone();
+        self.session[index].edit(EditKind::Other, Some(selection.clone()), |content| {
+            next = editing::insert_resource_link(content, selection, &label, &destination, image);
+            Some(next.clone())
+        });
+        self.finish_document_edit(self.session[index].id(), Some(next));
         self.status = if image {
             format!("已插入图片：{}", path.display())
         } else {
@@ -1515,7 +1226,7 @@ impl RuporaApp {
     }
 
     fn paste_clipboard_image(&mut self) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
         let image = match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image())
@@ -1532,7 +1243,7 @@ impl RuporaApp {
             .unwrap_or_default()
             .as_millis();
         let file_name = format!("image-{timestamp}.png");
-        let path = if let Some(base) = self.documents[index]
+        let path = if let Some(base) = self.session[index]
             .path
             .as_deref()
             .and_then(Path::parent)
@@ -1582,8 +1293,12 @@ impl RuporaApp {
         if self.last_recovery_write.elapsed() < Duration::from_secs(5) {
             return;
         }
+        self.save_recovery_snapshot();
+    }
+
+    fn save_recovery_snapshot(&mut self) {
         self.last_recovery_write = Instant::now();
-        match self.recovery_store.save(&self.documents) {
+        match self.recovery_store.save(self.session.documents()) {
             Ok(()) => self.recovery_error_reported = false,
             Err(error) if !self.recovery_error_reported => {
                 self.status = error;
@@ -1594,79 +1309,52 @@ impl RuporaApp {
     }
 
     fn check_external_changes_if_due(&mut self) {
-        if self.last_external_check.elapsed() < Duration::from_secs(2) {
-            return;
-        }
-        self.last_external_check = Instant::now();
+        let events = self
+            .external_changes
+            .scan(&mut self.session, Instant::now());
+        self.apply_external_events(events);
+    }
 
-        let open_paths = self
-            .documents
-            .iter()
-            .filter_map(|document| document.path.clone())
-            .collect::<HashSet<_>>();
-        self.external_conflicts
-            .retain(|path| open_paths.contains(path));
-
-        let mut reloaded = Vec::new();
-        for (index, document) in self.documents.iter_mut().enumerate() {
-            let Some(path) = document.path.clone() else {
-                continue;
-            };
-            match document.external_change_hint() {
-                Ok(false) => {
-                    self.external_conflicts.remove(&path);
-                    self.external_scan_error_reported = false;
+    fn apply_external_events(&mut self, events: Vec<ExternalEvent>) {
+        let mut errors = Vec::new();
+        let mut last_reloaded = None;
+        for event in events {
+            match event {
+                ExternalEvent::Reloaded { document_id, path } => {
+                    self.reconcile_reloaded_document(document_id);
+                    last_reloaded = Some(path);
                 }
-                Ok(true) if document.dirty => {
-                    self.external_conflicts.insert(path);
-                }
-                Ok(true) => match document.reload() {
-                    Ok(()) => {
-                        self.external_conflicts.remove(&path);
-                        reloaded.push((index, path));
-                        self.external_scan_error_reported = false;
-                    }
-                    Err(_) => {
-                        self.external_conflicts.insert(path);
-                    }
-                },
-                Err(error) if !self.external_scan_error_reported => {
-                    self.status = error;
-                    self.external_scan_error_reported = true;
-                }
-                Err(_) => {}
+                ExternalEvent::Error { error, .. } => errors.push(error),
+                ExternalEvent::Conflict { .. } => {}
             }
         }
-
-        if let Some((_, path)) = reloaded.last() {
-            if reloaded
-                .iter()
-                .any(|(index, _)| self.active == Some(*index))
-            {
-                self.editor_cursor = None;
-                self.pending_editor_cursor = None;
-                self.hybrid_active = None;
-                self.hybrid_ime_session = None;
-                self.hybrid_pointer_anchor = None;
-                self.hybrid_cross_selection = None;
-            }
-            self.document_views
-                .retain(|id, _| self.documents.iter().any(|document| document.id() == *id));
+        if !errors.is_empty() {
+            self.status = errors.join("；");
+        } else if let Some(path) = last_reloaded {
             self.status = format!("已自动重新加载外部修改：{}", path.display());
         }
     }
 
+    fn reconcile_reloaded_document(&mut self, id: u64) {
+        self.editor_surface.forget(id);
+        if self.session.active_id() == Some(id) {
+            self.editor_surface
+                .bind_document(self.session.active(), EditorBookmark::default());
+        }
+    }
+
     fn external_change_bar(&mut self, root: &mut Ui) {
-        let Some(index) = self.active else {
+        let Some(index) = self.session.active_index() else {
             return;
         };
-        let Some(path) = self.documents[index].path.clone() else {
+        let Some(path) = self.session[index].path.clone() else {
             return;
         };
-        if !self.external_conflicts.contains(&path) {
+        if !self.external_changes.has_conflict(self.session[index].id()) {
             return;
         }
 
+        let document_id = self.session[index].id();
         let mut reload = false;
         let mut save_as = false;
         let mut compare = false;
@@ -1709,14 +1397,15 @@ impl RuporaApp {
                 .add_filter("Markdown", &["md", "markdown", "mdown", "mkd", "txt"])
                 .pick_file()
             {
-                match self.documents[index].relink_external(new_path.clone()) {
-                    Ok(conflicts) => {
-                        self.external_conflicts.remove(&path);
+                match self.external_changes.resolve(
+                    &mut self.session,
+                    document_id,
+                    ExternalResolution::Relink(new_path.clone()),
+                ) {
+                    Ok(result) => {
+                        let conflicts = result.conflicts;
                         self.remember_recent(new_path);
-                        self.editor_cursor = None;
-                        self.pending_editor_cursor = None;
-                        self.hybrid_active = None;
-                        self.hybrid_ime_session = None;
+                        self.reconcile_reloaded_document(document_id);
                         self.status = if conflicts == 0 {
                             "已重新关联移动后的文件".to_owned()
                         } else {
@@ -1727,18 +1416,19 @@ impl RuporaApp {
                 }
             }
         } else if compare {
-            match self.documents[index].external_diff() {
+            match self.session[index].external_diff() {
                 Ok(diff) => self.external_diff_view = Some(diff),
                 Err(error) => self.show_error("比较失败", &error),
             }
         } else if merge {
-            match self.documents[index].merge_external() {
-                Ok(conflicts) => {
-                    self.external_conflicts.remove(&path);
-                    self.editor_cursor = None;
-                    self.pending_editor_cursor = None;
-                    self.hybrid_active = None;
-                    self.hybrid_ime_session = None;
+            match self.external_changes.resolve(
+                &mut self.session,
+                document_id,
+                ExternalResolution::Merge,
+            ) {
+                Ok(result) => {
+                    let conflicts = result.conflicts;
+                    self.reconcile_reloaded_document(document_id);
                     self.status = if conflicts == 0 {
                         "已自动合并外部修改".to_owned()
                     } else {
@@ -1748,7 +1438,7 @@ impl RuporaApp {
                 Err(error) => self.show_error("合并失败", &error),
             }
         } else if reload {
-            let confirmed = !self.documents[index].dirty
+            let confirmed = !self.session[index].dirty
                 || MessageDialog::new()
                     .set_level(MessageLevel::Warning)
                     .set_title("重新加载外部版本")
@@ -1757,13 +1447,13 @@ impl RuporaApp {
                     .show()
                     == MessageDialogResult::Yes;
             if confirmed {
-                match self.documents[index].reload() {
-                    Ok(()) => {
-                        self.external_conflicts.remove(&path);
-                        self.editor_cursor = None;
-                        self.pending_editor_cursor = None;
-                        self.hybrid_active = None;
-                        self.hybrid_ime_session = None;
+                match self.external_changes.resolve(
+                    &mut self.session,
+                    document_id,
+                    ExternalResolution::Reload,
+                ) {
+                    Ok(_) => {
+                        self.reconcile_reloaded_document(document_id);
                         self.status = format!("已从磁盘重新加载：{}", path.display());
                     }
                     Err(error) => self.show_error("重新加载失败", &error),
@@ -1802,6 +1492,11 @@ impl RuporaApp {
         let Some(state) = self.table_editor.as_mut() else {
             return;
         };
+        let token = state.snapshot.token();
+        let stale = self
+            .session
+            .get(token.document_id())
+            .is_none_or(|document| document.snapshot_token() != token);
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
@@ -1810,6 +1505,12 @@ impl RuporaApp {
             .default_size([760.0, 420.0])
             .open(&mut open)
             .show(root.ctx(), |ui| {
+                if stale {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "目标文档已变化。表格草稿已保留，可复制后重新打开编辑器。",
+                    );
+                }
                 ui.horizontal(|ui| {
                     if ui.button("增加列").clicked() {
                         state.table.add_column();
@@ -1896,57 +1597,70 @@ impl RuporaApp {
                     if ui.button("取消").clicked() {
                         cancel = true;
                     }
+                    if ui.button("复制表格 Markdown").clicked() {
+                        ui.ctx().copy_text(state.table.to_markdown());
+                    }
                 });
             });
 
         if apply {
-            let state = self.table_editor.take().expect("table editor state");
-            let Some(document_index) = self
-                .documents
-                .iter()
-                .position(|document| document.id() == state.document_id)
-            else {
-                self.show_error("表格应用失败", "目标文档已关闭，请重新打开表格编辑器。");
-                return;
-            };
-            let document = &mut self.documents[document_index];
-            let before = document.content.clone();
-            if before != state.base_content
-                || state.table.range.end > before.len()
-                || !before.is_char_boundary(state.table.range.start)
-                || !before.is_char_boundary(state.table.range.end)
-            {
-                self.show_error("表格应用失败", "文档已发生变化，请重新打开表格编辑器。");
-                return;
-            }
-            let mut replacement = state.table.to_markdown();
-            if state.table.range.is_empty() {
-                if state.table.range.start > 0 && !before[..state.table.range.start].ends_with('\n')
-                {
-                    replacement.insert_str(0, "\n\n");
-                }
-                if state.table.range.start < before.len()
-                    && !before[state.table.range.start..].starts_with('\n')
-                {
-                    replacement.push_str("\n\n");
-                }
-            }
-            let cursor =
-                before[..state.table.range.start].chars().count() + replacement.chars().count();
-            document
-                .content
-                .replace_range(state.table.range, &replacement);
-            document.record_edit(before, None, Some(cursor..cursor), EditKind::Format);
-            self.queue_editor_selection(cursor..cursor);
-            self.status = "已应用可视化表格修改".to_owned();
+            self.apply_table_editor();
         } else if !open || cancel {
             self.table_editor = None;
         }
     }
 
+    fn apply_table_editor(&mut self) {
+        let Some(state) = self.table_editor.take() else {
+            return;
+        };
+        let before = state.snapshot.text();
+        let range = state.table.range.clone();
+        if range.start > range.end
+            || range.end > before.len()
+            || !before.is_char_boundary(range.start)
+            || !before.is_char_boundary(range.end)
+        {
+            self.status = "表格范围已失效，请重新打开表格编辑器。".to_owned();
+            self.table_editor = Some(state);
+            return;
+        }
+        let mut replacement = state.table.to_markdown();
+        if range.is_empty() {
+            if range.start > 0 && !before[..range.start].ends_with('\n') {
+                replacement.insert_str(0, "\n\n");
+            }
+            if range.start < before.len() && !before[range.start..].starts_with('\n') {
+                replacement.push_str("\n\n");
+            }
+        }
+        let cursor = before[..range.start].chars().count() + replacement.chars().count();
+        let token = state.snapshot.token();
+        match self
+            .session
+            .edit_if_current(token, EditKind::Format, None, |text| {
+                text.replace_range(range, &replacement);
+                Some(cursor..cursor)
+            }) {
+            Ok(_) => {
+                self.finish_document_edit(token.document_id(), Some(cursor..cursor));
+                self.status = "已应用可视化表格修改".to_owned();
+            }
+            Err(SnapshotApplyError::Closed) => {
+                self.status = "目标文档已关闭，请重新打开表格编辑器。".to_owned();
+                self.table_editor = Some(state);
+            }
+            Err(SnapshotApplyError::Changed) => {
+                self.status = "文档或路径已发生变化，请重新打开表格编辑器。".to_owned();
+                self.table_editor = Some(state);
+            }
+        }
+    }
+
     fn top_bar(&mut self, root: &mut Ui) {
         let extension_names = self
-            .extension_registry
+            .background
+            .extensions()
             .services()
             .iter()
             .map(|service| service.name.clone())
@@ -1954,24 +1668,26 @@ impl RuporaApp {
         let palette = app_palette(self.state.dark);
         let toolbar_frame = egui::Frame::new()
             .fill(palette.toolbar)
-            .inner_margin(Margin::symmetric(10, 6))
-            .stroke(Stroke::new(1.0, palette.border));
+            .inner_margin(Margin::symmetric(16, 10));
         Panel::top("toolbar")
-            .exact_size(46.0)
+            .exact_size(56.0)
             .frame(toolbar_frame)
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(
-                        Button::new(RichText::new("R").strong().color(palette.accent))
-                            .fill(palette.accent_soft)
-                            .stroke(Stroke::NONE)
-                            .corner_radius(7)
-                            .min_size(Vec2::splat(28.0)),
+                    if app_icon_button(
+                        ui,
+                        AppIcon::Sidebar,
+                        self.state.show_sidebar,
+                        "显示 / 隐藏文档侧栏",
+                        palette,
                     )
-                    .on_hover_text("RUPORA · 原生 Markdown 编辑器");
+                    .clicked()
+                    {
+                        self.state.show_sidebar = !self.state.show_sidebar;
+                    }
                     ui.label(
                         RichText::new("RUPORA")
-                            .size(12.5)
+                            .size(14.0)
                             .strong()
                             .color(palette.text),
                     );
@@ -1997,7 +1713,7 @@ impl RuporaApp {
                     }
                     if ui
                         .add_enabled(
-                            self.active.is_some(),
+                            self.session.active_index().is_some(),
                             icon_button_widget(AppIcon::Save, false, palette),
                         )
                         .on_hover_text("保存当前文档 · Ctrl+S")
@@ -2025,8 +1741,9 @@ impl RuporaApp {
                             self.execute(AppCommand::SaveAs);
                         }
                         let can_undo = self
-                            .active
-                            .and_then(|index| self.documents.get(index))
+                            .session
+                            .active_index()
+                            .and_then(|index| self.session.documents().get(index))
                             .is_some_and(Document::can_undo);
                         if ui
                             .add_enabled(can_undo, Button::new("撤销"))
@@ -2036,8 +1753,9 @@ impl RuporaApp {
                             self.execute(AppCommand::Undo);
                         }
                         let can_redo = self
-                            .active
-                            .and_then(|index| self.documents.get(index))
+                            .session
+                            .active_index()
+                            .and_then(|index| self.session.documents().get(index))
                             .is_some_and(Document::can_redo);
                         if ui
                             .add_enabled(can_redo, Button::new("重做"))
@@ -2061,7 +1779,7 @@ impl RuporaApp {
                             }
                         });
                         ui.menu_button("扩展", |ui| {
-                            if !self.extension_registry.is_enabled() {
+                            if !self.background.extensions().is_enabled() {
                                 ui.label("扩展默认关闭");
                             } else if extension_names.is_empty() {
                                 ui.label("没有已配置的扩展服务");
@@ -2069,7 +1787,8 @@ impl RuporaApp {
                             for (index, name) in extension_names.iter().enumerate() {
                                 if ui
                                     .add_enabled(
-                                        self.extension_receiver.is_none() && self.active.is_some(),
+                                        !self.background.extension_running()
+                                            && self.session.active_index().is_some(),
                                         Button::new(name),
                                     )
                                     .clicked()
@@ -2091,7 +1810,7 @@ impl RuporaApp {
                         ui.menu_button("帮助", |ui| {
                             if ui
                                 .add_enabled(
-                                    self.update_receiver.is_none(),
+                                    !self.background.update_check_running(),
                                     Button::new("检查更新…"),
                                 )
                                 .clicked()
@@ -2099,7 +1818,7 @@ impl RuporaApp {
                                 self.execute(AppCommand::CheckUpdates);
                                 ui.close();
                             }
-                            if self.available_update.is_some()
+                            if self.background.available_update().is_some()
                                 && ui.button("打开新版本发布页").clicked()
                             {
                                 self.execute(AppCommand::OpenReleasePage);
@@ -2181,9 +1900,10 @@ impl RuporaApp {
                                 ui.close();
                             }
                             let anchors = self
-                                .active
+                                .session
+                                .active_index()
                                 .map(|index| {
-                                    markdown::heading_anchors(&self.documents[index].content)
+                                    markdown::heading_anchors(&self.session[index].content)
                                 })
                                 .unwrap_or_default();
                             ui.menu_button("交叉引用", |ui| {
@@ -2224,27 +1944,91 @@ impl RuporaApp {
                         });
                     });
 
-                    ui.add_space(10.0);
-                    let command_width = (ui.available_width() - 12.0).clamp(0.0, 440.0);
-                    if command_width >= 170.0
-                        && ui
-                            .add_sized(
-                                [command_width, 29.0],
-                                Button::new(
-                                    RichText::new("⌕  搜索命令或打开文件…    Ctrl+Shift+P")
-                                        .size(11.5)
-                                        .color(palette.secondary),
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if app_icon_button(
+                            ui,
+                            AppIcon::Theme,
+                            false,
+                            "切换浅色 / 深色外观",
+                            palette,
+                        )
+                        .clicked()
+                        {
+                            self.state.dark = !self.state.dark;
+                            apply_theme(ui.ctx(), self.state.dark);
+                        }
+                        if app_icon_button(
+                            ui,
+                            AppIcon::Outline,
+                            self.state.show_outline,
+                            "显示 / 隐藏大纲",
+                            palette,
+                        )
+                        .clicked()
+                        {
+                            self.state.show_outline = !self.state.show_outline;
+                        }
+                        ui.add_space(6.0);
+                        egui::Frame::new()
+                            .fill(palette.hover)
+                            .corner_radius(9)
+                            .inner_margin(3)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    // The toolbar lays out from the right edge.
+                                    for (mode, label) in [
+                                        (ViewMode::Preview, "阅读"),
+                                        (ViewMode::Split, "分栏"),
+                                        (ViewMode::Edit, "源码"),
+                                        (ViewMode::Hybrid, "写作"),
+                                    ] {
+                                        let selected = self.state.view_mode == mode;
+                                        if ui
+                                            .add(
+                                                Button::new(RichText::new(label).size(13.0).color(
+                                                    if selected {
+                                                        palette.text
+                                                    } else {
+                                                        palette.secondary
+                                                    },
+                                                ))
+                                                .fill(if selected {
+                                                    palette.surface
+                                                } else {
+                                                    Color32::TRANSPARENT
+                                                })
+                                                .stroke(Stroke::NONE)
+                                                .corner_radius(7)
+                                                .min_size(Vec2::new(46.0, 27.0)),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.execute(AppCommand::SetView(mode));
+                                        }
+                                    }
+                                });
+                            });
+                        if ui.available_width() > 130.0 {
+                            ui.add_space(10.0);
+                            if ui
+                                .add_sized(
+                                    [120.0, 30.0],
+                                    Button::new(
+                                        RichText::new("搜索与命令")
+                                            .size(12.0)
+                                            .color(palette.secondary),
+                                    )
+                                    .frame(false),
                                 )
-                                .fill(palette.surface)
-                                .stroke(Stroke::new(1.0, palette.border))
-                                .corner_radius(7),
-                            )
-                            .on_hover_text("打开命令面板")
-                            .clicked()
-                    {
-                        self.command_palette_open = true;
-                        self.command_focus_requested = true;
-                    }
+                                .on_hover_text("搜索命令 · Ctrl+Shift+P")
+                                .clicked()
+                            {
+                                self.command_palette_open = true;
+                                self.command_focus_requested = true;
+                            }
+                        }
+                    });
                 });
             });
     }
@@ -2264,10 +2048,13 @@ impl RuporaApp {
                         TextEdit::singleline(&mut self.find_query).hint_text("查找内容"),
                     );
                     if self.find_focus_requested {
+                        self.editor_surface.cancel_focus_request();
                         response.request_focus();
                         self.find_focus_requested = false;
                     }
-                    if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                    if response.lost_focus()
+                        && ui.input_mut(|input| input.consume_key(input.modifiers, Key::Enter))
+                    {
                         self.find_match(!ui.input(|input| input.modifiers.shift));
                     }
                     if ui.button("上一个").clicked() {
@@ -2302,7 +2089,7 @@ impl RuporaApp {
             return;
         }
         let mut open = self.about_open;
-        let available_update = self.available_update.clone();
+        let available_update = self.background.available_update().cloned();
         egui::Window::new("关于 RUPORA")
             .collapsible(false)
             .resizable(false)
@@ -2391,6 +2178,7 @@ impl RuporaApp {
                         .hint_text("输入命令，例如：保存、所见即所得、粗体"),
                 );
                 if self.command_focus_requested {
+                    self.editor_surface.cancel_focus_request();
                     response.request_focus();
                     self.command_focus_requested = false;
                 }
@@ -2405,7 +2193,9 @@ impl RuporaApp {
                     ui.label(RichText::new("没有匹配命令").weak());
                     return;
                 }
-                if response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                if (response.has_focus() || response.lost_focus())
+                    && ui.input_mut(|input| input.consume_key(input.modifiers, Key::Enter))
+                {
                     selected = Some(filtered[0].1);
                 }
                 for (label, command) in filtered.into_iter().take(12) {
@@ -2470,50 +2260,6 @@ impl RuporaApp {
 
     fn sidebar(&mut self, root: &mut Ui) {
         let palette = app_palette(self.state.dark);
-        Panel::left("activity-rail")
-            .exact_size(46.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(palette.toolbar)
-                    .inner_margin(Margin::symmetric(7, 8))
-                    .stroke(Stroke::new(1.0, palette.border)),
-            )
-            .show(root, |ui| {
-                ui.vertical_centered(|ui| {
-                    if app_icon_button(
-                        ui,
-                        AppIcon::Sidebar,
-                        self.state.show_sidebar,
-                        "资源管理器",
-                        palette,
-                    )
-                    .clicked()
-                    {
-                        self.state.show_sidebar = !self.state.show_sidebar;
-                    }
-                    ui.add_space(3.0);
-                    if app_icon_button(
-                        ui,
-                        AppIcon::Outline,
-                        self.state.show_outline,
-                        "文档大纲",
-                        palette,
-                    )
-                    .clicked()
-                    {
-                        self.state.show_outline = !self.state.show_outline;
-                    }
-                });
-                ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-                    if app_icon_button(ui, AppIcon::Theme, false, "切换浅色 / 深色外观", palette)
-                        .clicked()
-                    {
-                        self.state.dark = !self.state.dark;
-                        apply_theme(ui.ctx(), self.state.dark);
-                    }
-                });
-            });
-
         if !self.state.show_sidebar {
             return;
         }
@@ -2565,8 +2311,9 @@ impl RuporaApp {
                         });
                     });
                     let active_path = self
-                        .active
-                        .and_then(|index| self.documents.get(index))
+                        .session
+                        .active_index()
+                        .and_then(|index| self.session.documents().get(index))
                         .and_then(|document| document.path.as_deref());
                     ScrollArea::vertical()
                         .id_salt("workspace-tree")
@@ -2640,8 +2387,8 @@ impl RuporaApp {
                 let mut activate = None;
                 let mut close = None;
                 ScrollArea::vertical().show(ui, |ui| {
-                    for (index, document) in self.documents.iter().enumerate() {
-                        let selected = self.active == Some(index);
+                    for (index, document) in self.session.documents().iter().enumerate() {
+                        let selected = self.session.active_index() == Some(index);
                         egui::Frame::new()
                             .fill(if selected {
                                 palette.accent_soft
@@ -2747,8 +2494,9 @@ impl RuporaApp {
             return;
         }
         let headings = self
-            .active
-            .and_then(|index| self.documents.get(index))
+            .session
+            .active_index()
+            .and_then(|index| self.session.documents().get(index))
             .map(|document| document.analysis.headings.clone())
             .unwrap_or_default();
 
@@ -2791,11 +2539,12 @@ impl RuporaApp {
     }
 
     fn editor_tabs(&mut self, root: &mut Ui) {
-        if self.documents.is_empty() {
+        if self.session.documents().is_empty() {
             return;
         }
         let tabs = self
-            .documents
+            .session
+            .documents()
             .iter()
             .map(|document| (document.title(), document.dirty))
             .collect::<Vec<_>>();
@@ -2803,35 +2552,35 @@ impl RuporaApp {
         let mut activate = None;
         let mut close = None;
         Panel::top("editor-tabs")
-            .exact_size(38.0)
+            .exact_size(46.0)
             .frame(
                 egui::Frame::new()
                     .fill(palette.toolbar)
-                    .stroke(Stroke::new(1.0, palette.border)),
+                    .inner_margin(Margin::symmetric(16, 5)),
             )
             .show(root, |ui| {
+                let reveal_key = ui.id().with("visible-active-tab");
+                let active_layout = (self.session.active_id(), ui.available_width().to_bits());
+                let reveal_active = ui.data_mut(|data| {
+                    let previous = data.get_temp::<(Option<u64>, u32)>(reveal_key);
+                    data.insert_temp(reveal_key, active_layout);
+                    previous != Some(active_layout)
+                });
                 ScrollArea::horizontal()
                     .id_salt("editor-tabs-scroll")
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.spacing_mut().item_spacing.x = 6.0;
                             for (index, (title, dirty)) in tabs.iter().enumerate() {
-                                let selected = self.active == Some(index);
+                                let selected = self.session.active_index() == Some(index);
                                 let tab = egui::Frame::new()
                                     .fill(if selected {
                                         palette.surface
                                     } else {
-                                        palette.toolbar
+                                        Color32::TRANSPARENT
                                     })
-                                    .stroke(Stroke::new(
-                                        1.0,
-                                        if selected {
-                                            palette.surface
-                                        } else {
-                                            palette.border
-                                        },
-                                    ))
-                                    .inner_margin(Margin::symmetric(9, 3))
+                                    .corner_radius(8)
+                                    .inner_margin(Margin::symmetric(10, 2))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             let label = if *dirty {
@@ -2841,13 +2590,15 @@ impl RuporaApp {
                                             };
                                             if ui
                                                 .add(
-                                                    Button::new(RichText::new(label).color(
-                                                        if selected {
-                                                            palette.text
-                                                        } else {
-                                                            palette.secondary
-                                                        },
-                                                    ))
+                                                    Button::new(
+                                                        RichText::new(label).size(13.0).color(
+                                                            if selected {
+                                                                palette.text
+                                                            } else {
+                                                                palette.secondary
+                                                            },
+                                                        ),
+                                                    )
                                                     .frame(false)
                                                     .truncate()
                                                     .min_size(Vec2::new(112.0, 26.0)),
@@ -2870,14 +2621,8 @@ impl RuporaApp {
                                             }
                                         });
                                     });
-                                if selected {
-                                    ui.painter().line_segment(
-                                        [
-                                            tab.response.rect.left_top(),
-                                            tab.response.rect.right_top(),
-                                        ],
-                                        Stroke::new(2.0, palette.accent),
-                                    );
+                                if selected && reveal_active {
+                                    tab.response.scroll_to_me(Some(Align::Center));
                                 }
                             }
                             ui.add_space(5.0);
@@ -2908,7 +2653,7 @@ impl RuporaApp {
         CentralPanel::default()
             .frame(egui::Frame::new().fill(palette.canvas))
             .show(root, |ui| {
-                let Some(index) = self.active else {
+                let Some(index) = self.session.active_index() else {
                     ui.centered_and_justified(|ui| {
                         egui::Frame::new()
                             .fill(palette.canvas)
@@ -2955,1539 +2700,50 @@ impl RuporaApp {
                     return;
                 };
 
-                let mode = self.state.view_mode;
-                match mode {
-                    ViewMode::Edit => {
-                        self.edit_pane(ui, index, None);
-                    }
-                    ViewMode::Preview => {
-                        self.preview_pane(ui, index, None);
-                    }
-                    ViewMode::Hybrid => self.hybrid_pane(ui, index),
-                    ViewMode::Split => {
-                        if self.split_scroll_document != Some(index) {
-                            self.split_scroll_document = Some(index);
-                            self.split_scroll_ratio = 0.0;
-                            self.split_editor_maximum = 0.0;
-                            self.split_preview_maximum = 0.0;
-                        }
-                        let editor_target = (self.split_scroll_driver
-                            == SplitScrollDriver::Preview)
-                            .then_some(self.split_scroll_ratio * self.split_editor_maximum);
-                        let preview_target = (self.split_scroll_driver
-                            == SplitScrollDriver::Editor)
-                            .then_some(self.split_scroll_ratio * self.split_preview_maximum);
-                        let mut editor_scroll = PaneScroll::default();
-                        let mut preview_scroll = PaneScroll::default();
-                        ui.columns(2, |columns| {
-                            columns[0].push_id("source-pane", |ui| {
-                                editor_scroll = self.edit_pane(ui, index, editor_target);
-                            });
-                            columns[1].separator();
-                            columns[1].push_id("preview-pane", |ui| {
-                                preview_scroll = self.preview_pane(ui, index, preview_target);
-                            });
-                        });
-                        self.split_editor_maximum = editor_scroll.maximum;
-                        self.split_preview_maximum = preview_scroll.maximum;
-                        if editor_scroll.hovered {
-                            self.split_scroll_driver = SplitScrollDriver::Editor;
-                            self.split_scroll_ratio = scroll_ratio(editor_scroll);
-                        } else if preview_scroll.hovered {
-                            self.split_scroll_driver = SplitScrollDriver::Preview;
-                            self.split_scroll_ratio = scroll_ratio(preview_scroll);
-                        }
-                    }
-                }
+                self.show_editor_pane(ui, index, self.state.view_mode);
             });
     }
 
-    fn edit_pane(&mut self, ui: &mut Ui, index: usize, scroll_offset: Option<f32>) -> PaneScroll {
-        let selection_before = self.editor_cursor.map(cursor_range_to_char_range);
-        let mut scroll_area =
-            ScrollArea::vertical().id_salt(("editor-scroll", self.documents[index].id()));
-        if let Some(offset) = scroll_offset {
-            scroll_area = scroll_area.vertical_scroll_offset(offset);
-        }
-        let mut context_command = None;
-        let palette = app_palette(self.state.dark);
-        let output = scroll_area.show(ui, |ui| {
-            let viewport = ui.available_size();
-            ui.set_min_size(Vec2::new(viewport.x, viewport.y.max(420.0)));
-            ui.add_space(28.0);
-            let available_width = ui.available_width();
-            let page_width = (available_width - 48.0)
-                .clamp(280.0, 860.0)
-                .min(available_width);
-            let side_margin = ((available_width - page_width) * 0.5).max(0.0);
-            ui.horizontal(|ui| {
-                ui.add_space(side_margin);
-                egui::Frame::new()
-                    .fill(palette.surface)
-                    .stroke(Stroke::new(1.0, palette.border))
-                    .corner_radius(12)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 4],
-                        blur: 18,
-                        spread: 0,
-                        color: if self.state.dark {
-                            Color32::from_black_alpha(48)
-                        } else {
-                            Color32::from_black_alpha(18)
-                        },
-                    })
-                    .inner_margin(Margin::symmetric(56, 38))
-                    .show(ui, |ui| {
-                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            ui.set_width((page_width - 112.0).max(160.0));
-                            let available =
-                                Vec2::new(ui.available_width(), (viewport.y - 144.0).max(360.0));
-                            let row_height =
-                                ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
-                            let desired_rows = (available.y / row_height).max(20.0) as usize;
-                            let editor_id =
-                                ui.make_persistent_id(("editor", self.documents[index].id()));
-                            if let Some(cursor_range) = self.pending_editor_cursor.take() {
-                                let mut state =
-                                    TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
-                                state.cursor.set_char_range(Some(cursor_range));
-                                state.store(ui.ctx(), editor_id);
-                                ui.memory_mut(|memory| memory.request_focus(editor_id));
-                                self.editor_cursor = Some(cursor_range);
-                            }
-                            let input_action = editor_input_action(ui);
-                            let mut editor_buffer =
-                                TrackingTextBuffer::new(&mut self.documents[index].content);
-                            let output = TextEdit::multiline(&mut editor_buffer)
-                                .id(editor_id)
-                                .font(egui::TextStyle::Monospace)
-                                .code_editor()
-                                .hint_text("Markdown 源码编辑区")
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(desired_rows)
-                                .lock_focus(true)
-                                .show(ui);
-                            set_accessible_label(ui.ctx(), editor_id, "Markdown 源码编辑区");
-                            let mut before_content = editor_buffer.take_before();
-                            drop(editor_buffer);
-                            output.response.context_menu(|ui| {
-                                if ui.button("撤销").clicked() {
-                                    context_command = Some(AppCommand::Undo);
-                                    ui.close();
-                                }
-                                if ui.button("重做").clicked() {
-                                    context_command = Some(AppCommand::Redo);
-                                    ui.close();
-                                }
-                                ui.separator();
-                                if ui.button("粗体").clicked() {
-                                    context_command =
-                                        Some(AppCommand::Format(MarkdownCommand::Bold));
-                                    ui.close();
-                                }
-                                if ui.button("斜体").clicked() {
-                                    context_command =
-                                        Some(AppCommand::Format(MarkdownCommand::Italic));
-                                    ui.close();
-                                }
-                                if ui.button("链接").clicked() {
-                                    context_command =
-                                        Some(AppCommand::Format(MarkdownCommand::Link));
-                                    ui.close();
-                                }
-                                if ui.button("行内代码").clicked() {
-                                    context_command =
-                                        Some(AppCommand::Format(MarkdownCommand::InlineCode));
-                                    ui.close();
-                                }
-                                ui.separator();
-                                if ui.button("粘贴剪贴板图片").clicked() {
-                                    context_command = Some(AppCommand::PasteImage);
-                                    ui.close();
-                                }
-                                if ui.button("可视化编辑表格").clicked() {
-                                    context_command = Some(AppCommand::EditTable);
-                                    ui.close();
-                                }
-                            });
-                            let mut selection_after =
-                                output.cursor_range.map(cursor_range_to_char_range);
-                            if let Some(cursor_range) = output.cursor_range {
-                                self.editor_cursor = Some(cursor_range);
-                            }
-                            let focused = output.response.has_focus();
-                            let mut changed = output.response.changed();
-                            let mut kind = EditKind::Typing;
-                            let mut cursor_adjusted = false;
-
-                            if focused
-                                && let (Some(url), Some(selection)) = (
-                                    input_action.pasted_text.as_deref(),
-                                    selection_before.clone(),
-                                )
-                                && !selection.is_empty()
-                                && let Some(before_content) = before_content.as_ref()
-                            {
-                                let mut linked = before_content.clone();
-                                if let Some(next) =
-                                    editing::paste_url_as_markdown_link(&mut linked, selection, url)
-                                {
-                                    self.documents[index].content = linked;
-                                    selection_after = Some(next);
-                                    kind = EditKind::Other;
-                                    changed = true;
-                                    cursor_adjusted = true;
-                                }
-                            } else if focused
-                                && input_action.tab
-                                && let Some(before_content) = before_content.as_ref()
-                            {
-                                self.documents[index].content.clone_from(before_content);
-                                let selection = selection_before.clone().unwrap_or_else(|| {
-                                    let end = before_content.chars().count();
-                                    end..end
-                                });
-                                selection_after = Some(editing::indent_selected_lines(
-                                    &mut self.documents[index].content,
-                                    selection,
-                                    input_action.shift,
-                                ));
-                                kind = EditKind::Other;
-                                changed = true;
-                                cursor_adjusted = true;
-                            } else if focused
-                                && let (Some(typed), Some(selection)) =
-                                    (input_action.typed_text.as_deref(), selection_before.clone())
-                                && let Some(before_content) = before_content.as_ref()
-                            {
-                                let mut paired = before_content.clone();
-                                if let Some(next) =
-                                    editing::apply_smart_pair(&mut paired, selection, typed)
-                                {
-                                    changed = paired != *before_content;
-                                    self.documents[index].content = paired;
-                                    selection_after = Some(next);
-                                    kind = EditKind::Other;
-                                    cursor_adjusted = true;
-                                }
-                            } else if focused
-                                && changed
-                                && input_action.enter
-                                && let Some(cursor) =
-                                    selection_after.as_ref().map(|range| range.end)
-                                && let Some(next) = editing::continue_markdown_line(
-                                    &mut self.documents[index].content,
-                                    cursor,
-                                )
-                            {
-                                selection_after = Some(next);
-                                cursor_adjusted = true;
-                            }
-
-                            if changed
-                                && let Some(before_content) = before_content.take()
-                                && self.documents[index].record_edit(
-                                    before_content,
-                                    selection_before,
-                                    selection_after.clone(),
-                                    kind,
-                                )
-                            {
-                                if cursor_adjusted && let Some(selection) = selection_after {
-                                    self.queue_editor_selection(selection);
-                                }
-                                self.status = "已修改".to_owned();
-                            } else if cursor_adjusted && let Some(selection) = selection_after {
-                                self.queue_editor_selection(selection);
-                            }
-                        });
-                    });
-            });
-            ui.add_space(32.0);
-        });
-        if let Some(command) = context_command {
-            self.execute(command);
-        }
-        PaneScroll {
-            offset: output.state.offset.y,
-            maximum: (output.content_size.y - output.inner_rect.height()).max(0.0),
-            hovered: ui
-                .ctx()
-                .pointer_hover_pos()
-                .is_some_and(|position| output.inner_rect.contains(position)),
-        }
-    }
-
-    fn preview_pane(
-        &mut self,
-        ui: &mut Ui,
-        index: usize,
-        scroll_offset: Option<f32>,
-    ) -> PaneScroll {
-        let viewport_height = ui.available_height();
-        let source = self.documents[index].content.clone();
-        let blocks = self.documents[index].blocks().to_vec();
-        let document_id = self.documents[index].id();
+    fn show_editor_pane(&mut self, ui: &mut Ui, index: usize, mode: ViewMode) {
         let base_path = self.preview_base_path(index);
-        let svg_cache = self.generated_svg_cache.clone();
-        let dark = self.state.dark;
-        let palette = app_palette(self.state.dark);
-        let mut task_toggle = None;
-        let mut clicked_destination = None;
-        let mut scroll_area = ScrollArea::vertical().id_salt(("preview-scroll", document_id));
-        if let Some(offset) = scroll_offset {
-            scroll_area = scroll_area.vertical_scroll_offset(offset);
-        }
-        let output = scroll_area.show(ui, |ui| {
-            ui.add_space(28.0);
-            let available_width = ui.available_width();
-            let page_width = (available_width - 48.0)
-                .clamp(280.0, 860.0)
-                .min(available_width);
-            let side_margin = ((available_width - page_width) * 0.5).max(0.0);
-            ui.horizontal(|ui| {
-                ui.add_space(side_margin);
-                egui::Frame::new()
-                    .fill(palette.surface)
-                    .stroke(Stroke::new(1.0, palette.border))
-                    .corner_radius(12)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 4],
-                        blur: 18,
-                        spread: 0,
-                        color: if self.state.dark {
-                            Color32::from_black_alpha(48)
-                        } else {
-                            Color32::from_black_alpha(18)
-                        },
-                    })
-                    .inner_margin(Margin::symmetric(56, 38))
-                    .show(ui, |ui| {
-                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            ui.set_width((page_width - 112.0).max(160.0));
-                            ui.set_min_height((viewport_height - 142.0).max(480.0));
-                            for block in &blocks {
-                                let source_block = &source[block.range.clone()];
-                                let code = fenced_code_content(source_block);
-                                let preview = show_native_block_preview(
-                                    ui,
-                                    source_block,
-                                    &base_path,
-                                    dark,
-                                    &mut svg_cache.borrow_mut(),
-                                    palette,
-                                );
-                                let response = ui.interact(
-                                    preview.rect,
-                                    ui.make_persistent_id((
-                                        "native-preview-block",
-                                        document_id,
-                                        block.id,
-                                    )),
-                                    egui::Sense::click(),
-                                );
-                                if response.clicked()
-                                    && let Some(position) = response.interact_pointer_pos()
-                                {
-                                    let local_source_byte =
-                                        preview.mapping.source_byte_at_position(
-                                            source_block,
-                                            preview.rect,
-                                            position,
-                                        );
-                                    if let Some(updated) = markdown::toggle_task_marker_at(
-                                        source_block,
-                                        local_source_byte,
-                                    ) {
-                                        task_toggle = Some((block.range.clone(), updated));
-                                    } else if let Some(destination) = markdown::link_destination_at(
-                                        source_block,
-                                        local_source_byte,
-                                    ) {
-                                        clicked_destination = Some(destination);
-                                    }
-                                }
-                                if let Some(code) = code {
-                                    let _ = show_code_copy_button(
-                                        ui,
-                                        (document_id, block.id),
-                                        preview.rect,
-                                        code,
-                                        palette,
-                                    );
-                                }
-                                ui.add_space(12.0);
-                            }
-                            ui.add_space(60.0);
-                        });
-                    });
-            });
-            ui.add_space(40.0);
-        });
-        if let Some((range, updated)) = task_toggle {
-            self.documents[index].content.replace_range(range, &updated);
-            self.documents[index].record_edit(source, None, None, EditKind::TaskList);
-            self.status = "已更新任务列表".to_owned();
-        }
-        if let Some(destination) = clicked_destination {
-            self.open_preview_destination(index, &destination);
-        }
-        PaneScroll {
-            offset: output.state.offset.y,
-            maximum: (output.content_size.y - output.inner_rect.height()).max(0.0),
-            hovered: ui
-                .ctx()
-                .pointer_hover_pos()
-                .is_some_and(|position| output.inner_rect.contains(position)),
-        }
-    }
-
-    fn apply_hybrid_cross_selection_input(&mut self, ui: &mut Ui, index: usize) {
-        let document_id = self.documents[index].id();
-        let Some(selection) = self
-            .hybrid_cross_selection
-            .filter(|selection| selection.document_id == document_id)
-        else {
-            self.hybrid_cross_selection = None;
-            return;
-        };
-        let range = cursor_range_to_char_range(selection.cursor);
-        if range.is_empty() {
-            self.hybrid_cross_selection = None;
-            return;
-        }
-        let action = take_cross_block_input(ui);
-        let Some(action) = action else {
-            return;
-        };
-
-        let before = self.documents[index].content.clone();
-        let range = clamp_char_range(&before, range);
-        let start = char_to_byte(&before, range.start);
-        let end = char_to_byte(&before, range.end);
-        let selected = selected_markdown_for_clipboard(&before[start..end]);
-        if action.copy() {
-            ui.ctx().copy_text(selected);
-        }
-        let Some(replacement) = action.replacement() else {
-            return;
-        };
-
-        self.documents[index]
-            .content
-            .replace_range(start..end, replacement);
-        let cursor = range.start + replacement.chars().count();
-        let cursor = CCursorRange::one(CCursor::new(cursor));
-        self.documents[index].record_edit(
-            before,
-            Some(range),
-            Some(cursor_range_to_char_range(cursor)),
-            EditKind::Typing,
+        let output = self.editor_surface.show(
+            ui,
+            &mut self.session[index],
+            EditorOptions {
+                mode,
+                dark: self.state.dark,
+                base_path: &base_path,
+            },
         );
-        self.editor_cursor = Some(cursor);
-        self.pending_editor_cursor = Some(cursor);
-        self.hybrid_cross_selection = None;
-        self.hybrid_pointer_anchor = None;
-        self.hybrid_ime_session = None;
-        self.status = "已更新跨块选择".to_owned();
-    }
-
-    fn hybrid_pane(&mut self, ui: &mut Ui, index: usize) {
-        self.apply_hybrid_cross_selection_input(ui, index);
-        if self.hybrid_block_heights.len() > MAX_HYBRID_BLOCK_HEIGHT_CACHE {
-            self.hybrid_block_heights.clear();
+        if !output.notice.is_empty() {
+            self.status = output.notice;
         }
-        let viewport_height = ui.available_height();
-        let source = self.documents[index].content.clone();
-        let document_id = self.documents[index].id();
-        let cursor_before = self.editor_cursor;
-        let selection_before = cursor_before.map(cursor_range_to_char_range);
-        let blocks = self.documents[index].blocks().to_vec();
-        let front_matter = markdown::parse_front_matter(&source);
-        let base_path = self.preview_base_path(index);
-        let svg_cache = self.generated_svg_cache.clone();
-        let dark = self.state.dark;
-        let screen_reader = ui.ctx().options(|options| options.screen_reader);
-
-        let mut pending_source_cursor = self.pending_editor_cursor.take();
-        if let Some(cursor_range) = pending_source_cursor {
-            let [selection_start, _] = cursor_range.sorted_cursors();
-            let selected_block = block_for_char_index(&source, &blocks, selection_start.index.0);
-            self.hybrid_active = Some((index, selected_block.id));
-        }
-
-        let active_id = self
-            .hybrid_active
-            .filter(|(document, id)| {
-                *document == index && blocks.iter().any(|block| block.id == *id)
-            })
-            .map(|(_, id)| id)
-            .or_else(|| source.is_empty().then(|| blocks[0].id));
-        let document_title = self.documents[index].title();
-        let ime_action = ui.input(|input| ime_frame_action(&input.events));
-        let mut ime_session = self.hybrid_ime_session.take().filter(|session| {
-            session.document_id == document_id && Some(session.block_id) == active_id
-        });
-
-        let mut pending_edit = None;
-        let mut activate = None;
-        let mut next_global_cursor = None;
-        let mut cursor_adjusted = false;
-        let mut page_rect = None;
-        let mut active_editor_rect = None;
-        let mut pointer_regions = Vec::<HybridPointerRegion>::new();
-        let mut copied_code_block = false;
-        let mut clicked_destination = None;
-        let palette = app_palette(self.state.dark);
-
-        ScrollArea::vertical()
-            .id_salt(("hybrid-scroll", document_id))
-            .show(ui, |ui| {
-                ui.add_space(28.0);
-                let available_width = ui.available_width();
-                let page_width = (available_width - 48.0)
-                    .clamp(280.0, 860.0)
-                    .min(available_width);
-                let side_margin = ((available_width - page_width) * 0.5).max(0.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(side_margin);
-                    let page = egui::Frame::new()
-                        .fill(palette.surface)
-                        .stroke(Stroke::new(1.0, palette.border))
-                        .corner_radius(12)
-                        .shadow(egui::epaint::Shadow {
-                            offset: [0, 4],
-                            blur: 18,
-                            spread: 0,
-                            color: if self.state.dark {
-                                Color32::from_black_alpha(48)
-                            } else {
-                                Color32::from_black_alpha(18)
-                            },
-                        })
-                        .inner_margin(Margin::symmetric(56, 38))
-                        .show(ui, |ui| {
-                            set_wysiwyg_document_accessibility(ui, &document_title);
-                            ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                                ui.set_width((page_width - 112.0).max(160.0));
-                                ui.set_min_height((viewport_height - 142.0).max(480.0));
-                                for (block_index, block) in blocks.iter().enumerate() {
-                                    let source_block = &source[block.range.clone()];
-                                    let code_content = fenced_code_content(source_block);
-                                    let block_is_code = code_content.is_some();
-                                    if block_index > 0
-                                        && Some(blocks[block_index - 1].id) != active_id
-                                    {
-                                        let gap =
-                                            blocks[block_index - 1].range.end..block.range.start;
-                                        let blank_lines =
-                                            extra_inter_block_blank_lines(&source, gap.clone());
-                                        if blank_lines > 0 {
-                                            let line_height = ui
-                                                .text_style_height(&egui::TextStyle::Body)
-                                                .max(1.0);
-                                            let response = ui
-                                                .allocate_response(
-                                                    Vec2::new(
-                                                        ui.available_width(),
-                                                        blank_lines as f32 * line_height,
-                                                    ),
-                                                    egui::Sense::click(),
-                                                )
-                                                .on_hover_cursor(egui::CursorIcon::Text)
-                                                .on_hover_text("点击编辑段落之间的空行");
-                                            if response.clicked()
-                                                && let Some(position) =
-                                                    response.interact_pointer_pos()
-                                            {
-                                                let line = ((position.y - response.rect.top())
-                                                    / line_height)
-                                                    .floor()
-                                                    as usize;
-                                                if let Some(cursor_byte) =
-                                                    inter_block_blank_line_cursor_byte(
-                                                        &source,
-                                                        gap,
-                                                        line.min(blank_lines - 1),
-                                                    )
-                                                {
-                                                    activate = Some((
-                                                        blocks[block_index - 1].id,
-                                                        cursor_byte,
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    let block_layout_start = ui.next_widget_position().y;
-                                    let layout_key = HybridBlockLayoutKey {
-                                        document_id,
-                                        block_id: block.id,
-                                        width: ui.available_width().round().clamp(0.0, u16::MAX as f32)
-                                            as u16,
-                                        dark,
-                                    };
-                                    let block_height = self
-                                        .hybrid_block_heights
-                                        .get(&layout_key)
-                                        .copied()
-                                        .unwrap_or_else(|| {
-                                            estimated_hybrid_block_height(
-                                                source_block,
-                                                ui.available_width(),
-                                                block_is_code,
-                                            )
-                                        });
-                                    let predicted_rect = egui::Rect::from_min_size(
-                                        egui::pos2(ui.min_rect().left(), block_layout_start),
-                                        egui::vec2(ui.available_width(), block_height),
-                                    );
-                                    let prefetch_rect = ui
-                                        .clip_rect()
-                                        .expand2(egui::vec2(0.0, viewport_height.max(200.0)));
-                                    if !screen_reader
-                                        && Some(block.id) != active_id
-                                        && !prefetch_rect.intersects(predicted_rect)
-                                    {
-                                        ui.add_space(block_height);
-                                        continue;
-                                    }
-
-                                    let generated_preview = if block.range.start == 0 {
-                                        front_matter.as_ref().and_then(|front| {
-                                            (block.range.end <= front.body_start).then(|| {
-                                                markdown::front_matter_preview_markdown(front)
-                                            })
-                                        })
-                                    } else if source_block.trim().eq_ignore_ascii_case("[TOC]") {
-                                        Some(markdown::toc_preview_markdown(&source))
-                                    } else {
-                                        None
-                                    };
-                                    let preview_source =
-                                        generated_preview.as_deref().unwrap_or(source_block);
-                                    let mut code_surface_rect = None;
-                                    ui.push_id(("hybrid-block", document_id, block.id), |ui| {
-                                        if Some(block.id) == active_id {
-                                            let edit_range =
-                                                hybrid_edit_range(&source, &blocks, block.id);
-                                            let block_char_start =
-                                                source[..edit_range.start].chars().count();
-                                            let local_source_cursor_before =
-                                                cursor_before.map(|cursor| {
-                                                    cursor_range_saturating_sub(
-                                                        cursor,
-                                                        block_char_start,
-                                                    )
-                                                });
-                                            let local_source_selection_before =
-                                                local_source_cursor_before
-                                                    .map(cursor_range_to_char_range);
-                                            let (original_block, ime_visual_content) =
-                                                if let Some(session) = ime_session.take() {
-                                                    (
-                                                        session.base_source,
-                                                        Some(session.visual_content),
-                                                    )
-                                                } else {
-                                                    (source[edit_range.clone()].to_owned(), None)
-                                                };
-                                            let had_ime_session = ime_visual_content.is_some();
-                                            let projection = match local_source_selection_before
-                                                .clone()
-                                            {
-                                                Some(selection) => {
-                                                    VisualProjection::from_markdown_with_selection(
-                                                        &original_block,
-                                                        Some(selection),
-                                                    )
-                                                }
-                                                None => {
-                                                    VisualProjection::from_markdown(&original_block)
-                                                }
-                                            };
-                                            let mut visual_content = ime_visual_content
-                                                .unwrap_or_else(|| projection.text().to_owned());
-                                            let visual_selection_before =
-                                                local_source_selection_before.as_ref().map(
-                                                    |selection| {
-                                                        projection.visual_char_range(
-                                                            &original_block,
-                                                            selection.clone(),
-                                                        )
-                                                    },
-                                                );
-                                            let editor_id = ui.make_persistent_id((
-                                                "hybrid-editor",
-                                                index,
-                                                block.id,
-                                            ));
-                                            let pending_local_cursor =
-                                                pending_source_cursor.take().map(|cursor_range| {
-                                                    cursor_range_saturating_sub(
-                                                        cursor_range,
-                                                        block_char_start,
-                                                    )
-                                                });
-                                            let cursor_source_cursor =
-                                                if pending_local_cursor.is_some() {
-                                                    pending_local_cursor.as_ref()
-                                                } else if had_ime_session {
-                                                    None
-                                                } else {
-                                                    local_source_cursor_before.as_ref()
-                                                };
-                                            if let Some(local_cursor) = cursor_source_cursor {
-                                                let local_source =
-                                                    cursor_range_to_char_range(*local_cursor);
-                                                let local_visual = projection.visual_char_range(
-                                                    &original_block,
-                                                    local_source,
-                                                );
-                                                let mut state =
-                                                    TextEdit::load_state(ui.ctx(), editor_id)
-                                                        .unwrap_or_default();
-                                                state.cursor.set_char_range(Some(
-                                                    cursor_range_with_direction(
-                                                        local_visual,
-                                                        *local_cursor,
-                                                    ),
-                                                ));
-                                                state.store(ui.ctx(), editor_id);
-                                            }
-                                            if pending_local_cursor.is_some() {
-                                                ui.memory_mut(|memory| {
-                                                    memory.request_focus(editor_id)
-                                                });
-                                            }
-
-                                            let block_is_code =
-                                                is_fenced_code_block(&original_block);
-                                            let code_language =
-                                                fenced_code_language(&original_block)
-                                                    .map(str::to_owned);
-                                            let block_is_table =
-                                                is_native_table_block(&original_block);
-                                            let block_is_quote =
-                                                is_native_quote_block(&original_block);
-                                            let frame = if block_is_code {
-                                                egui::Frame::new()
-                                                    .fill(palette.code_bg)
-                                                    .stroke(Stroke::new(1.0, palette.border))
-                                                    .corner_radius(8)
-                                                    .inner_margin(Margin::symmetric(14, 10))
-                                            } else if block_is_table {
-                                                egui::Frame::new()
-                                                    .fill(palette.code_bg.gamma_multiply(0.38))
-                                                    .stroke(Stroke::new(1.0, palette.border))
-                                                    .corner_radius(8)
-                                                    .inner_margin(Margin::symmetric(12, 10))
-                                            } else if block_is_quote {
-                                                egui::Frame::new()
-                                                    .fill(palette.accent_soft.gamma_multiply(0.42))
-                                                    .stroke(Stroke::new(1.0, palette.border))
-                                                    .corner_radius(6)
-                                                    .inner_margin(Margin::symmetric(14, 9))
-                                            } else {
-                                                egui::Frame::new()
-                                                    .inner_margin(Margin::symmetric(0, 3))
-                                            };
-                                            let editor_frame = frame.show(ui, |ui| {
-                                                if block_is_code
-                                                    && let Some(language) = code_language.as_deref()
-                                                {
-                                                    ui.label(
-                                                        RichText::new(language.to_uppercase())
-                                                            .monospace()
-                                                            .size(11.0)
-                                                            .color(palette.secondary),
-                                                    );
-                                                    ui.add_space(4.0);
-                                                }
-                                                let desired_rows = if block_is_code {
-                                                    multiline_edit_rows(&visual_content).max(2)
-                                                } else {
-                                                    multiline_edit_rows(&visual_content)
-                                                };
-                                                let input_action = editor_input_action(ui);
-                                                let mut layouter =
-                                                    |ui: &Ui,
-                                                     buffer: &dyn egui::TextBuffer,
-                                                     wrap_width: f32| {
-                                                        if block_is_code {
-                                                            syntax_highlighted_code_layout(
-                                                                ui,
-                                                                buffer.as_str(),
-                                                                wrap_width,
-                                                                palette,
-                                                                code_language.as_deref(),
-                                                            )
-                                                        } else {
-                                                            wysiwyg_layout(
-                                                                ui,
-                                                                buffer.as_str(),
-                                                                &projection,
-                                                                wrap_width,
-                                                                palette,
-                                                                true,
-                                                            )
-                                                        }
-                                                    };
-                                                let mut editor =
-                                                    TextEdit::multiline(&mut visual_content)
-                                                        .id(editor_id)
-                                                        .frame(egui::Frame::NONE)
-                                                        .layouter(&mut layouter)
-                                                        .hint_text(if block_is_code {
-                                                            "输入代码…"
-                                                        } else {
-                                                            "开始写作…"
-                                                        })
-                                                        .desired_width(f32::INFINITY)
-                                                        .desired_rows(desired_rows)
-                                                        .lock_focus(true);
-                                                if block_is_code {
-                                                    editor = editor.code_editor();
-                                                }
-                                                let inline_code_background = (!block_is_code)
-                                                    .then(|| ui.painter().add(egui::Shape::Noop));
-                                                let mut output = editor.show(ui);
-                                                pointer_regions.push(HybridPointerRegion {
-                                                    block_id: block.id,
-                                                    source_range: edit_range.clone(),
-                                                    rect: output.response.rect,
-                                                    atomic_range: block_is_code
-                                                        .then(|| block.range.clone()),
-                                                    mapping: NativePointerMapping::Text(
-                                                        TextProjectionPreview {
-                                                            rect: output.response.rect,
-                                                            galley: Arc::clone(&output.galley),
-                                                            galley_pos: output.galley_pos,
-                                                            projection: projection.clone(),
-                                                        },
-                                                    ),
-                                                });
-                                                if output.response.clicked()
-                                                    && ui.input(|input| input.modifiers.command)
-                                                    && let Some(position) =
-                                                        output.response.interact_pointer_pos()
-                                                {
-                                                    let visual_cursor = usize::from(
-                                                        text_edit_cursor_at_position(
-                                                            &output, position,
-                                                        )
-                                                        .index,
-                                                    );
-                                                    let source_char = projection
-                                                        .source_char_range(
-                                                            &original_block,
-                                                            visual_cursor..visual_cursor,
-                                                        )
-                                                        .start;
-                                                    let source_byte = char_to_byte(
-                                                        &original_block,
-                                                        source_char,
-                                                    );
-                                                    if let Some(destination) =
-                                                        markdown::link_destination_at(
-                                                            &original_block,
-                                                            source_byte,
-                                                        )
-                                                    {
-                                                        clicked_destination = Some(destination);
-                                                    }
-                                                }
-                                                if let Some(shape_index) = inline_code_background {
-                                                    let runs = projection.runs_for(&visual_content);
-                                                    ui.painter().set(
-                                                        shape_index,
-                                                        egui::Shape::Vec(
-                                                            rounded_inline_code_backgrounds(
-                                                                &output.galley,
-                                                                output.galley_pos,
-                                                                &runs,
-                                                                palette,
-                                                            ),
-                                                        ),
-                                                    );
-                                                    paint_inline_code_delimiters(
-                                                        ui,
-                                                        &output.galley,
-                                                        output.galley_pos,
-                                                        &runs,
-                                                        palette,
-                                                    );
-                                                }
-                                                if output.response.has_focus() {
-                                                    let accessible_remainder =
-                                                        accessible_document_remainder(
-                                                            &source, &blocks, block.id,
-                                                        );
-                                                    append_accessible_text_runs(
-                                                        ui,
-                                                        editor_id,
-                                                        (document_id, block.id),
-                                                        &accessible_remainder,
-                                                        output.response.rect,
-                                                    );
-                                                }
-                                                set_accessible_label(
-                                                    ui.ctx(),
-                                                    editor_id,
-                                                    format!(
-                                                        "从第 {} 行开始的所见即所得编辑块",
-                                                        block.line
-                                                    ),
-                                                );
-                                                let visual_cursor_after =
-                                                    text_edit_cursor_after_input(&output);
-                                                let mut visual_selection_after =
-                                                    visual_cursor_after
-                                                        .map(cursor_range_to_char_range);
-                                                if output.response.dragged()
-                                                    && let Some(anchor_position) = ui
-                                                        .input(|input| input.pointer.press_origin())
-                                                {
-                                                    // `TextEditOutput::cursor_range` is captured
-                                                    // before pointer interaction in egui 0.35. On
-                                                    // Windows a right-to-left drag can therefore be
-                                                    // observed as only the moving caret. Rebuild the
-                                                    // directed range from the stable press origin
-                                                    // and current pointer position using the exact
-                                                    // galley hit-test used by TextEdit itself.
-                                                    let anchor = text_edit_cursor_at_position(
-                                                        &output,
-                                                        anchor_position,
-                                                    );
-                                                    let current_position = ui
-                                                        .input(|input| input.pointer.interact_pos())
-                                                        .unwrap_or(anchor_position);
-                                                    let current = text_edit_cursor_at_position(
-                                                        &output,
-                                                        current_position,
-                                                    );
-                                                    let cursor = CCursorRange {
-                                                        primary: current,
-                                                        secondary: anchor,
-                                                        h_pos: None,
-                                                    };
-                                                    visual_selection_after =
-                                                        Some(cursor_range_to_char_range(cursor));
-                                                    output
-                                                        .state
-                                                        .cursor
-                                                        .set_char_range(Some(cursor));
-                                                    output
-                                                        .state
-                                                        .clone()
-                                                        .store(ui.ctx(), output.response.id);
-                                                }
-                                                let focused = output.response.has_focus();
-                                                let mut changed = output.response.changed();
-                                                let mut kind = EditKind::Typing;
-                                                let mut source_update = None;
-                                                let mut boundary_input_handled = false;
-                                                let defer_ime = focused
-                                                    && (ime_action == ImeFrameAction::Preedit
-                                                        || had_ime_session
-                                                            && ime_action == ImeFrameAction::None);
-
-                                                if defer_ime {
-                                                    changed = false;
-                                                } else if had_ime_session
-                                                    && ime_action == ImeFrameAction::Cancel
-                                                {
-                                                    ime_session = None;
-                                                    changed = false;
-                                                } else if had_ime_session
-                                                    && ime_action == ImeFrameAction::Commit
-                                                {
-                                                    ime_session = None;
-                                                } else if !defer_ime
-                                                    && focused
-                                                    && !changed
-                                                    && !input_action.horizontal_modified
-                                                    && let Some(selection) =
-                                                        local_source_selection_before.clone()
-                                                    && let Some(selection) =
-                                                        move_across_hidden_inline_code_boundary(
-                                                            &original_block,
-                                                            selection,
-                                                            input_action.left,
-                                                            input_action.right,
-                                                        )
-                                                {
-                                                    next_global_cursor = Some(CCursorRange::two(
-                                                        CCursor::new(
-                                                            block_char_start + selection.start,
-                                                        ),
-                                                        CCursor::new(
-                                                            block_char_start + selection.end,
-                                                        ),
-                                                    ));
-                                                    cursor_adjusted = true;
-                                                    boundary_input_handled = true;
-                                                }
-
-                                                if !boundary_input_handled
-                                                    && !defer_ime
-                                                    && focused
-                                                    && let (Some(url), Some(selection)) = (
-                                                        input_action.pasted_text.as_deref(),
-                                                        visual_selection_before.clone(),
-                                                    )
-                                                    && !selection.is_empty()
-                                                {
-                                                    let source_selection = projection
-                                                        .source_char_range(
-                                                            &original_block,
-                                                            selection,
-                                                        );
-                                                    let mut updated = original_block.clone();
-                                                    if let Some(next) =
-                                                        editing::paste_url_as_markdown_link(
-                                                            &mut updated,
-                                                            source_selection,
-                                                            url,
-                                                        )
-                                                    {
-                                                        source_update = Some((updated, next));
-                                                        kind = EditKind::Other;
-                                                        changed = true;
-                                                        cursor_adjusted = true;
-                                                    }
-                                                } else if !defer_ime && focused && input_action.tab
-                                                {
-                                                    let selection = visual_selection_before
-                                                        .clone()
-                                                        .unwrap_or_else(|| {
-                                                            let end =
-                                                                visual_content.chars().count();
-                                                            end..end
-                                                        });
-                                                    let source_selection = projection
-                                                        .source_char_range(
-                                                            &original_block,
-                                                            selection,
-                                                        );
-                                                    let mut updated = original_block.clone();
-                                                    let next = editing::indent_selected_lines(
-                                                        &mut updated,
-                                                        source_selection,
-                                                        input_action.shift,
-                                                    );
-                                                    source_update = Some((updated, next));
-                                                    kind = EditKind::Other;
-                                                    changed = true;
-                                                    cursor_adjusted = true;
-                                                } else if !defer_ime
-                                                    && focused
-                                                    && let (Some(typed), Some(selection)) = (
-                                                        input_action.typed_text.as_deref(),
-                                                        visual_selection_before.clone(),
-                                                    )
-                                                {
-                                                    let mut paired = projection.text().to_owned();
-                                                    if let Some(next) = editing::apply_smart_pair(
-                                                        &mut paired,
-                                                        selection,
-                                                        typed,
-                                                    ) {
-                                                        changed = paired != projection.text();
-                                                        visual_content = paired;
-                                                        visual_selection_after = Some(next);
-                                                        kind = EditKind::Other;
-                                                        cursor_adjusted = true;
-                                                    }
-                                                } else if !defer_ime
-                                                    && focused
-                                                    && block_is_code
-                                                    && (input_action.backspace
-                                                        || input_action.delete)
-                                                    && !changed
-                                                    && projection.text().trim().is_empty()
-                                                {
-                                                    let replacement_range =
-                                                        code_block_removal_range(
-                                                            &source,
-                                                            &blocks,
-                                                            block_index,
-                                                        );
-                                                    let cursor = source[..replacement_range.start]
-                                                        .chars()
-                                                        .count();
-                                                    pending_edit = Some((
-                                                        replacement_range,
-                                                        String::new(),
-                                                        EditKind::Typing,
-                                                    ));
-                                                    next_global_cursor = Some(CCursorRange::one(
-                                                        CCursor::new(cursor),
-                                                    ));
-                                                    cursor_adjusted = true;
-                                                    boundary_input_handled = true;
-                                                } else if !defer_ime
-                                                    && focused
-                                                    && input_action.backspace
-                                                    && !changed
-                                                    && visual_selection_before.as_ref().is_some_and(
-                                                        |selection| {
-                                                            selection.is_empty()
-                                                                && selection.start == 0
-                                                        },
-                                                    )
-                                                    && let Some((replacement_range, cursor)) =
-                                                        boundary_backspace_edit(
-                                                            &source,
-                                                            edit_range.clone(),
-                                                        )
-                                                {
-                                                    pending_edit = Some((
-                                                        replacement_range,
-                                                        original_block.clone(),
-                                                        EditKind::Typing,
-                                                    ));
-                                                    next_global_cursor = Some(CCursorRange::one(
-                                                        CCursor::new(cursor),
-                                                    ));
-                                                    cursor_adjusted = true;
-                                                    boundary_input_handled = true;
-                                                }
-
-                                                if !boundary_input_handled
-                                                    && !defer_ime
-                                                    && source_update.is_none()
-                                                    && changed
-                                                    && let Some(selection) =
-                                                        visual_selection_after.clone()
-                                                    && let Some(mut update) = projection.apply_edit(
-                                                        &original_block,
-                                                        &visual_content,
-                                                        selection,
-                                                    )
-                                                {
-                                                    if focused && input_action.enter {
-                                                        if !input_action.shift
-                                                            && let Some(selection) =
-                                                                complete_fenced_code_on_enter(
-                                                                    &mut update.source,
-                                                                    update.selection.clone(),
-                                                                )
-                                                        {
-                                                            update.selection = selection;
-                                                        } else {
-                                                            update.selection =
-                                                                complete_visual_enter(
-                                                                    &mut update.source,
-                                                                    update.selection,
-                                                                    input_action.shift,
-                                                                );
-                                                        }
-                                                    }
-                                                    if let Some(selection) =
-                                                        consume_paired_fenced_code_closer(
-                                                            &mut update.source,
-                                                            update.selection.clone(),
-                                                        )
-                                                    {
-                                                        update.selection = selection;
-                                                    } else if let Some(selection) =
-                                                        complete_bare_fenced_code_after_typing(
-                                                            &mut update.source,
-                                                            update.selection.clone(),
-                                                        )
-                                                    {
-                                                        update.selection = selection;
-                                                    }
-                                                    cursor_adjusted = true;
-                                                    source_update =
-                                                        Some((update.source, update.selection));
-                                                }
-
-                                                if !boundary_input_handled
-                                                    && !defer_ime
-                                                    && source_update.is_none()
-                                                    && focused
-                                                    && block_is_code
-                                                    && !input_action.horizontal_modified
-                                                    && (input_action.right || input_action.down)
-                                                    && visual_selection_before.as_ref().is_some_and(
-                                                        |selection| {
-                                                            selection.is_empty()
-                                                                && selection.end
-                                                                    == projection
-                                                                        .text()
-                                                                        .chars()
-                                                                        .count()
-                                                        },
-                                                    )
-                                                {
-                                                    let mut updated = original_block.clone();
-                                                    if let Some(selection) =
-                                                        paragraph_after_fenced_code(&mut updated)
-                                                    {
-                                                        source_update = Some((updated, selection));
-                                                        cursor_adjusted = true;
-                                                    }
-                                                }
-
-                                                if defer_ime {
-                                                    // IME pre-edit text belongs to the composition,
-                                                    // not to the Markdown document or its undo history.
-                                                    // Keeping this visual buffer alive lets egui replace
-                                                    // the previous pre-edit range on the next frame.
-                                                    ime_session = Some(HybridImeSession {
-                                                        document_id,
-                                                        block_id: block.id,
-                                                        base_source: original_block,
-                                                        visual_content,
-                                                    });
-                                                } else if !boundary_input_handled
-                                                    && let Some((updated, selection)) =
-                                                        source_update
-                                                {
-                                                    next_global_cursor = Some(CCursorRange::two(
-                                                        CCursor::new(
-                                                            block_char_start + selection.start,
-                                                        ),
-                                                        CCursor::new(
-                                                            block_char_start + selection.end,
-                                                        ),
-                                                    ));
-                                                    pending_edit =
-                                                        Some((edit_range.clone(), updated, kind));
-                                                } else if !boundary_input_handled
-                                                    && let Some(selection) = visual_selection_after
-                                                {
-                                                    let source_selection =
-                                                        source_selection_after_visual_input(
-                                                            &projection,
-                                                            &original_block,
-                                                            local_source_selection_before.as_ref(),
-                                                            visual_selection_before.as_ref(),
-                                                            selection,
-                                                        );
-                                                    let local_cursor = if let Some(visual_cursor) =
-                                                        visual_cursor_after
-                                                    {
-                                                        cursor_range_with_direction(
-                                                            source_selection,
-                                                            visual_cursor,
-                                                        )
-                                                    } else {
-                                                        CCursorRange::two(
-                                                            CCursor::new(source_selection.start),
-                                                            CCursor::new(source_selection.end),
-                                                        )
-                                                    };
-                                                    next_global_cursor = Some(cursor_range_add(
-                                                        local_cursor,
-                                                        block_char_start,
-                                                    ));
-                                                }
-                                            });
-                                            active_editor_rect = Some(editor_frame.response.rect);
-                                            if block_is_code {
-                                                code_surface_rect =
-                                                    Some(editor_frame.response.rect);
-                                                if let Some(region) = pointer_regions.last_mut()
-                                                    && region.block_id == block.id
-                                                {
-                                                    region.rect = editor_frame.response.rect;
-                                                }
-                                            }
-                                        } else {
-                                            ui.add_space(6.0);
-                                            let preview = show_native_block_preview(
-                                                ui,
-                                                preview_source,
-                                                &base_path,
-                                                dark,
-                                                &mut svg_cache.borrow_mut(),
-                                                palette,
-                                            );
-                                            ui.add_space(6.0);
-                                            let activation_id =
-                                                ui.make_persistent_id(("activate-block", block.id));
-                                            let response = ui
-                                                .interact(
-                                                    preview.rect,
-                                                    activation_id,
-                                                    egui::Sense::click_and_drag(),
-                                                )
-                                                .on_hover_text(format!(
-                                                    "点击编辑第 {} 行开始的 Markdown 块；Ctrl+点击打开链接",
-                                                    block.line
-                                                ));
-                                            set_markdown_preview_accessibility(
-                                                &response,
-                                                preview_source,
-                                            );
-                                            pointer_regions.push(HybridPointerRegion {
-                                                block_id: block.id,
-                                                source_range: block.range.clone(),
-                                                rect: preview.rect,
-                                                atomic_range: (block_is_code
-                                                    || preview.atomic
-                                                    || generated_preview.is_some())
-                                                .then(|| block.range.clone()),
-                                                mapping: preview.mapping.clone(),
-                                            });
-                                            if response.clicked() {
-                                                let local_source_byte = response
-                                                    .interact_pointer_pos()
-                                                    .map(|position| {
-                                                        preview.mapping.source_byte_at_position(
-                                                            preview_source,
-                                                            preview.rect,
-                                                            position,
-                                                        )
-                                                    })
-                                                    .unwrap_or_default();
-                                                let command_click =
-                                                    ui.input(|input| input.modifiers.command);
-                                                if generated_preview.is_none()
-                                                    && let Some(updated) =
-                                                        markdown::toggle_task_marker_at(
-                                                            source_block,
-                                                            local_source_byte,
-                                                        )
-                                                {
-                                                    pending_edit = Some((
-                                                        block.range.clone(),
-                                                        updated,
-                                                        EditKind::TaskList,
-                                                    ));
-                                                } else if command_click
-                                                    && let Some(destination) =
-                                                        markdown::link_destination_at(
-                                                            preview_source,
-                                                            local_source_byte,
-                                                        )
-                                                {
-                                                    clicked_destination = Some(destination);
-                                                } else {
-                                                    activate = Some((
-                                                        block.id,
-                                                        if generated_preview.is_some() {
-                                                            block.range.start
-                                                        } else {
-                                                            block.range.start + local_source_byte
-                                                        },
-                                                    ));
-                                                }
-                                            }
-                                            if block_is_code {
-                                                code_surface_rect = Some(preview.rect);
-                                            }
-                                        }
-                                    });
-                                    if let (Some(rect), Some(content)) =
-                                        (code_surface_rect, code_content)
-                                        && show_code_copy_button(
-                                            ui,
-                                            (document_id, block.id),
-                                            rect,
-                                            content,
-                                            palette,
-                                        )
-                                    {
-                                        copied_code_block = true;
-                                    }
-
-                                    if block_is_code {
-                                        let response = ui
-                                            .allocate_response(
-                                                Vec2::new(ui.available_width(), 24.0),
-                                                egui::Sense::click(),
-                                            )
-                                            .on_hover_cursor(egui::CursorIcon::Text)
-                                            .on_hover_text("双击在代码块后新建普通段落");
-                                        if response.hovered() {
-                                            ui.painter().text(
-                                                response.rect.center(),
-                                                egui::Align2::CENTER_CENTER,
-                                                "双击新建段落",
-                                                FontId::proportional(11.0),
-                                                palette.secondary.gamma_multiply(0.75),
-                                            );
-                                        }
-                                        if response.double_clicked() && pending_edit.is_none() {
-                                            let (tail_range, replacement, cursor) =
-                                                paragraph_after_code_double_click(
-                                                    &source,
-                                                    &blocks,
-                                                    block_index,
-                                                );
-                                            next_global_cursor =
-                                                Some(CCursorRange::one(CCursor::new(cursor)));
-                                            if let Some(replacement) = replacement {
-                                                pending_edit = Some((
-                                                    tail_range,
-                                                    replacement,
-                                                    EditKind::Typing,
-                                                ));
-                                            }
-                                            cursor_adjusted = true;
-                                        }
-                                    } else {
-                                        ui.add_space(8.0);
-                                    }
-                                    let measured_height =
-                                        (ui.next_widget_position().y - block_layout_start).max(1.0);
-                                    self.hybrid_block_heights
-                                        .insert(layout_key, measured_height);
-                                }
-                                ui.add_space(60.0);
-                            });
-                        });
-                    page_rect = Some(page.response.rect);
-                });
-                ui.add_space(40.0);
-            });
-
-        if copied_code_block {
-            self.status = "已复制代码块".to_owned();
-        }
-        if let Some(destination) = clicked_destination {
+        if let Some(destination) = output.destination {
             self.open_preview_destination(index, &destination);
         }
-
-        let pointer = ui.input(|input| {
-            (
-                input.pointer.primary_pressed(),
-                input.pointer.primary_released(),
-                input.pointer.primary_down(),
-                input.pointer.is_decidedly_dragging(),
-                input.pointer.press_origin(),
-                input.pointer.interact_pos(),
-            )
-        });
-        if pointer.0
-            && let Some(origin) = pointer.4
-            && let Some((block_id, source_char)) =
-                hybrid_pointer_hit(&source, &pointer_regions, origin)
-        {
-            self.hybrid_pointer_anchor = Some(HybridPointerAnchor {
-                document_id,
-                block_id,
-                source_char,
+        for command in output.commands {
+            self.execute(match command {
+                EditorCommand::PasteImage => AppCommand::PasteImage,
+                EditorCommand::EditTable => AppCommand::EditTable,
             });
-            self.hybrid_cross_selection = None;
         }
-        if pointer.2
-            && pointer.3
-            && let (Some(anchor), Some(position)) = (self.hybrid_pointer_anchor, pointer.5)
-            && anchor.document_id == document_id
-            && let Some((current_block, current_char)) =
-                hybrid_pointer_hit(&source, &pointer_regions, position)
-        {
-            if current_block != anchor.block_id {
-                let cursor = snap_atomic_cross_block_selection(
-                    &source,
-                    &blocks,
-                    anchor.block_id,
-                    anchor.source_char,
-                    current_block,
-                    current_char,
-                );
-                self.hybrid_cross_selection = Some(HybridCrossSelection {
-                    document_id,
-                    cursor,
-                });
-                next_global_cursor = Some(cursor);
-            } else if Some(current_block) != active_id
-                && anchor.source_char != current_char
-                && let Some(atomic) = pointer_regions
-                    .iter()
-                    .find(|region| region.block_id == current_block)
-                    .and_then(|region| region.atomic_range.clone())
-            {
-                let start = source[..atomic.start].chars().count();
-                let end = source[..atomic.end].chars().count();
-                let cursor = CCursorRange::two(CCursor::new(start), CCursor::new(end));
-                self.hybrid_cross_selection = Some(HybridCrossSelection {
-                    document_id,
-                    cursor,
-                });
-                next_global_cursor = Some(cursor);
-            } else {
-                self.hybrid_cross_selection = None;
-            }
-        }
-        if pointer.1 {
-            self.hybrid_pointer_anchor = None;
-        }
-        if let Some(selection) = self
-            .hybrid_cross_selection
-            .filter(|selection| selection.document_id == document_id)
-        {
-            next_global_cursor = Some(selection.cursor);
-            paint_hybrid_cross_selection(ui, &source, &pointer_regions, selection.cursor);
-        }
+    }
 
-        let deactivate = ui.input(|input| {
-            input.key_pressed(Key::Escape)
-                || input.pointer.any_click()
-                    && input.pointer.interact_pos().is_some_and(|position| {
-                        page_rect.is_some_and(|rect| rect.contains(position))
-                            && active_editor_rect.is_some_and(|rect| !rect.contains(position))
-                    })
-        });
-
-        if let Some(cursor_range) = next_global_cursor {
-            self.editor_cursor = Some(cursor_range);
-        }
-        if let Some((range, replacement, kind)) = pending_edit {
-            self.documents[index]
-                .content
-                .replace_range(range.clone(), &replacement);
-            let selection_after = next_global_cursor.map(cursor_range_to_char_range);
-            self.documents[index].record_edit(
-                source.clone(),
-                selection_before,
-                selection_after,
-                kind,
-            );
-            let cursor_block_id = next_global_cursor.map(|cursor_range| {
-                let cursor = cursor_range.sorted_cursors()[1].index.0;
-                let updated_source = self.documents[index].content.clone();
-                let updated_blocks = self.documents[index].blocks().to_vec();
-                block_for_char_index(&updated_source, &updated_blocks, cursor).id
-            });
-            if let Some(next_active_id) = cursor_block_id.or(active_id) {
-                self.hybrid_active = Some((index, next_active_id));
-                if cursor_block_id != active_id {
-                    self.pending_editor_cursor = next_global_cursor;
-                }
-            }
-            if !copied_code_block {
-                self.status = if kind == EditKind::TaskList {
-                    "已更新任务列表"
-                } else {
-                    "已更新当前 Markdown 块"
-                }
-                .to_owned();
-            }
-        }
-        if cursor_adjusted {
-            self.pending_editor_cursor = next_global_cursor;
-        }
-        if deactivate && self.hybrid_cross_selection.is_none() {
-            self.hybrid_active = None;
-            ime_session = None;
-        }
-        if let Some((id, start)) = activate {
-            let char_start = source[..start].chars().count();
-            self.hybrid_active = Some((index, id));
-            ime_session = None;
-            self.queue_editor_selection(char_start..char_start);
-        }
-        self.hybrid_ime_session = ime_session;
+    #[cfg(test)]
+    fn hybrid_pane(&mut self, ui: &mut Ui, index: usize) {
+        self.show_editor_pane(ui, index, ViewMode::Hybrid);
+    }
+    #[cfg(test)]
+    fn edit_pane(&mut self, ui: &mut Ui, index: usize, _offset: Option<f32>) {
+        self.show_editor_pane(ui, index, ViewMode::Edit);
+    }
+    #[cfg(test)]
+    fn preview_pane(&mut self, ui: &mut Ui, index: usize, _offset: Option<f32>) {
+        self.show_editor_pane(ui, index, ViewMode::Preview);
     }
 
     fn preview_base_path(&self, index: usize) -> PathBuf {
-        self.documents[index]
+        self.session[index]
             .path
             .as_deref()
             .and_then(Path::parent)
@@ -4525,7 +2781,7 @@ impl RuporaApp {
             return;
         };
         let link_path = PathBuf::from(path_part);
-        let base = self.documents[index]
+        let base = self.session[index]
             .path
             .as_deref()
             .and_then(Path::parent)
@@ -4554,7 +2810,7 @@ impl RuporaApp {
             let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
             self.open_paths([resolved]);
             if let Some(fragment) = fragment
-                && let Some(target_index) = self.documents.iter().position(|document| {
+                && let Some(target_index) = self.session.documents().iter().position(|document| {
                     document.path.as_ref().is_some_and(|path| {
                         path.canonicalize().unwrap_or_else(|_| path.clone()) == canonical
                     })
@@ -4568,12 +2824,12 @@ impl RuporaApp {
     }
 
     fn jump_to_anchor(&mut self, index: usize, anchor: &str) {
-        let target = markdown::heading_anchors(&self.documents[index].content)
+        let target = markdown::heading_anchors(&self.session[index].content)
             .into_iter()
             .find(|heading| heading.id == anchor);
         if let Some(target) = target {
             self.activate_document(index);
-            let source = &self.documents[index].content;
+            let source = &self.session[index].content;
             let byte = line_start_byte(source, target.heading.line);
             let cursor = source[..byte].chars().count();
             self.queue_editor_selection(cursor..cursor);
@@ -4585,8 +2841,9 @@ impl RuporaApp {
 
     fn status_bar(&mut self, root: &mut Ui) {
         let document_info = self
-            .active
-            .and_then(|index| self.documents.get(index))
+            .session
+            .active_index()
+            .and_then(|index| self.session.documents().get(index))
             .map(|document| {
                 format!(
                     "{} 字符 · {} 词 · {} 行 · {} · {}",
@@ -4603,16 +2860,14 @@ impl RuporaApp {
         let source_mode = self.state.view_mode == ViewMode::Edit;
         let mut toggle_source_mode = false;
         Panel::bottom("status")
-            .exact_size(31.0)
+            .exact_size(30.0)
             .frame(
                 egui::Frame::new()
-                    .fill(palette.toolbar)
-                    .inner_margin(Margin::symmetric(10, 4))
-                    .stroke(Stroke::new(1.0, palette.border)),
+                    .fill(palette.canvas)
+                    .inner_margin(Margin::symmetric(18, 4)),
             )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("●").size(8.0).color(palette.accent));
                     ui.label(RichText::new(&self.status).small().color(palette.secondary));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
@@ -4660,7 +2915,12 @@ impl RuporaApp {
         if self.allow_close || !ctx.input(|input| input.viewport().close_requested()) {
             return;
         }
-        if !self.documents.iter().any(|document| document.dirty) {
+        if !self
+            .session
+            .documents()
+            .iter()
+            .any(|document| document.dirty)
+        {
             self.allow_close = true;
             return;
         }
@@ -4683,15 +2943,14 @@ impl RuporaApp {
 impl eframe::App for RuporaApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut Frame) {
         ctx.request_repaint_after(Duration::from_millis(500));
-        for document in &mut self.documents {
+        for document in self.session.documents_mut() {
             document.refresh_derived_state_if_idle(Duration::from_millis(120));
             if document.derived_state_is_stale() {
                 ctx.request_repaint_after(Duration::from_millis(40));
             }
         }
         self.poll_instance_requests(ctx);
-        self.poll_update_check();
-        self.poll_extension();
+        self.poll_background();
         self.handle_shortcuts(ctx);
         self.handle_dropped_files(ctx);
         self.save_recovery_snapshot_if_due();
@@ -4718,1451 +2977,35 @@ impl eframe::App for RuporaApp {
     fn save(&mut self, storage: &mut dyn Storage) {
         self.store_active_view_state();
         self.state.session_files = self
-            .documents
+            .session
+            .documents()
             .iter()
             .filter_map(|document| document.path.clone())
             .collect();
         self.state.active_session_file = self
-            .active
-            .and_then(|index| self.documents.get(index))
+            .session
+            .active_index()
+            .and_then(|index| self.session.documents().get(index))
             .and_then(|document| document.path.clone());
         eframe::set_value(storage, APP_STATE_KEY, &self.state);
         eframe::set_value(storage, UI_EXPERIENCE_KEY, &CURRENT_UI_EXPERIENCE);
-        let _ = self.recovery_store.save(&self.documents);
+        let _ = self.recovery_store.save(self.session.documents());
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if self.discard_recovery_on_exit || self.documents.iter().all(|document| !document.dirty) {
+        if self.discard_recovery_on_exit
+            || self
+                .session
+                .documents()
+                .iter()
+                .all(|document| !document.dirty)
+        {
             let _ = self.recovery_store.clear();
         } else {
-            let _ = self.recovery_store.save(&self.documents);
+            let _ = self.recovery_store.save(self.session.documents());
         }
         diagnostics::append_event("INFO", "RUPORA exited normally").ok();
     }
-}
-
-#[derive(Clone, Copy)]
-enum AppIcon {
-    New,
-    Folder,
-    Save,
-    Sidebar,
-    Outline,
-    Theme,
-    Source,
-    File,
-    Close,
-}
-
-impl AppIcon {
-    const fn accessible_label(self) -> &'static str {
-        match self {
-            Self::New => "新建",
-            Self::Folder => "打开",
-            Self::Save => "保存",
-            Self::Sidebar => "资源管理器",
-            Self::Outline => "文档大纲",
-            Self::Theme => "切换主题",
-            Self::Source => "源码 / 所见即所得",
-            Self::File => "Markdown 文档",
-            Self::Close => "关闭",
-        }
-    }
-}
-
-struct AppIconButton {
-    icon: AppIcon,
-    selected: bool,
-    palette: AppPalette,
-    size: f32,
-}
-
-impl egui::Widget for AppIconButton {
-    fn ui(self, ui: &mut Ui) -> egui::Response {
-        let (rect, response) = ui.allocate_exact_size(Vec2::splat(self.size), egui::Sense::click());
-        let enabled = ui.is_enabled();
-        let fill = if self.selected {
-            self.palette.accent_soft
-        } else if response.hovered() && enabled {
-            self.palette.hover
-        } else {
-            Color32::TRANSPARENT
-        };
-        ui.painter().rect_filled(rect, 6.0, fill);
-        let color = if !enabled {
-            self.palette.secondary.gamma_multiply(0.45)
-        } else if self.selected {
-            self.palette.accent
-        } else {
-            self.palette.secondary
-        };
-        paint_app_icon(
-            ui.painter(),
-            rect.shrink(self.size * 0.25),
-            self.icon,
-            color,
-        );
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::WidgetType::Button,
-                enabled,
-                self.icon.accessible_label(),
-            )
-        });
-        response
-    }
-}
-
-fn icon_button_widget(icon: AppIcon, selected: bool, palette: AppPalette) -> AppIconButton {
-    AppIconButton {
-        icon,
-        selected,
-        palette,
-        size: 30.0,
-    }
-}
-
-fn app_icon_button(
-    ui: &mut Ui,
-    icon: AppIcon,
-    selected: bool,
-    tooltip: &str,
-    palette: AppPalette,
-) -> egui::Response {
-    ui.add(icon_button_widget(icon, selected, palette))
-        .on_hover_text(tooltip)
-}
-
-fn paint_app_icon(painter: &egui::Painter, rect: egui::Rect, icon: AppIcon, color: Color32) {
-    let stroke = Stroke::new(1.45, color);
-    let center = rect.center();
-    let left = rect.left();
-    let right = rect.right();
-    let top = rect.top();
-    let bottom = rect.bottom();
-    match icon {
-        AppIcon::New => {
-            painter.line_segment(
-                [egui::pos2(left, center.y), egui::pos2(right, center.y)],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(center.x, top), egui::pos2(center.x, bottom)],
-                stroke,
-            );
-        }
-        AppIcon::Folder => {
-            painter.add(egui::Shape::closed_line(
-                vec![
-                    egui::pos2(left, top + 3.0),
-                    egui::pos2(left + 5.0, top + 3.0),
-                    egui::pos2(left + 7.0, top + 5.0),
-                    egui::pos2(right, top + 5.0),
-                    egui::pos2(right, bottom - 1.0),
-                    egui::pos2(left, bottom - 1.0),
-                ],
-                stroke,
-            ));
-        }
-        AppIcon::Save => {
-            painter.add(egui::Shape::closed_line(
-                vec![
-                    egui::pos2(left + 1.0, top),
-                    egui::pos2(right - 2.0, top),
-                    egui::pos2(right, top + 2.0),
-                    egui::pos2(right, bottom),
-                    egui::pos2(left + 1.0, bottom),
-                ],
-                stroke,
-            ));
-            painter.line_segment(
-                [
-                    egui::pos2(left + 4.0, top),
-                    egui::pos2(left + 4.0, top + 5.0),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(left + 4.0, bottom - 4.0),
-                    egui::pos2(right - 3.0, bottom - 4.0),
-                ],
-                stroke,
-            );
-        }
-        AppIcon::Sidebar => {
-            painter.add(egui::Shape::closed_line(
-                vec![
-                    egui::pos2(left, top),
-                    egui::pos2(right, top),
-                    egui::pos2(right, bottom),
-                    egui::pos2(left, bottom),
-                ],
-                stroke,
-            ));
-            painter.line_segment(
-                [egui::pos2(left + 4.5, top), egui::pos2(left + 4.5, bottom)],
-                stroke,
-            );
-        }
-        AppIcon::Outline => {
-            for row in 0..3 {
-                let y = top + 2.0 + row as f32 * 5.0;
-                painter.circle_filled(egui::pos2(left + 1.5, y), 1.15, color);
-                painter.line_segment([egui::pos2(left + 5.0, y), egui::pos2(right, y)], stroke);
-            }
-        }
-        AppIcon::Theme => {
-            painter.circle_stroke(center, 3.3, stroke);
-            for index in 0..8 {
-                let angle = index as f32 * std::f32::consts::TAU / 8.0;
-                let direction = egui::vec2(angle.cos(), angle.sin());
-                painter.line_segment([center + direction * 5.3, center + direction * 7.0], stroke);
-            }
-        }
-        AppIcon::Source => {
-            painter.line_segment(
-                [
-                    egui::pos2(center.x - 2.0, top + 1.5),
-                    egui::pos2(left, center.y),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(left, center.y),
-                    egui::pos2(center.x - 2.0, bottom - 1.5),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(center.x + 2.0, top + 1.5),
-                    egui::pos2(right, center.y),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(right, center.y),
-                    egui::pos2(center.x + 2.0, bottom - 1.5),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(center.x + 1.5, top),
-                    egui::pos2(center.x - 1.5, bottom),
-                ],
-                stroke,
-            );
-        }
-        AppIcon::File => {
-            painter.add(egui::Shape::line(
-                vec![
-                    egui::pos2(left + 2.0, top),
-                    egui::pos2(right - 4.0, top),
-                    egui::pos2(right, top + 4.0),
-                    egui::pos2(right, bottom),
-                    egui::pos2(left + 2.0, bottom),
-                    egui::pos2(left + 2.0, top),
-                ],
-                stroke,
-            ));
-            painter.line_segment(
-                [
-                    egui::pos2(right - 4.0, top),
-                    egui::pos2(right - 4.0, top + 4.0),
-                ],
-                stroke,
-            );
-        }
-        AppIcon::Close => {
-            painter.line_segment(
-                [
-                    egui::pos2(left + 2.0, top + 2.0),
-                    egui::pos2(right - 2.0, bottom - 2.0),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(right - 2.0, top + 2.0),
-                    egui::pos2(left + 2.0, bottom - 2.0),
-                ],
-                stroke,
-            );
-        }
-    }
-}
-
-fn outline_row(ui: &mut Ui, heading: &Heading) -> bool {
-    let indent = (heading.level.saturating_sub(1) as f32) * 12.0;
-    ui.horizontal(|ui| {
-        ui.add_space(indent);
-        ui.selectable_label(false, &heading.text)
-            .on_hover_text(format!("第 {} 行 · H{}", heading.line, heading.level))
-            .clicked()
-    })
-    .inner
-}
-
-fn block_for_char_index<'a>(
-    source: &str,
-    blocks: &'a [markdown::MarkdownBlock],
-    char_index: usize,
-) -> &'a markdown::MarkdownBlock {
-    let byte_index = source
-        .char_indices()
-        .nth(char_index)
-        .map_or(source.len(), |(index, _)| index);
-    blocks
-        .iter()
-        .find(|block| {
-            (block.range.start..block.range.end).contains(&byte_index)
-                || (block.range.is_empty() && block.range.start == byte_index)
-        })
-        // Inter-block whitespace belongs to the preceding block's editable
-        // range. Keeping the cursor there prevents a queued blank-line click
-        // from being clamped to the beginning of the following paragraph on
-        // the next frame. An exact next-block start was handled above.
-        .or_else(|| {
-            blocks
-                .iter()
-                .rev()
-                .find(|block| block.range.start < byte_index)
-        })
-        .or_else(|| blocks.iter().find(|block| block.range.start >= byte_index))
-        .unwrap_or_else(|| blocks.last().expect("Markdown always has an editing block"))
-}
-
-fn cursor_range_to_char_range(range: CCursorRange) -> std::ops::Range<usize> {
-    let [start, end] = range.sorted_cursors();
-    start.index.0..end.index.0
-}
-
-fn cursor_range_saturating_sub(range: CCursorRange, offset: usize) -> CCursorRange {
-    CCursorRange {
-        primary: CCursor {
-            index: range.primary.index.saturating_sub(offset),
-            prefer_next_row: range.primary.prefer_next_row,
-        },
-        secondary: CCursor {
-            index: range.secondary.index.saturating_sub(offset),
-            prefer_next_row: range.secondary.prefer_next_row,
-        },
-        h_pos: range.h_pos,
-    }
-}
-
-fn cursor_range_add(range: CCursorRange, offset: usize) -> CCursorRange {
-    CCursorRange {
-        primary: range.primary + offset,
-        secondary: range.secondary + offset,
-        h_pos: range.h_pos,
-    }
-}
-
-fn cursor_range_with_direction(
-    sorted: std::ops::Range<usize>,
-    direction: CCursorRange,
-) -> CCursorRange {
-    if direction.primary.index >= direction.secondary.index {
-        CCursorRange::two(CCursor::new(sorted.start), CCursor::new(sorted.end))
-    } else {
-        CCursorRange::two(CCursor::new(sorted.end), CCursor::new(sorted.start))
-    }
-}
-
-fn text_edit_cursor_after_input(output: &egui::text_edit::TextEditOutput) -> Option<CCursorRange> {
-    if output.response.clicked() || output.response.dragged() {
-        // Pointer interaction happens after `cursor_range` is captured. For
-        // clicks and drag-selection the stored state is therefore newer, even
-        // if another event also changed text in the same frame.
-        output
-            .state
-            .cursor
-            .range(&output.galley)
-            .or(output.cursor_range)
-    } else if output.response.changed() {
-        // With hint text, egui 0.35 deliberately returns the pre-input empty
-        // galley for the first keystroke. Resolving `state.cursor` against that
-        // stale galley collapses the freshly advanced cursor back to zero, so
-        // the next frame inserts before the Markdown marker. The public range
-        // is the authoritative post-keyboard-edit cursor in this case.
-        output
-            .cursor_range
-            .or_else(|| output.state.cursor.range(&output.galley))
-    } else {
-        output
-            .state
-            .cursor
-            .range(&output.galley)
-            .or(output.cursor_range)
-    }
-}
-
-fn text_edit_cursor_at_position(
-    output: &egui::text_edit::TextEditOutput,
-    position: egui::Pos2,
-) -> CCursor {
-    output
-        .galley
-        .cursor_from_pos(position - output.galley_pos + egui::vec2(output.galley.rect.left(), 0.0))
-}
-
-fn source_selection_after_visual_input(
-    projection: &VisualProjection,
-    source: &str,
-    previous_source_selection: Option<&std::ops::Range<usize>>,
-    previous_visual_selection: Option<&std::ops::Range<usize>>,
-    visual_selection: std::ops::Range<usize>,
-) -> std::ops::Range<usize> {
-    if previous_visual_selection == Some(&visual_selection)
-        && let Some(previous) = previous_source_selection
-        && previous.end <= source.chars().count()
-        && projection.visual_char_range(source, previous.clone()) == visual_selection
-    {
-        return previous.clone();
-    }
-    projection.source_char_range(source, visual_selection)
-}
-
-fn line_break_before(source: &str, byte_index: usize) -> Option<std::ops::Range<usize>> {
-    let before = source.get(..byte_index)?;
-    if before.ends_with("\r\n") {
-        Some(byte_index - 2..byte_index)
-    } else if before.ends_with(['\n', '\r']) {
-        Some(byte_index - 1..byte_index)
-    } else {
-        None
-    }
-}
-
-fn boundary_backspace_edit(
-    source: &str,
-    edit_range: std::ops::Range<usize>,
-) -> Option<(std::ops::Range<usize>, usize)> {
-    let line_break = line_break_before(source, edit_range.start)?;
-    let cursor = source[..line_break.start].chars().count();
-    Some((line_break.start..edit_range.end, cursor))
-}
-
-fn code_block_removal_range(
-    source: &str,
-    blocks: &[markdown::MarkdownBlock],
-    block_index: usize,
-) -> std::ops::Range<usize> {
-    let block = &blocks[block_index];
-    if let Some(next) = blocks.get(block_index + 1) {
-        if next.range.is_empty() {
-            block.range.start..source.len()
-        } else {
-            block.range.start..next.range.start
-        }
-    } else if let Some(previous) = block_index
-        .checked_sub(1)
-        .and_then(|index| blocks.get(index))
-    {
-        previous.range.end..block.range.end
-    } else {
-        block.range.start..block.range.end.min(source.len())
-    }
-}
-
-fn selected_markdown_for_clipboard(selected: &str) -> String {
-    selected
-        .trim_end_matches(['\r', '\n'])
-        .trim_end()
-        .to_owned()
-}
-
-fn paragraph_after_code_double_click(
-    source: &str,
-    blocks: &[markdown::MarkdownBlock],
-    block_index: usize,
-) -> (std::ops::Range<usize>, Option<String>, usize) {
-    let block = &blocks[block_index];
-    if let Some(next) = blocks.get(block_index + 1)
-        && !next.range.is_empty()
-    {
-        let cursor = source[..next.range.start].chars().count();
-        return (next.range.start..next.range.start, None, cursor);
-    }
-
-    let tail_range = block.range.start..source.len();
-    let mut replacement = source[tail_range.clone()].to_owned();
-    let local_selection = paragraph_after_fenced_code(&mut replacement)
-        .expect("a complete fenced block must expose a trailing paragraph");
-    let cursor = source[..tail_range.start].chars().count() + local_selection.end;
-    let changed = (replacement != source[tail_range.clone()]).then_some(replacement);
-    (tail_range, changed, cursor)
-}
-
-fn scroll_ratio(scroll: PaneScroll) -> f32 {
-    if scroll.maximum <= f32::EPSILON {
-        0.0
-    } else {
-        (scroll.offset / scroll.maximum).clamp(0.0, 1.0)
-    }
-}
-
-fn is_fenced_code_block(source: &str) -> bool {
-    let first_line = source.lines().next().unwrap_or_default();
-    let indentation = first_line.bytes().take_while(|byte| *byte == b' ').count();
-    if indentation > 3 || first_line.as_bytes().get(indentation) == Some(&b'\t') {
-        return false;
-    }
-    let marker = &first_line[indentation..];
-    marker.starts_with("```") || marker.starts_with("~~~")
-}
-
-fn hybrid_edit_range(
-    source: &str,
-    blocks: &[markdown::MarkdownBlock],
-    active_id: BlockId,
-) -> std::ops::Range<usize> {
-    let index = blocks
-        .iter()
-        .position(|block| block.id == active_id)
-        .expect("active Markdown block must still exist");
-    let start = blocks[index].range.start;
-    let end = blocks
-        .get(index + 1)
-        .map_or(source.len(), |block| block.range.start);
-    start..end
-}
-
-fn snap_atomic_cross_block_selection(
-    source: &str,
-    blocks: &[markdown::MarkdownBlock],
-    anchor_block: BlockId,
-    anchor_char: usize,
-    current_block: BlockId,
-    current_char: usize,
-) -> CCursorRange {
-    let snap = |block_id: BlockId, cursor: usize, lower_endpoint: bool| {
-        let Some(block) = blocks.iter().find(|block| block.id == block_id) else {
-            return cursor;
-        };
-        let Some(block_source) = source.get(block.range.clone()) else {
-            return cursor;
-        };
-        if !is_fenced_code_block(block_source) {
-            return cursor;
-        }
-        let boundary = if lower_endpoint {
-            block.range.start
-        } else {
-            block.range.end
-        };
-        source[..boundary].chars().count()
-    };
-
-    let forward = anchor_char <= current_char;
-    let snapped_anchor = snap(anchor_block, anchor_char, forward);
-    let snapped_current = snap(current_block, current_char, !forward);
-    CCursorRange {
-        primary: CCursor::new(snapped_current),
-        secondary: CCursor::new(snapped_anchor),
-        h_pos: None,
-    }
-}
-
-fn multiline_edit_rows(source: &str) -> usize {
-    source.bytes().filter(|byte| *byte == b'\n').count() + 1
-}
-
-fn extra_inter_block_blank_lines(source: &str, gap: std::ops::Range<usize>) -> usize {
-    line_break_count(source, gap).saturating_sub(2)
-}
-
-fn inter_block_blank_line_cursor_byte(
-    source: &str,
-    gap: std::ops::Range<usize>,
-    blank_line: usize,
-) -> Option<usize> {
-    // Two line breaks are the normal Markdown paragraph separator. Each
-    // additional visible blank row starts after the second, third, … break.
-    nth_line_break_end(source, gap, blank_line.saturating_add(1))
-}
-
-fn line_break_count(source: &str, range: std::ops::Range<usize>) -> usize {
-    let Some(fragment) = source.get(range) else {
-        return 0;
-    };
-    let bytes = fragment.as_bytes();
-    let mut cursor = 0usize;
-    let mut count = 0usize;
-    while cursor < bytes.len() {
-        match bytes[cursor] {
-            b'\r' => {
-                cursor += usize::from(bytes.get(cursor + 1) == Some(&b'\n')) + 1;
-                count += 1;
-            }
-            b'\n' => {
-                cursor += 1;
-                count += 1;
-            }
-            _ => cursor += 1,
-        }
-    }
-    count
-}
-
-fn nth_line_break_end(source: &str, range: std::ops::Range<usize>, target: usize) -> Option<usize> {
-    let fragment = source.get(range.clone())?;
-    let bytes = fragment.as_bytes();
-    let mut cursor = 0usize;
-    let mut index = 0usize;
-    while cursor < bytes.len() {
-        let length = match bytes[cursor] {
-            b'\r' if bytes.get(cursor + 1) == Some(&b'\n') => 2,
-            b'\r' | b'\n' => 1,
-            _ => {
-                cursor += 1;
-                continue;
-            }
-        };
-        cursor += length;
-        if index == target {
-            return Some(range.start + cursor);
-        }
-        index += 1;
-    }
-    None
-}
-
-fn wysiwyg_layout(
-    ui: &Ui,
-    text: &str,
-    projection: &VisualProjection,
-    wrap_width: f32,
-    palette: AppPalette,
-    inline_code_chips: bool,
-) -> Arc<egui::Galley> {
-    let runs = projection.runs_for(text);
-    if runs.is_empty() {
-        let mut job = LayoutJob::simple(
-            text.to_owned(),
-            FontId::new(14.0, FontFamily::Proportional),
-            palette.text,
-            wrap_width,
-        );
-        job.keep_trailing_whitespace = true;
-        return ui.fonts_mut(|fonts| fonts.layout_job(job));
-    }
-
-    let mut job = LayoutJob::default();
-    job.wrap.max_width = wrap_width;
-    job.keep_trailing_whitespace = true;
-    let mut previous_was_inline_code = false;
-    for run in runs {
-        let start = char_to_byte(text, run.range.start);
-        let end = char_to_byte(text, run.range.end);
-        let format = visual_text_format(run.style, palette);
-        let is_inline_code = inline_code_chips && run.style.code && !run.style.marker;
-        let leading_space = if is_inline_code != previous_was_inline_code {
-            3.0
-        } else {
-            0.0
-        };
-        job.append(&text[start..end], leading_space, format);
-        previous_was_inline_code = is_inline_code;
-    }
-    ui.fonts_mut(|fonts| fonts.layout_job(job))
-}
-
-fn syntax_highlighted_code_layout(
-    ui: &Ui,
-    text: &str,
-    wrap_width: f32,
-    palette: AppPalette,
-    language: Option<&str>,
-) -> Arc<egui::Galley> {
-    crate::code_highlight::layout(
-        ui,
-        text,
-        wrap_width,
-        crate::code_highlight::CodePalette {
-            plain: palette.text,
-            keyword: palette.code_keyword,
-            string: palette.code_string,
-            comment: palette.code_comment,
-            number: palette.code_number,
-        },
-        language,
-    )
-}
-
-fn rounded_inline_code_backgrounds(
-    galley: &egui::Galley,
-    galley_pos: egui::Pos2,
-    runs: &[crate::wysiwyg::VisualRun],
-    palette: AppPalette,
-) -> Vec<egui::Shape> {
-    let mut shapes = Vec::new();
-    let mut char_index = 0usize;
-    let mut run_index = 0usize;
-
-    for placed_row in &galley.rows {
-        let row_offset = galley_pos.to_vec2() + placed_row.pos.to_vec2();
-        let mut chip_rect = None;
-        for glyph in &placed_row.glyphs {
-            while runs
-                .get(run_index)
-                .is_some_and(|run| run.range.end <= char_index)
-            {
-                run_index += 1;
-            }
-            let is_inline_code = runs.get(run_index).is_some_and(|run| {
-                run.range.contains(&char_index) && run.style.code && !run.style.marker
-            });
-            if is_inline_code {
-                let rect = glyph.logical_rect().translate(row_offset);
-                chip_rect = Some(chip_rect.map_or(rect, |current: egui::Rect| current.union(rect)));
-            } else {
-                push_inline_code_background(&mut shapes, chip_rect.take(), palette);
-            }
-            char_index += 1;
-        }
-        push_inline_code_background(&mut shapes, chip_rect.take(), palette);
-        if placed_row.ends_with_newline {
-            char_index += 1;
-        }
-    }
-    shapes
-}
-
-#[derive(Clone)]
-struct TextProjectionPreview {
-    rect: egui::Rect,
-    galley: Arc<egui::Galley>,
-    galley_pos: egui::Pos2,
-    projection: VisualProjection,
-}
-
-impl TextProjectionPreview {
-    fn source_byte_at_position(&self, source: &str, position: egui::Pos2) -> usize {
-        let cursor = self
-            .galley
-            .cursor_from_pos(position - self.galley_pos + egui::vec2(self.galley.rect.left(), 0.0));
-        let visual_index = cursor.index.0;
-        let source_index = self
-            .projection
-            .source_char_range(source, visual_index..visual_index)
-            .start;
-        char_to_byte(source, source_index)
-    }
-}
-
-#[derive(Clone)]
-enum NativePointerMapping {
-    Text(TextProjectionPreview),
-    Atomic {
-        source_range: std::ops::Range<usize>,
-    },
-}
-
-impl NativePointerMapping {
-    fn source_byte_at_position(
-        &self,
-        source: &str,
-        rect: egui::Rect,
-        position: egui::Pos2,
-    ) -> usize {
-        match self {
-            Self::Text(preview) => preview.source_byte_at_position(source, position),
-            Self::Atomic { source_range } => {
-                if position.y < rect.center().y
-                    || (position.y == rect.center().y && position.x < rect.center().x)
-                {
-                    source_range.start
-                } else {
-                    source_range.end
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-struct NativeBlockPreview {
-    rect: egui::Rect,
-    mapping: NativePointerMapping,
-    atomic: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct HybridBlockLayoutKey {
-    document_id: u64,
-    block_id: BlockId,
-    width: u16,
-    dark: bool,
-}
-
-#[derive(Clone)]
-struct HybridPointerRegion {
-    block_id: BlockId,
-    source_range: std::ops::Range<usize>,
-    rect: egui::Rect,
-    atomic_range: Option<std::ops::Range<usize>>,
-    mapping: NativePointerMapping,
-}
-
-impl HybridPointerRegion {
-    fn source_char_at_position(&self, source: &str, position: egui::Pos2) -> Option<usize> {
-        let block_source = source.get(self.source_range.clone())?;
-        let local_byte = self
-            .mapping
-            .source_byte_at_position(block_source, self.rect, position);
-        let byte = (self.source_range.start + local_byte).min(source.len());
-        Some(source[..byte].chars().count())
-    }
-}
-
-fn hybrid_pointer_hit(
-    source: &str,
-    regions: &[HybridPointerRegion],
-    position: egui::Pos2,
-) -> Option<(BlockId, usize)> {
-    regions
-        .iter()
-        .filter(|region| region.rect.expand(3.0).contains(position))
-        .min_by(|left, right| {
-            pointer_rect_distance(left.rect, position)
-                .total_cmp(&pointer_rect_distance(right.rect, position))
-                .then_with(|| {
-                    left.rect
-                        .center()
-                        .distance_sq(position)
-                        .total_cmp(&right.rect.center().distance_sq(position))
-                })
-        })
-        .and_then(|region| {
-            region
-                .source_char_at_position(source, position)
-                .map(|cursor| (region.block_id, cursor))
-        })
-}
-
-fn pointer_rect_distance(rect: egui::Rect, position: egui::Pos2) -> f32 {
-    let horizontal = if position.x < rect.left() {
-        rect.left() - position.x
-    } else if position.x > rect.right() {
-        position.x - rect.right()
-    } else {
-        0.0
-    };
-    let vertical = if position.y < rect.top() {
-        rect.top() - position.y
-    } else if position.y > rect.bottom() {
-        position.y - rect.bottom()
-    } else {
-        0.0
-    };
-    horizontal.mul_add(horizontal, vertical * vertical)
-}
-
-fn estimated_hybrid_block_height(source: &str, width: f32, fenced_code: bool) -> f32 {
-    let characters_per_row = (width / if fenced_code { 8.4 } else { 7.6 })
-        .floor()
-        .max(12.0) as usize;
-    let visual_rows = source
-        .lines()
-        .map(|line| line.chars().count().max(1).div_ceil(characters_per_row))
-        .sum::<usize>()
-        .max(1);
-    let trimmed = source.trim_start();
-    if trimmed.starts_with("![") {
-        360.0
-    } else if fenced_code {
-        visual_rows as f32 * 19.0 + 72.0
-    } else if trimmed.starts_with('|') && source.lines().count() >= 2 {
-        visual_rows as f32 * 30.0 + 24.0
-    } else if trimmed.starts_with('#') {
-        visual_rows as f32 * 38.0 + 18.0
-    } else {
-        visual_rows as f32 * 22.0 + 20.0
-    }
-}
-
-fn paint_hybrid_cross_selection(
-    ui: &Ui,
-    source: &str,
-    regions: &[HybridPointerRegion],
-    cursor: CCursorRange,
-) {
-    let selection = cursor_range_to_char_range(cursor);
-    if selection.is_empty() {
-        return;
-    }
-    for region in regions {
-        let Some(local_source) = hybrid_region_selection(source, &region.source_range, &selection)
-        else {
-            continue;
-        };
-        let block_source = &source[region.source_range.clone()];
-        let fully_selects_atomic_block = region.atomic_range.as_ref().is_some_and(|atomic| {
-            let start = source[..atomic.start].chars().count();
-            let end = source[..atomic.end].chars().count();
-            selection.start <= start && selection.end >= end
-        });
-        if fully_selects_atomic_block {
-            ui.painter().rect_filled(
-                region.rect,
-                8.0,
-                ui.visuals().selection.bg_fill.gamma_multiply(0.32),
-            );
-            continue;
-        }
-        let NativePointerMapping::Text(preview) = &region.mapping else {
-            continue;
-        };
-        let visual = preview
-            .projection
-            .visual_char_range(block_source, local_source);
-        if visual.is_empty() {
-            continue;
-        }
-        let mut galley = Arc::clone(&preview.galley);
-        egui::text_selection::visuals::paint_text_selection(
-            &mut galley,
-            ui.visuals(),
-            &CCursorRange::two(CCursor::new(visual.start), CCursor::new(visual.end)),
-            None,
-        );
-        ui.painter()
-            .galley(preview.galley_pos, galley, ui.visuals().text_color());
-    }
-}
-
-fn hybrid_region_selection(
-    source: &str,
-    region: &std::ops::Range<usize>,
-    selection: &std::ops::Range<usize>,
-) -> Option<std::ops::Range<usize>> {
-    let region_start = source.get(..region.start)?.chars().count();
-    let region_end = source.get(..region.end)?.chars().count();
-    let start = selection.start.max(region_start);
-    let end = selection.end.min(region_end);
-    (start < end).then_some(start - region_start..end - region_start)
-}
-
-fn show_code_copy_button(
-    ui: &mut Ui,
-    id_source: (u64, BlockId),
-    code_rect: egui::Rect,
-    content: &str,
-    palette: AppPalette,
-) -> bool {
-    let id = ui.make_persistent_id(("copy-wysiwyg-code", id_source));
-    let now = ui.input(|input| input.time);
-    let copied_at = ui.data(|data| data.get_temp::<f64>(id));
-    let recently_copied = copied_at.is_some_and(|copied_at| now - copied_at < 1.6);
-    if recently_copied {
-        ui.ctx().request_repaint_after(Duration::from_millis(100));
-    }
-
-    let size = Vec2::new(if recently_copied { 76.0 } else { 54.0 }, 25.0);
-    let rect = egui::Rect::from_min_size(
-        egui::pos2(code_rect.right() - size.x - 8.0, code_rect.top() + 8.0),
-        size,
-    );
-    let label = if recently_copied {
-        "✓ 已复制"
-    } else {
-        "复制"
-    };
-    let response = ui.put(
-        rect,
-        Button::new(RichText::new(label).size(11.0).color(palette.text))
-            .fill(palette.surface.gamma_multiply(0.94))
-            .stroke(Stroke::new(1.0, palette.border))
-            .corner_radius(5),
-    );
-    if !response.clicked() {
-        return false;
-    }
-
-    ui.ctx().copy_text(content.to_owned());
-    ui.data_mut(|data| data.insert_temp(id, now));
-    ui.ctx().request_repaint();
-    true
-}
-
-fn show_text_projection_preview(
-    ui: &mut Ui,
-    source: &str,
-    palette: AppPalette,
-) -> TextProjectionPreview {
-    let projection = VisualProjection::from_markdown(source);
-    let runs = projection.runs_for(projection.text());
-    let galley = wysiwyg_layout(
-        ui,
-        projection.text(),
-        &projection,
-        ui.available_width(),
-        palette,
-        true,
-    );
-    let (galley_pos, galley, response) =
-        egui::Label::new(galley).selectable(false).layout_in_ui(ui);
-    ui.painter().extend(rounded_inline_code_backgrounds(
-        &galley, galley_pos, &runs, palette,
-    ));
-    ui.painter()
-        .galley(galley_pos, Arc::clone(&galley), palette.text);
-    TextProjectionPreview {
-        rect: response.rect,
-        galley,
-        galley_pos,
-        projection,
-    }
-}
-
-fn show_code_projection_preview(
-    ui: &mut Ui,
-    source: &str,
-    palette: AppPalette,
-    language: Option<&str>,
-) -> TextProjectionPreview {
-    let projection = VisualProjection::from_markdown(source);
-    let galley = syntax_highlighted_code_layout(
-        ui,
-        projection.text(),
-        ui.available_width(),
-        palette,
-        language,
-    );
-    let (galley_pos, galley, response) =
-        egui::Label::new(galley).selectable(false).layout_in_ui(ui);
-    ui.painter()
-        .galley(galley_pos, Arc::clone(&galley), palette.text);
-    TextProjectionPreview {
-        rect: response.rect,
-        galley,
-        galley_pos,
-        projection,
-    }
-}
-
-fn show_native_block_preview(
-    ui: &mut Ui,
-    source: &str,
-    base_directory: &Path,
-    dark: bool,
-    svg_cache: &mut HashMap<String, Arc<[u8]>>,
-    palette: AppPalette,
-) -> NativeBlockPreview {
-    if let Some(diagram) = standalone_mermaid(source) {
-        let response = egui::Frame::new()
-            .fill(palette.code_bg)
-            .stroke(Stroke::new(1.0, palette.border))
-            .corner_radius(8)
-            .inner_margin(Margin::symmetric(14, 12))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("MERMAID")
-                        .monospace()
-                        .size(11.0)
-                        .color(palette.secondary),
-                );
-                ui.add_space(8.0);
-                render_mermaid_widget(ui, svg_cache, &diagram.source, dark);
-            })
-            .response;
-        return NativeBlockPreview {
-            rect: response.rect,
-            mapping: NativePointerMapping::Atomic {
-                source_range: diagram.range,
-            },
-            atomic: true,
-        };
-    }
-
-    if let Some(math) = standalone_display_math(source) {
-        let response = egui::Frame::new()
-            .fill(palette.code_bg.gamma_multiply(0.45))
-            .stroke(Stroke::new(1.0, palette.border))
-            .corner_radius(8)
-            .inner_margin(Margin::symmetric(16, 14))
-            .show(ui, |ui| {
-                ui.centered_and_justified(|ui| {
-                    render_math_widget(ui, svg_cache, &math.source, false, dark);
-                });
-            })
-            .response;
-        return NativeBlockPreview {
-            rect: response.rect,
-            mapping: NativePointerMapping::Atomic {
-                source_range: math.range,
-            },
-            atomic: true,
-        };
-    }
-
-    if let Some(image) = standalone_image(source) {
-        let response = egui::Frame::new()
-            .fill(palette.code_bg.gamma_multiply(0.35))
-            .stroke(Stroke::new(1.0, palette.border))
-            .corner_radius(8)
-            .inner_margin(Margin::symmetric(12, 12))
-            .show(ui, |ui| {
-                match document_image_uri(base_directory, &image.destination) {
-                    Ok(uri) => {
-                        ui.vertical_centered(|ui| {
-                            ui.add(
-                                egui::Image::from_uri(uri)
-                                    .alt_text(if image.alt.trim().is_empty() {
-                                        "文档图片"
-                                    } else {
-                                        &image.alt
-                                    })
-                                    .fit_to_original_size(1.0)
-                                    .max_width(ui.available_width())
-                                    .max_height(520.0),
-                            );
-                            if !image.alt.trim().is_empty() {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new(&image.alt)
-                                        .size(12.0)
-                                        .color(palette.secondary),
-                                );
-                            }
-                        });
-                    }
-                    Err(error) => {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("▧").size(20.0).color(palette.secondary));
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new(if image.alt.trim().is_empty() {
-                                        "图片不可用"
-                                    } else {
-                                        &image.alt
-                                    })
-                                    .strong()
-                                    .color(palette.text),
-                                );
-                                ui.label(RichText::new(error).size(12.0).color(palette.secondary));
-                            });
-                        });
-                    }
-                }
-            })
-            .response;
-        return NativeBlockPreview {
-            rect: response.rect,
-            mapping: NativePointerMapping::Atomic {
-                source_range: image.range,
-            },
-            atomic: true,
-        };
-    }
-
-    if is_fenced_code_block(source) {
-        let response = egui::Frame::new()
-            .fill(palette.code_bg)
-            .stroke(Stroke::new(1.0, palette.border))
-            .corner_radius(8)
-            .inner_margin(Margin::symmetric(14, 10))
-            .show(ui, |ui| {
-                if let Some(language) = fenced_code_language(source) {
-                    ui.label(
-                        RichText::new(language.to_uppercase())
-                            .monospace()
-                            .size(11.0)
-                            .color(palette.secondary),
-                    );
-                    ui.add_space(4.0);
-                }
-                show_code_projection_preview(ui, source, palette, fenced_code_language(source))
-            });
-        return NativeBlockPreview {
-            rect: response.response.rect,
-            mapping: NativePointerMapping::Text(response.inner),
-            atomic: true,
-        };
-    }
-
-    let styled_container = is_native_table_block(source) || is_native_quote_block(source);
-    let shown = styled_container.then(|| {
-        egui::Frame::new()
-            .fill(if is_native_quote_block(source) {
-                palette.accent_soft.gamma_multiply(0.42)
-            } else {
-                palette.code_bg.gamma_multiply(0.38)
-            })
-            .stroke(Stroke::new(1.0, palette.border))
-            .corner_radius(if is_native_quote_block(source) { 6 } else { 8 })
-            .inner_margin(Margin::symmetric(14, 9))
-            .show(ui, |ui| show_text_projection_preview(ui, source, palette))
-    });
-    let (rect, preview) = if let Some(shown) = shown {
-        (shown.response.rect, shown.inner)
-    } else {
-        let preview = show_text_projection_preview(ui, source, palette);
-        (preview.rect, preview)
-    };
-    NativeBlockPreview {
-        rect,
-        mapping: NativePointerMapping::Text(preview),
-        atomic: false,
-    }
-}
-
-fn is_native_table_block(source: &str) -> bool {
-    table::find_table(source, 0).is_some()
-}
-
-fn is_native_quote_block(source: &str) -> bool {
-    source.trim_start().starts_with('>')
-}
-
-fn accessible_markdown_block_text(source: &str) -> String {
-    let projection = VisualProjection::from_markdown(source);
-    let text = projection.text().trim_end_matches(['\r', '\n']);
-    if text.trim().is_empty() {
-        source.to_owned()
-    } else {
-        text.to_owned()
-    }
-}
-
-fn set_wysiwyg_document_accessibility(ui: &Ui, title: &str) {
-    ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
-        node.set_role(egui::accesskit::Role::Document);
-        node.set_label(format!("{title} 所见即所得文档"));
-    });
-}
-
-fn accessible_document_remainder(
-    source: &str,
-    blocks: &[markdown::MarkdownBlock],
-    active_id: BlockId,
-) -> String {
-    const MAX_ACCESSIBLE_REMAINDER_CHARS: usize = 1_048_576;
-
-    let mut output = String::new();
-    let mut remaining = MAX_ACCESSIBLE_REMAINDER_CHARS;
-    for block in blocks.iter().filter(|block| block.id != active_id) {
-        if remaining == 0 {
-            break;
-        }
-        let text = accessible_markdown_block_text(&source[block.range.clone()]);
-        if text.is_empty() {
-            continue;
-        }
-        if remaining > 0 {
-            output.push('\n');
-            remaining = remaining.saturating_sub(1);
-        }
-        let mut appended = 0usize;
-        for character in text.chars().take(remaining) {
-            output.push(character);
-            appended += 1;
-        }
-        remaining = remaining.saturating_sub(appended);
-    }
-    output
-}
-
-fn append_accessible_text_runs(
-    ui: &mut Ui,
-    parent_id: egui::Id,
-    salt: (u64, BlockId),
-    text: &str,
-    bounds: egui::Rect,
-) {
-    const MAX_TEXT_RUN_CHARS: usize = 255;
-
-    let mut chunk = String::new();
-    let mut chunk_chars = 0usize;
-    let mut chunk_index = 0usize;
-    for character in text.chars() {
-        chunk.push(character);
-        chunk_chars += 1;
-        if chunk_chars == MAX_TEXT_RUN_CHARS {
-            append_accessible_text_run(ui, parent_id, salt, chunk_index, &chunk, bounds);
-            chunk.clear();
-            chunk_chars = 0;
-            chunk_index += 1;
-        }
-    }
-    if !chunk.is_empty() {
-        append_accessible_text_run(ui, parent_id, salt, chunk_index, &chunk, bounds);
-    }
-}
-
-fn append_accessible_text_run(
-    ui: &mut Ui,
-    parent_id: egui::Id,
-    salt: (u64, BlockId),
-    chunk_index: usize,
-    text: &str,
-    bounds: egui::Rect,
-) {
-    let child = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt(("wysiwyg-accessible-remainder", salt, chunk_index))
-            .max_rect(bounds)
-            .accessibility_parent(parent_id),
-    );
-    child
-        .ctx()
-        .accesskit_node_builder(child.unique_id(), |node| {
-            node.set_role(egui::accesskit::Role::TextRun);
-            node.set_value(text);
-            node.set_character_lengths(
-                text.chars()
-                    .map(|character| character.len_utf8() as u8)
-                    .collect::<Vec<_>>(),
-            );
-            node.set_text_direction(egui::accesskit::TextDirection::LeftToRight);
-            node.set_bounds(egui::accesskit::Rect {
-                x0: bounds.min.x.into(),
-                y0: bounds.min.y.into(),
-                x1: bounds.max.x.into(),
-                y1: bounds.max.y.into(),
-            });
-        });
-}
-
-fn set_markdown_preview_accessibility(response: &egui::Response, source: &str) {
-    let accessible_text = accessible_markdown_block_text(source);
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &accessible_text));
-}
-
-fn paint_inline_code_delimiters(
-    ui: &Ui,
-    galley: &egui::Galley,
-    galley_pos: egui::Pos2,
-    runs: &[crate::wysiwyg::VisualRun],
-    palette: AppPalette,
-) -> usize {
-    let mut painted = 0usize;
-    let mut char_index = 0usize;
-    let mut run_index = 0usize;
-    for placed_row in &galley.rows {
-        let row_offset = galley_pos.to_vec2() + placed_row.pos.to_vec2();
-        for glyph in &placed_row.glyphs {
-            while runs
-                .get(run_index)
-                .is_some_and(|run| run.range.end <= char_index)
-            {
-                run_index += 1;
-            }
-            let is_delimiter = glyph.chr == '`'
-                && runs.get(run_index).is_some_and(|run| {
-                    run.range.contains(&char_index) && run.style.code && run.style.marker
-                });
-            if is_delimiter {
-                let rect = glyph.logical_rect().translate(row_offset);
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "`",
-                    FontId::new(17.0, FontFamily::Monospace),
-                    palette.accent,
-                );
-                painted += 1;
-            }
-            char_index += 1;
-        }
-        if placed_row.ends_with_newline {
-            char_index += 1;
-        }
-    }
-    painted
-}
-
-fn push_inline_code_background(
-    shapes: &mut Vec<egui::Shape>,
-    rect: Option<egui::Rect>,
-    palette: AppPalette,
-) {
-    let Some(rect) = rect else {
-        return;
-    };
-    let rect = rect.expand2(Vec2::new(3.0, WYSIWYG_INLINE_CODE_VERTICAL_PADDING));
-    shapes.push(egui::Shape::rect_filled(rect, 4, palette.code_bg));
-    shapes.push(egui::Shape::rect_stroke(
-        rect,
-        4,
-        Stroke::new(0.75, palette.border),
-        egui::StrokeKind::Inside,
-    ));
-}
-
-fn visual_text_format(style: VisualStyle, palette: AppPalette) -> TextFormat {
-    let size = if style.code && style.marker {
-        17.0
-    } else if style.footnote {
-        11.0
-    } else {
-        match (style.code, style.heading) {
-            (_, 1) => 34.0,
-            (_, 2) => 27.0,
-            (_, 3) => 22.0,
-            (_, 4) => 18.0,
-            (true, _) => 15.0,
-            _ => 16.0,
-        }
-    };
-    let family = if style.code {
-        FontFamily::Monospace
-    } else if style.strong || style.heading > 0 || style.table_header {
-        FontFamily::Name(WYSIWYG_STRONG_FAMILY.into())
-    } else {
-        FontFamily::Proportional
-    };
-    let mut format = TextFormat::simple(
-        FontId::new(size, family),
-        if style.code && style.marker {
-            palette.accent
-        } else if style.marker || style.quote {
-            palette.secondary
-        } else if style.link {
-            palette.accent
-        } else {
-            palette.text
-        },
-    );
-    format.line_height = Some(match (style.code, style.heading) {
-        (_, 1) => 44.0,
-        (_, 2) => 36.0,
-        (_, 3) => 31.0,
-        (_, 4) => WYSIWYG_BODY_LINE_HEIGHT,
-        (true, _) => WYSIWYG_INLINE_CODE_LINE_HEIGHT,
-        _ => WYSIWYG_BODY_LINE_HEIGHT,
-    });
-    if style.code {
-        format.valign = Align::Center;
-    } else if style.footnote {
-        format.valign = Align::Min;
-    }
-    if style.strong || style.heading > 0 || style.table_header {
-        format.extra_letter_spacing = 0.2;
-    }
-    if style.table_header {
-        format.background = palette.code_bg.gamma_multiply(0.7);
-    } else if style.table {
-        format.background = palette.surface.gamma_multiply(0.98);
-    }
-    format.italics = style.emphasis;
-    if style.strikethrough {
-        format.strikethrough = Stroke::new(1.0, format.color);
-    }
-    if style.link {
-        format.underline = Stroke::new(1.0, palette.accent);
-    }
-    if style.code {
-        format.extra_letter_spacing = 0.1;
-    }
-    format
 }
 
 fn parse_shortcut(specification: &str) -> Option<egui::KeyboardShortcut> {
@@ -6263,125 +3106,6 @@ fn duplicate_shortcuts(bindings: &KeyBindings) -> bool {
         .into_iter()
         .map(|shortcut| shortcut.trim().to_ascii_uppercase())
         .any(|shortcut| !shortcut.is_empty() && !unique.insert(shortcut))
-}
-
-#[derive(Default)]
-struct EditorInputAction {
-    backspace: bool,
-    delete: bool,
-    down: bool,
-    enter: bool,
-    horizontal_modified: bool,
-    left: bool,
-    tab: bool,
-    right: bool,
-    shift: bool,
-    pasted_text: Option<String>,
-    typed_text: Option<String>,
-}
-
-enum CrossBlockInput {
-    Copy,
-    Cut,
-    Delete,
-    Replace(String),
-}
-
-impl CrossBlockInput {
-    fn copy(&self) -> bool {
-        matches!(self, Self::Copy | Self::Cut)
-    }
-
-    fn replacement(&self) -> Option<&str> {
-        match self {
-            Self::Copy => None,
-            Self::Cut | Self::Delete => Some(""),
-            Self::Replace(text) => Some(text),
-        }
-    }
-}
-
-fn take_cross_block_input(ui: &mut Ui) -> Option<CrossBlockInput> {
-    let mut action = None;
-    ui.input_mut(|input| {
-        input.events.retain(|event| {
-            // Apply one action to the cross-block range. Remaining events must
-            // reach TextEdit at the resulting caret during this same frame.
-            if action.is_some() {
-                return true;
-            }
-            let next = match event {
-                egui::Event::Copy => Some(CrossBlockInput::Copy),
-                egui::Event::Cut => Some(CrossBlockInput::Cut),
-                egui::Event::Paste(text) | egui::Event::Text(text) => Some(
-                    CrossBlockInput::Replace(crate::document::normalize_line_endings(text)),
-                ),
-                egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty() => {
-                    Some(CrossBlockInput::Replace(text.clone()))
-                }
-                egui::Event::Key {
-                    key: Key::Backspace | Key::Delete,
-                    pressed: true,
-                    ..
-                } => Some(CrossBlockInput::Delete),
-                _ => None,
-            };
-            if let Some(next) = next {
-                action = Some(next);
-                false
-            } else {
-                true
-            }
-        });
-    });
-    action
-}
-
-fn editor_input_action(ui: &Ui) -> EditorInputAction {
-    ui.input(|input| EditorInputAction {
-        backspace: input.key_pressed(Key::Backspace),
-        delete: input.key_pressed(Key::Delete),
-        down: input.key_pressed(Key::ArrowDown),
-        enter: input.key_pressed(Key::Enter),
-        horizontal_modified: input.modifiers.alt
-            || input.modifiers.ctrl
-            || input.modifiers.mac_cmd
-            || input.modifiers.shift,
-        left: input.key_pressed(Key::ArrowLeft),
-        tab: input.key_pressed(Key::Tab),
-        right: input.key_pressed(Key::ArrowRight),
-        shift: input.modifiers.shift,
-        pasted_text: input.events.iter().rev().find_map(|event| match event {
-            egui::Event::Paste(text) => Some(text.trim().to_owned()),
-            _ => None,
-        }),
-        typed_text: input.events.iter().rev().find_map(|event| match event {
-            egui::Event::Text(text) => Some(text.clone()),
-            _ => None,
-        }),
-    })
-}
-
-fn ime_frame_action(events: &[egui::Event]) -> ImeFrameAction {
-    events
-        .iter()
-        .fold(ImeFrameAction::None, |action, event| match event {
-            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
-                if text.is_empty() {
-                    ImeFrameAction::Cancel
-                } else {
-                    ImeFrameAction::Preedit
-                }
-            }
-            egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
-                if text.is_empty() {
-                    ImeFrameAction::Cancel
-                } else {
-                    ImeFrameAction::Commit
-                }
-            }
-            _ => action,
-        })
 }
 
 fn workspace_entries_ui(
@@ -6514,11 +3238,6 @@ fn line_start_byte(text: &str, one_based_line: usize) -> usize {
     text.len()
 }
 
-fn clamp_char_range(text: &str, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
-    let length = text.chars().count();
-    range.start.min(length)..range.end.min(length).max(range.start.min(length))
-}
-
 fn next_footnote_number(source: &str) -> usize {
     let mut used = HashSet::new();
     let bytes = source.as_bytes();
@@ -6538,1702 +3257,14 @@ fn next_footnote_number(source: &str) -> usize {
     (1..).find(|number| !used.contains(number)).unwrap_or(1)
 }
 
-fn apply_theme(ctx: &Context, dark: bool) {
-    let palette = app_palette(dark);
-    let mut visuals = if dark {
-        egui::Visuals::dark()
-    } else {
-        egui::Visuals::light()
-    };
-    visuals.override_text_color = Some(palette.text);
-    visuals.weak_text_color = Some(palette.secondary);
-    visuals.panel_fill = palette.canvas;
-    visuals.window_fill = palette.surface;
-    visuals.window_stroke = Stroke::new(1.0, palette.border);
-    visuals.window_corner_radius = egui::CornerRadius::same(10);
-    visuals.menu_corner_radius = egui::CornerRadius::same(8);
-    visuals.faint_bg_color = palette.hover;
-    visuals.extreme_bg_color = palette.surface;
-    visuals.text_edit_bg_color = Some(palette.surface);
-    visuals.code_bg_color = palette.code_bg;
-    visuals.hyperlink_color = palette.accent;
-    visuals.selection.bg_fill = palette.accent_soft;
-    visuals.selection.stroke = Stroke::new(1.5, palette.accent);
-    visuals.button_frame = true;
-    visuals.collapsing_header_frame = false;
-    visuals.indent_has_left_vline = false;
-
-    visuals.widgets.noninteractive.bg_fill = palette.surface;
-    visuals.widgets.noninteractive.weak_bg_fill = palette.surface;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.border);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette.text);
-    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
-
-    visuals.widgets.inactive.bg_fill = palette.surface;
-    visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, palette.text);
-    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
-
-    visuals.widgets.hovered.bg_fill = palette.hover;
-    visuals.widgets.hovered.weak_bg_fill = palette.hover;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, palette.border);
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, palette.text);
-    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
-    visuals.widgets.hovered.expansion = 0.0;
-
-    visuals.widgets.active.bg_fill = palette.accent_soft;
-    visuals.widgets.active.weak_bg_fill = palette.accent_soft;
-    visuals.widgets.active.bg_stroke = Stroke::NONE;
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, palette.text);
-    visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
-    visuals.widgets.active.expansion = 0.0;
-    visuals.widgets.open = visuals.widgets.active;
-
-    ctx.set_theme(if dark {
-        egui::Theme::Dark
-    } else {
-        egui::Theme::Light
-    });
-    ctx.global_style_mut(|style| {
-        style.visuals = visuals;
-        style.spacing.item_spacing = Vec2::new(7.0, 5.0);
-        style.spacing.button_padding = Vec2::new(10.0, 5.0);
-        style.spacing.interact_size = Vec2::new(32.0, 29.0);
-        style.spacing.window_margin = Margin::same(12);
-        style.text_styles.insert(
-            TextStyle::Heading,
-            FontId::new(32.0, FontFamily::Proportional),
-        );
-        style
-            .text_styles
-            .insert(TextStyle::Body, FontId::new(16.0, FontFamily::Proportional));
-        style.text_styles.insert(
-            TextStyle::Button,
-            FontId::new(13.0, FontFamily::Proportional),
-        );
-        style.text_styles.insert(
-            TextStyle::Small,
-            FontId::new(12.0, FontFamily::Proportional),
-        );
-        style.text_styles.insert(
-            TextStyle::Monospace,
-            FontId::new(15.0, FontFamily::Monospace),
-        );
-        for (name, size) in [
-            ("rupora-title", 30.0),
-            ("rupora-h2", 24.0),
-            ("rupora-h3", 20.0),
-            ("rupora-h4", 17.0),
-        ] {
-            style.text_styles.insert(
-                TextStyle::Name(name.into()),
-                FontId::new(size, FontFamily::Proportional),
-            );
-        }
-    });
-}
-
-fn install_fonts(ctx: &Context) {
-    let regular_font = export::cjk_font_candidates()
-        .into_iter()
-        .find_map(|path| fs::read(&path).ok().map(|bytes| (path, bytes)));
-    let mut fonts = FontDefinitions::default();
-    if let Some((path, bytes)) = regular_font {
-        let font_name = format!("rupora-cjk-{}", path.display());
-        fonts
-            .font_data
-            .insert(font_name.clone(), Arc::new(FontData::from_owned(bytes)));
-        fonts
-            .families
-            .entry(FontFamily::Proportional)
-            .or_default()
-            .insert(0, font_name.clone());
-        let monospace = fonts.families.entry(FontFamily::Monospace).or_default();
-        monospace.insert(monospace.len().min(1), font_name);
-    }
-    let mut strong_fonts = Vec::new();
-    if let Some((bold_path, bold_bytes)) = cjk_bold_font_candidates()
-        .into_iter()
-        .find_map(|path| fs::read(&path).ok().map(|bytes| (path, bytes)))
-    {
-        let bold_name = format!("rupora-cjk-bold-{}", bold_path.display());
-        fonts.font_data.insert(
-            bold_name.clone(),
-            Arc::new(FontData::from_owned(bold_bytes)),
-        );
-        strong_fonts.push(bold_name);
-    }
-    strong_fonts.extend(
-        fonts
-            .families
-            .get(&FontFamily::Proportional)
-            .cloned()
-            .unwrap_or_default(),
-    );
-    fonts
-        .families
-        .insert(FontFamily::Name(WYSIWYG_STRONG_FAMILY.into()), strong_fonts);
-    ctx.set_fonts(fonts);
-}
-
-fn cjk_bold_font_candidates() -> Vec<PathBuf> {
-    if cfg!(target_os = "windows") {
-        vec![
-            PathBuf::from(r"C:\Windows\Fonts\msyhbd.ttc"),
-            PathBuf::from(r"C:\Windows\Fonts\msyhbd.ttf"),
-            PathBuf::from(r"C:\Windows\Fonts\simhei.ttf"),
-        ]
-    } else if cfg!(target_os = "macos") {
-        vec![
-            PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
-            PathBuf::from("/System/Library/Fonts/STHeiti Medium.ttc"),
-        ]
-    } else {
-        vec![
-            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
-            PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc"),
-            PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
-        ]
-    }
-}
+#[cfg(test)]
+#[path = "product_input_tests.rs"]
+mod product_input_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn isolated_app(directory: &Path) -> RuporaApp {
-        RuporaApp::from_state(
-            PersistedState::default(),
-            RecoveryStore::at(directory.join("recovery.json")),
-            None,
-            ExtensionRegistry::disabled(directory.join("extensions.json")),
-            None,
-        )
-    }
-
-    #[test]
-    fn audit_cross_block_input_preserves_all_text_events_and_normalizes_pasted_newlines() {
-        for (events, expected) in [
-            (
-                vec![
-                    egui::Event::Text("你".to_owned()),
-                    egui::Event::Text("🙂".to_owned()),
-                ],
-                "你🙂",
-            ),
-            (
-                vec![egui::Event::Paste("甲\r\n乙\r丙".to_owned())],
-                "甲\n乙\n丙",
-            ),
-        ] {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = isolated_app(directory.path());
-            app.new_document();
-            app.documents[0].content = "first\n\nsecond".to_owned();
-            app.documents[0].update_after_edit();
-            let cursor = CCursorRange::two(CCursor::new(0), CCursor::new(13));
-            app.editor_cursor = Some(cursor);
-            app.hybrid_cross_selection = Some(HybridCrossSelection {
-                document_id: app.documents[0].id(),
-                cursor,
-            });
-            let context = Context::default();
-            let _ = context.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1000.0, 800.0),
-                    )),
-                    events,
-                    ..Default::default()
-                },
-                |ui| app.hybrid_pane(ui, 0),
-            );
-            assert_eq!(app.documents[0].content, expected);
-            app.undo_active();
-            assert_eq!(app.documents[0].content, "first\n\nsecond");
-        }
-    }
-
-    #[test]
-    fn audit_source_editor_pastes_plain_text_over_a_unicode_selection() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut app = isolated_app(directory.path());
-        app.new_document();
-        app.documents[0].content = "前中文🙂后".to_owned();
-        app.documents[0].update_after_edit();
-        app.queue_editor_selection(1..4);
-        let context = Context::default();
-        for events in [vec![], vec![egui::Event::Paste("替换".to_owned())]] {
-            let _ = context.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1000.0, 800.0),
-                    )),
-                    events,
-                    ..Default::default()
-                },
-                |ui| {
-                    app.edit_pane(ui, 0, None);
-                },
-            );
-        }
-        assert_eq!(app.documents[0].content, "前替换后");
-        app.undo_active();
-        assert_eq!(app.documents[0].content, "前中文🙂后");
-    }
-
-    #[test]
-    fn audit_switching_untitled_tabs_restores_each_selection() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut app = isolated_app(directory.path());
-        app.new_document();
-        app.documents[0].content = "甲乙🙂".to_owned();
-        app.queue_editor_selection(1..3);
-        app.new_document();
-        app.documents[1].content = "第二篇".to_owned();
-        app.queue_editor_selection(0..2);
-        app.activate_document(0);
-        assert_eq!(app.active_selection(0), 1..3);
-        app.activate_document(1);
-        assert_eq!(app.active_selection(1), 0..2);
-    }
-
-    #[test]
-    fn audit_closing_an_inactive_tab_preserves_the_active_selection() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut app = isolated_app(directory.path());
-        app.new_document();
-        app.new_document();
-        app.documents[1].content = "正文🙂".to_owned();
-        app.queue_editor_selection(0..2);
-        app.close_document(0);
-        assert_eq!(app.active, Some(0));
-        assert_eq!(app.active_selection(0), 0..2);
-    }
-
-    #[test]
-    fn audit_reloading_multiple_files_resets_the_active_editor_even_when_it_is_not_last() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut app = isolated_app(directory.path());
-        for name in ["first.md", "second.md"] {
-            let path = directory.path().join(name);
-            fs::write(&path, "original").unwrap();
-            app.documents.push(Document::open(&path).unwrap());
-            fs::write(path, "changed 中文🙂").unwrap();
-        }
-        app.active = Some(0);
-        app.queue_editor_selection(0..8);
-        app.last_external_check = Instant::now() - Duration::from_secs(3);
-        app.check_external_changes_if_due();
-        assert_eq!(app.documents[0].content, "changed 中文🙂");
-        assert!(app.editor_cursor.is_none());
-        assert!(app.pending_editor_cursor.is_none());
-    }
-    use crate::native_preview::{
-        MAX_GENERATED_SVG_CACHE_BYTES, MAX_GENERATED_SVG_CACHE_ENTRIES, cache_generated_svg,
-    };
-
-    #[test]
-    fn accepts_supported_document_extensions_case_insensitively() {
-        assert!(is_markdown_path(Path::new("README.MD")));
-        assert!(is_markdown_path(Path::new("notes.markdown")));
-        assert!(!is_markdown_path(Path::new("image.png")));
-    }
-
-    #[test]
-    fn recognizes_only_commonmark_indented_fences() {
-        assert!(is_fenced_code_block("```rust\nfn main() {}\n```"));
-        assert!(is_fenced_code_block("   ~~~\ncode\n   ~~~"));
-        assert!(!is_fenced_code_block("    ```\nnot a fence"));
-        assert!(!is_fenced_code_block("\t```\nnot a fence"));
-    }
-
-    #[test]
-    fn decodes_unicode_local_link_fragments_without_form_semantics() {
-        assert_eq!(
-            decode_uri_fragment("%E4%B8%AD%E6%96%87%20%E6%A0%87%E9%A2%98"),
-            Some("中文 标题".to_owned())
-        );
-        assert_eq!(decode_uri_fragment("c%2B%2B"), Some("c++".to_owned()));
-        assert_eq!(decode_uri_fragment("a+b"), Some("a+b".to_owned()));
-        assert_eq!(decode_uri_fragment("%ZZ"), None);
-        assert_eq!(decode_uri_fragment("%E4%B8"), None);
-    }
-
-    #[test]
-    fn extension_results_follow_document_identity_after_tabs_shift() {
-        let first = Document::untitled(1);
-        let target = Document::untitled(2);
-        let target_id = target.id();
-        let trailing = Document::untitled(3);
-        let mut documents = vec![first, target, trailing];
-
-        documents.remove(0);
-        assert_eq!(extension_document_index(&documents, target_id), Some(0));
-
-        documents.remove(0);
-        assert_eq!(extension_document_index(&documents, target_id), None);
-    }
-
-    #[test]
-    fn clean_session_documents_are_restored_alongside_recovered_tabs() {
-        let directory = tempfile::tempdir().unwrap();
-        let recovered_path = directory.path().join("recovered.md");
-        let clean_path = directory.path().join("clean.md");
-        fs::write(&recovered_path, "recovered").unwrap();
-        fs::write(&clean_path, "clean").unwrap();
-        let recovered = Document::open(&recovered_path).unwrap();
-
-        let paths =
-            restorable_session_files(&[recovered], [recovered_path.clone(), clean_path.clone()]);
-        assert_eq!(paths, vec![clean_path]);
-    }
-
-    #[test]
-    fn allocates_the_first_unused_numeric_footnote() {
-        assert_eq!(next_footnote_number("plain"), 1);
-        assert_eq!(next_footnote_number("[^1] and [^3]"), 2);
-        assert_eq!(next_footnote_number("[^2]: definition"), 1);
-        assert_eq!(next_footnote_number("[^1][^2]"), 3);
-        assert_eq!(next_footnote_number("[^[^1][^2]"), 3);
-    }
-
-    #[test]
-    fn bounds_the_generated_svg_cache() {
-        let context = Context::default();
-        let mut cache = HashMap::new();
-        for index in 0..=MAX_GENERATED_SVG_CACHE_ENTRIES {
-            cache_generated_svg(
-                &context,
-                &mut cache,
-                format!("key-{index}"),
-                Arc::from([index as u8]),
-            );
-        }
-        assert_eq!(cache.len(), MAX_GENERATED_SVG_CACHE_ENTRIES);
-        assert!(cache.contains_key(&format!("key-{MAX_GENERATED_SVG_CACHE_ENTRIES}")));
-    }
-
-    #[test]
-    fn bounds_the_generated_svg_cache_by_bytes() {
-        let context = Context::default();
-        let mut cache = HashMap::new();
-        let shared = Arc::<[u8]>::from(vec![0; MAX_GENERATED_SVG_CACHE_BYTES / 4]);
-        for index in 0..4 {
-            cache_generated_svg(
-                &context,
-                &mut cache,
-                format!("large-{index}"),
-                shared.clone(),
-            );
-        }
-        assert_eq!(cache.len(), 4);
-
-        assert!(cache_generated_svg(
-            &context,
-            &mut cache,
-            "replacement".to_owned(),
-            Arc::from([1]),
-        ));
-        assert!(cache.len() <= 4);
-        assert!(cache.contains_key("replacement"));
-    }
-
-    #[test]
-    fn creates_relative_encoded_resource_destinations() {
-        let directory = tempfile::tempdir().unwrap();
-        let notes = directory.path().join("notes");
-        let assets = directory.path().join("assets");
-        fs::create_dir_all(&notes).unwrap();
-        fs::create_dir_all(&assets).unwrap();
-        let image = assets.join("diagram one.png");
-        fs::write(&image, b"image").unwrap();
-
-        assert_eq!(
-            markdown_resource_destination(&image, &notes),
-            "../assets/diagram%20one.png"
-        );
-        assert!(is_image_path(&image));
-        assert!(!is_image_path(Path::new("attachment.pdf")));
-    }
-
-    #[test]
-    fn parses_configurable_cross_platform_shortcuts() {
-        let shortcut = parse_shortcut("Ctrl+Shift+P").unwrap();
-        assert!(shortcut.modifiers.command);
-        assert!(shortcut.modifiers.shift);
-        assert_eq!(shortcut.logical_key, Key::P);
-        assert!(parse_shortcut("Ctrl+NoSuchKey").is_none());
-    }
-
-    #[test]
-    fn detects_duplicate_shortcuts() {
-        let mut bindings = KeyBindings::default();
-        assert!(!duplicate_shortcuts(&bindings));
-        bindings.link.clone_from(&bindings.bold);
-        assert!(duplicate_shortcuts(&bindings));
-    }
-
-    #[test]
-    fn calculates_safe_split_scroll_ratios() {
-        assert_eq!(
-            scroll_ratio(PaneScroll {
-                offset: 50.0,
-                maximum: 100.0,
-                hovered: true,
-            }),
-            0.5
-        );
-        assert_eq!(scroll_ratio(PaneScroll::default()), 0.0);
-    }
-
-    #[test]
-    fn local_path_policy_blocks_workspace_escape() {
-        let directory = tempfile::tempdir().unwrap();
-        let workspace = directory.path().join("workspace");
-        let outside = directory.path().join("outside.txt");
-        fs::create_dir(&workspace).unwrap();
-        fs::write(&outside, "secret").unwrap();
-        let inside = workspace.join("note.md");
-        fs::write(&inside, "safe").unwrap();
-
-        assert!(path_is_within(&inside, &workspace));
-        assert!(!path_is_within(&outside, &workspace));
-    }
-
-    #[test]
-    fn wysiwyg_editor_matches_editing_typography_to_markdown_blocks() {
-        let heading = VisualProjection::from_markdown("# Title");
-        assert_eq!(heading.text(), "Title");
-        assert!(heading.runs_for(heading.text())[0].style.heading == 1);
-
-        let code = VisualProjection::from_markdown("```rust\nfn main() {}\n```");
-        assert_eq!(code.text(), "fn main() {}");
-        assert!(code.runs_for(code.text())[0].style.code);
-    }
-
-    #[test]
-    fn native_projection_covers_every_markdown_block_kind() {
-        for source in [
-            "plain text",
-            "before `code` after",
-            "# heading with `code`",
-            "**bold `code`** and *emphasis*",
-            "脚注引用[^1]",
-            "soft\nline",
-            "hard  \nline",
-            "before <span>重点</span> after",
-            "<div data-value=\"a > b\">文字</div>",
-            "- list with `code`",
-            "[link](note.md) and `code`",
-            "![image](image.png) and `code`",
-            "```rust\ncode\n```",
-            "<img alt=\"diagram\" src=\"image.png\">",
-        ] {
-            let projection = VisualProjection::from_markdown(source);
-            assert!(!projection.text().is_empty(), "{source}");
-            assert_eq!(
-                projection.visual_char_range(source, 0..source.chars().count()),
-                0..projection.text().chars().count(),
-                "{source}"
-            );
-        }
-    }
-
-    #[test]
-    fn cross_block_selection_treats_fenced_code_as_an_atomic_block() {
-        let source = "before α\n\n```rust\n代码();\n```\n\nafter β";
-        let blocks = markdown::blocks(source);
-        assert_eq!(blocks.len(), 3);
-        let before = &blocks[0];
-        let code = &blocks[1];
-        let after = &blocks[2];
-        let char_at = |byte| source[..byte].chars().count();
-
-        let forward = snap_atomic_cross_block_selection(
-            source,
-            &blocks,
-            before.id,
-            char_at(before.range.end) - 2,
-            code.id,
-            char_at(code.range.start) + 4,
-        );
-        assert_eq!(
-            forward.primary.index.0,
-            char_at(code.range.end),
-            "the whole code block must be selected at the upper edge"
-        );
-
-        let backward = snap_atomic_cross_block_selection(
-            source,
-            &blocks,
-            code.id,
-            char_at(code.range.start) + 5,
-            before.id,
-            char_at(before.range.end) - 2,
-        );
-        assert_eq!(
-            backward.secondary.index.0,
-            char_at(code.range.end),
-            "a later code anchor must snap to its far edge"
-        );
-
-        let from_code = snap_atomic_cross_block_selection(
-            source,
-            &blocks,
-            code.id,
-            char_at(code.range.start) + 5,
-            after.id,
-            char_at(after.range.start) + 2,
-        );
-        assert_eq!(from_code.secondary.index.0, char_at(code.range.start));
-        let selected = &source[code.range.clone()];
-        assert_eq!(
-            selected_markdown_for_clipboard(selected),
-            "```rust\n代码();\n```"
-        );
-    }
-
-    #[test]
-    fn rendered_media_hit_testing_exposes_only_exact_atomic_boundaries() {
-        let mapping = NativePointerMapping::Atomic {
-            source_range: 3..17,
-        };
-        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(210.0, 120.0));
-        assert_eq!(
-            mapping.source_byte_at_position("0123456789abcdefghijkl", rect, egui::pos2(20.0, 30.0)),
-            3
-        );
-        assert_eq!(
-            mapping.source_byte_at_position(
-                "0123456789abcdefghijkl",
-                rect,
-                egui::pos2(200.0, 110.0)
-            ),
-            17
-        );
-    }
-
-    #[test]
-    fn overlapping_pointer_slop_prefers_the_region_actually_under_the_pointer() {
-        let source = "aaa\n\nbbb";
-        let blocks = markdown::blocks(source);
-        let regions = [
-            HybridPointerRegion {
-                block_id: blocks[0].id,
-                source_range: blocks[0].range.clone(),
-                rect: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 10.0)),
-                atomic_range: None,
-                mapping: NativePointerMapping::Atomic { source_range: 0..3 },
-            },
-            HybridPointerRegion {
-                block_id: blocks[1].id,
-                source_range: blocks[1].range.clone(),
-                rect: egui::Rect::from_min_max(egui::pos2(0.0, 11.0), egui::pos2(100.0, 21.0)),
-                atomic_range: None,
-                mapping: NativePointerMapping::Atomic { source_range: 0..3 },
-            },
-        ];
-
-        assert_eq!(
-            hybrid_pointer_hit(source, &regions, egui::pos2(50.0, 9.5)).map(|(block, _)| block),
-            Some(blocks[0].id)
-        );
-        assert_eq!(
-            hybrid_pointer_hit(source, &regions, egui::pos2(50.0, 11.5)).map(|(block, _)| block),
-            Some(blocks[1].id)
-        );
-    }
-
-    #[test]
-    #[ignore = "manual large-document WYSIWYG frame measurement"]
-    fn measures_large_native_wysiwyg_layout_cost() {
-        for block_count in [1_000usize, 5_000, 20_000] {
-            let source = (0..block_count)
-                .map(|index| format!("Paragraph {index} with **bold** and 中文。"))
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            let blocks = markdown::blocks(&source);
-            let context = Context::default();
-            install_fonts(&context);
-            apply_theme(&context, false);
-            let started = Instant::now();
-            let mut rendered = 0usize;
-            let _ = context.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1_280.0, 800.0),
-                    )),
-                    ..egui::RawInput::default()
-                },
-                |ui| {
-                    ui.set_width(1_280.0);
-                    let mut svg_cache = HashMap::new();
-                    for block in &blocks {
-                        let block_source = &source[block.range.clone()];
-                        let estimated = estimated_hybrid_block_height(
-                            block_source,
-                            ui.available_width(),
-                            false,
-                        );
-                        let predicted = egui::Rect::from_min_size(
-                            ui.next_widget_position(),
-                            egui::vec2(ui.available_width(), estimated),
-                        );
-                        if ui
-                            .clip_rect()
-                            .expand2(egui::vec2(0.0, 800.0))
-                            .intersects(predicted)
-                        {
-                            rendered += 1;
-                            let _ = show_native_block_preview(
-                                ui,
-                                block_source,
-                                Path::new("."),
-                                false,
-                                &mut svg_cache,
-                                app_palette(false),
-                            );
-                        } else {
-                            ui.add_space(estimated);
-                        }
-                    }
-                },
-            );
-            eprintln!(
-                "virtualized native WYSIWYG layout: {block_count} blocks ({rendered} rendered) in {:?}",
-                started.elapsed()
-            );
-        }
-    }
-
-    #[test]
-    fn removing_a_code_block_also_removes_one_structural_gap() {
-        for (source, index, expected) in [
-            ("```\na\n```\n\nafter", 0, "after"),
-            ("before\n\n```\na\n```", 1, "before"),
-            ("```\na\n```", 0, ""),
-            ("```\n\n```\n\n", 0, ""),
-        ] {
-            let blocks = markdown::blocks(source);
-            let range = code_block_removal_range(source, &blocks, index);
-            let mut updated = source.to_owned();
-            updated.replace_range(range, "");
-            assert_eq!(updated, expected);
-        }
-    }
-
-    #[test]
-    fn double_click_after_code_targets_a_real_plain_paragraph() {
-        let source = "```\ncode\n```";
-        let blocks = markdown::blocks(source);
-        let (range, replacement, cursor) = paragraph_after_code_double_click(source, &blocks, 0);
-        assert_eq!(range, 0..source.len());
-        assert_eq!(replacement.as_deref(), Some("```\ncode\n```\n\n"));
-        assert_eq!(cursor, "```\ncode\n```\n\n".chars().count());
-
-        let source = "```\ncode\n```\n\nnext";
-        let blocks = markdown::blocks(source);
-        let (range, replacement, cursor) = paragraph_after_code_double_click(source, &blocks, 0);
-        assert_eq!(range.start, range.end);
-        assert!(replacement.is_none());
-        assert_eq!(cursor, source.find("next").unwrap());
-    }
-
-    #[test]
-    fn inline_code_preview_click_maps_to_the_actual_glyph() {
-        use egui::RawInput;
-
-        let context = Context::default();
-        let source = "PRE `ab` POST";
-        let mut source_byte = None;
-        let _ = context.run_ui(RawInput::default(), |ui| {
-            ui.set_width(720.0);
-            let preview = show_text_projection_preview(ui, source, app_palette(false));
-            let visual_index = preview
-                .projection
-                .text()
-                .find("ab")
-                .expect("code should be visible")
-                + 1;
-            let position = preview.galley_pos
-                + preview
-                    .galley
-                    .pos_from_cursor(CCursor::new(visual_index))
-                    .center()
-                    .to_vec2();
-            source_byte = Some(preview.source_byte_at_position(source, position));
-        });
-
-        let source_byte = source_byte.expect("preview should be measured");
-        let source_cursor = source[..source_byte].chars().count();
-        assert_eq!(source_cursor, 6);
-        assert_eq!(
-            VisualProjection::from_markdown_with_selection(
-                source,
-                Some(source_cursor..source_cursor),
-            )
-            .text(),
-            source
-        );
-    }
-
-    #[test]
-    fn native_task_checkbox_hit_maps_to_the_source_marker() {
-        use egui::RawInput;
-
-        let context = Context::default();
-        let source = "- [ ] 待办事项";
-        let mut updated = None;
-        let _ = context.run_ui(RawInput::default(), |ui| {
-            ui.set_width(720.0);
-            let preview = show_text_projection_preview(ui, source, app_palette(false));
-            let position = preview.galley_pos
-                + preview
-                    .galley
-                    .pos_from_cursor(CCursor::new(0))
-                    .center()
-                    .to_vec2();
-            let source_byte = preview.source_byte_at_position(source, position);
-            updated = markdown::toggle_task_marker_at(source, source_byte);
-        });
-        assert_eq!(updated.as_deref(), Some("- [x] 待办事项"));
-    }
-
-    #[test]
-    fn code_copy_control_emits_the_complete_code_body() {
-        use egui::{Event, Modifiers, OutputCommand, PointerButton, RawInput, Rect, pos2, vec2};
-
-        let context = Context::default();
-        let code_rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(300.0, 90.0));
-        let click = pos2(274.0, 30.0);
-        let block_id = markdown::blocks("code")[0].id;
-        let _ = context.run_ui(
-            RawInput {
-                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 140.0))),
-                ..RawInput::default()
-            },
-            |ui| {
-                ui.set_width(340.0);
-                assert!(!show_code_copy_button(
-                    ui,
-                    (7, block_id),
-                    code_rect,
-                    "fn main() {}\n中文",
-                    app_palette(false),
-                ));
-            },
-        );
-        let output = context.run_ui(
-            RawInput {
-                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 140.0))),
-                events: vec![
-                    Event::PointerMoved(click),
-                    Event::PointerButton {
-                        pos: click,
-                        button: PointerButton::Primary,
-                        pressed: true,
-                        modifiers: Modifiers::NONE,
-                    },
-                    Event::PointerButton {
-                        pos: click,
-                        button: PointerButton::Primary,
-                        pressed: false,
-                        modifiers: Modifiers::NONE,
-                    },
-                ],
-                ..RawInput::default()
-            },
-            |ui| {
-                ui.set_width(340.0);
-                assert!(show_code_copy_button(
-                    ui,
-                    (7, block_id),
-                    code_rect,
-                    "fn main() {}\n中文",
-                    app_palette(false),
-                ));
-            },
-        );
-        assert!(output.platform_output.commands.iter().any(|command| {
-            matches!(command, OutputCommand::CopyText(text) if text == "fn main() {}\n中文")
-        }));
-    }
-
-    #[test]
-    fn accessible_preview_text_covers_non_active_markdown_blocks() {
-        assert_eq!(accessible_markdown_block_text("- 项目"), "• 项目");
-        let footnote = accessible_markdown_block_text("脚注引用[^1]");
-        assert!(footnote.contains('1'));
-        assert!(!footnote.contains("[^1]"));
-        assert!(accessible_markdown_block_text("```rust\nfn main() {}\n```").contains("fn main"));
-    }
-
-    #[test]
-    fn inactive_markdown_preview_registers_its_accessible_text() {
-        use egui::{RawInput, Sense, vec2};
-
-        let context = Context::default();
-        context.enable_accesskit();
-        let output = context.run_ui(RawInput::default(), |ui| {
-            ui.push_id("accessible-wysiwyg-document", |ui| {
-                set_wysiwyg_document_accessibility(ui, "测试.md");
-                ui.label("文档开头");
-                let response = ui.allocate_response(vec2(240.0, 40.0), Sense::click());
-                set_markdown_preview_accessibility(
-                    &response,
-                    "后续列表与 `code` RETEST-END-20260813",
-                );
-            });
-        });
-        let update = output
-            .platform_output
-            .accesskit_update
-            .expect("AccessKit should receive a tree update");
-
-        assert!(
-            update
-                .nodes
-                .iter()
-                .any(|(_, node)| node.role() == egui::accesskit::Role::Document)
-        );
-        assert!(update.nodes.iter().any(|(_, node)| {
-            node.value()
-                .is_some_and(|value| value.contains("RETEST-END-20260813"))
-        }));
-    }
-
-    #[test]
-    fn focused_wysiwyg_editor_exposes_the_remaining_document_as_text_runs() {
-        use egui::{Id, RawInput};
-
-        let context = Context::default();
-        context.enable_accesskit();
-        let editor_id = Id::new("focused-wysiwyg-accessibility-regression");
-        let source = "ACCESS-FINAL\n\nACCESS-FINAL-END-20260813";
-        let blocks = markdown::blocks(source);
-        let remainder = accessible_document_remainder(source, &blocks, blocks[0].id);
-        assert!(remainder.contains("ACCESS-FINAL-END-20260813"));
-        assert!(!remainder.contains("ACCESS-FINAL\n"));
-
-        let output = context.run_ui(RawInput::default(), |ui| {
-            ui.memory_mut(|memory| memory.request_focus(editor_id));
-            let mut active = "ACCESS-FINAL".to_owned();
-            let output = TextEdit::multiline(&mut active).id(editor_id).show(ui);
-            append_accessible_text_runs(
-                ui,
-                editor_id,
-                (7, blocks[0].id),
-                &remainder,
-                output.response.rect,
-            );
-        });
-        let update = output
-            .platform_output
-            .accesskit_update
-            .expect("AccessKit should receive a tree update");
-        assert_eq!(update.focus, editor_id.accesskit_id());
-
-        let editor = update
-            .nodes
-            .iter()
-            .find(|(id, _)| *id == editor_id.accesskit_id())
-            .map(|(_, node)| node)
-            .expect("focused editor node should exist");
-        let remainder_node = update
-            .nodes
-            .iter()
-            .find(|(_, node)| {
-                node.value()
-                    .is_some_and(|value| value.contains("ACCESS-FINAL-END-20260813"))
-            })
-            .expect("remainder text run should exist");
-        assert!(editor.children().contains(&remainder_node.0));
-    }
-
-    #[test]
-    fn active_inline_code_paints_both_visible_delimiters() {
-        use egui::RawInput;
-
-        let context = Context::default();
-        let mut painted = None;
-        let _ = context.run_ui(RawInput::default(), |ui| {
-            let source = "PRE `ab` POST";
-            let content_start = source.find("ab").unwrap();
-            let source_cursor = source[..content_start + 1].chars().count();
-            let projection = VisualProjection::from_markdown_with_selection(
-                source,
-                Some(source_cursor..source_cursor),
-            );
-            let runs = projection.runs_for(projection.text());
-            let galley = wysiwyg_layout(
-                ui,
-                projection.text(),
-                &projection,
-                480.0,
-                app_palette(false),
-                true,
-            );
-            painted = Some(paint_inline_code_delimiters(
-                ui,
-                &galley,
-                egui::Pos2::ZERO,
-                &runs,
-                app_palette(false),
-            ));
-        });
-
-        assert_eq!(painted, Some(2));
-    }
-
-    #[test]
-    fn inline_code_text_and_chip_are_centered_on_the_body_line() {
-        use egui::RawInput;
-
-        let context = Context::default();
-        let mut measured = None;
-        let _ = context.run_ui(RawInput::default(), |ui| {
-            let source = "before `code` after";
-            let projection = VisualProjection::from_markdown(source);
-            let runs = projection.runs_for(projection.text());
-            let galley = wysiwyg_layout(
-                ui,
-                projection.text(),
-                &projection,
-                480.0,
-                app_palette(false),
-                true,
-            );
-            let code_start = projection.text().find("code").unwrap();
-            let code_start = projection.text()[..code_start].chars().count();
-            let row = galley
-                .rows
-                .iter()
-                .find(|row| code_start < row.glyphs.len())
-                .expect("single-line inline code should have a row");
-            let glyph = &row.glyphs[code_start];
-            let glyph_rect = glyph.logical_rect().translate(row.pos.to_vec2());
-            let shapes = rounded_inline_code_backgrounds(
-                &galley,
-                egui::Pos2::ZERO,
-                &runs,
-                app_palette(false),
-            );
-            let egui::Shape::Rect(chip) = &shapes[0] else {
-                panic!("inline code background should start with a rectangle");
-            };
-            measured = Some((row.rect(), glyph_rect, chip.rect));
-        });
-
-        let (row, glyph, chip) = measured.expect("layout should be measured");
-        assert!((glyph.center().y - row.center().y).abs() <= 0.5);
-        assert!((chip.center().y - row.center().y).abs() <= 0.5);
-        assert_eq!(glyph.height(), WYSIWYG_INLINE_CODE_LINE_HEIGHT);
-        assert_eq!(
-            chip.height(),
-            WYSIWYG_INLINE_CODE_LINE_HEIGHT + 2.0 * WYSIWYG_INLINE_CODE_VERTICAL_PADDING
-        );
-    }
-
-    #[test]
-    fn wysiwyg_editor_keeps_trailing_newlines_inside_the_active_range() {
-        let source = "第一段\n\n第二段";
-        let blocks = markdown::blocks(source);
-        let first_range = hybrid_edit_range(source, &blocks, blocks[0].id);
-        assert_eq!(&source[first_range], "第一段\n\n");
-
-        let mut trailing = "换句话".to_owned();
-        let original_blocks = markdown::blocks(&trailing);
-        let original_range = hybrid_edit_range(&trailing, &original_blocks, original_blocks[0].id);
-        let replacement = format!("{}\n", &trailing[original_range.clone()]);
-        trailing.replace_range(original_range, &replacement);
-
-        let updated_blocks = markdown::blocks(&trailing);
-        let updated_range = hybrid_edit_range(&trailing, &updated_blocks, updated_blocks[0].id);
-        assert_eq!(&trailing[updated_range], "换句话\n");
-        assert_eq!(multiline_edit_rows(&trailing), 2);
-    }
-
-    #[test]
-    fn hidden_inline_code_boundaries_preserve_the_outside_cursor_side() {
-        let source = "`abc`";
-        let projection = VisualProjection::from_markdown(source);
-        let previous_source = 5..5;
-        let previous_visual = projection.visual_char_range(source, previous_source.clone());
-        assert_eq!(previous_visual, 3..3);
-
-        assert_eq!(
-            source_selection_after_visual_input(
-                &projection,
-                source,
-                Some(&previous_source),
-                Some(&previous_visual),
-                previous_visual.clone(),
-            ),
-            previous_source
-        );
-        assert_eq!(
-            source_selection_after_visual_input(
-                &projection,
-                source,
-                Some(&(5..5)),
-                Some(&(3..3)),
-                2..2,
-            ),
-            3..3
-        );
-
-        let changed_source = "x";
-        let changed_projection = VisualProjection::from_markdown(changed_source);
-        assert_eq!(
-            source_selection_after_visual_input(
-                &changed_projection,
-                changed_source,
-                Some(&(99..99)),
-                Some(&(0..0)),
-                0..0,
-            ),
-            0..0
-        );
-    }
-
-    #[test]
-    fn cursor_localization_saturates_both_selection_ends() {
-        let range = CCursorRange::two(CCursor::new(1), CCursor::new(3));
-        let localized = cursor_range_saturating_sub(range, 10);
-        assert_eq!(localized.primary.index.0, 0);
-        assert_eq!(localized.secondary.index.0, 0);
-    }
-
-    #[test]
-    fn heading_line_navigation_handles_unicode_and_out_of_range_lines() {
-        let source = "标题\r\n第二行\nthird";
-        assert_eq!(line_start_byte(source, 1), 0);
-        assert_eq!(&source[line_start_byte(source, 2)..], "第二行\nthird");
-        assert_eq!(&source[line_start_byte(source, 3)..], "third");
-        assert_eq!(line_start_byte(source, 99), source.len());
-    }
-
-    #[test]
-    fn source_code_editor_enter_continues_one_nested_list_prefix() {
-        use egui::{Event, Id, Modifiers, RawInput};
-
-        let context = Context::default();
-        let id = Id::new("source-list-enter-regression");
-        let mut source = "  - item".to_owned();
-        let mut cursor = None;
-        let _ = context.run_ui(
-            RawInput {
-                events: vec![Event::Key {
-                    key: Key::Enter,
-                    physical_key: Some(Key::Enter),
-                    pressed: true,
-                    repeat: false,
-                    modifiers: Modifiers::NONE,
-                }],
-                ..RawInput::default()
-            },
-            |ui| {
-                let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
-                state
-                    .cursor
-                    .set_char_range(Some(CCursorRange::one(CCursor::new(
-                        source.chars().count(),
-                    ))));
-                state.store(ui.ctx(), id);
-                ui.memory_mut(|memory| memory.request_focus(id));
-                let output = TextEdit::multiline(&mut source)
-                    .id(id)
-                    .code_editor()
-                    .show(ui);
-                cursor = output
-                    .cursor_range
-                    .map(cursor_range_to_char_range)
-                    .map(|range| range.end);
-            },
-        );
-
-        assert!(
-            matches!(source.as_str(), "  - item\n" | "  - item\n  "),
-            "egui may change its code-editor auto-indent policy between releases: {source:?}"
-        );
-        let cursor = cursor.expect("the focused source editor should retain its cursor");
-        let selection = editing::continue_markdown_line(&mut source, cursor).unwrap();
-        assert_eq!(source, "  - item\n  - ");
-        assert_eq!(selection.end, source.chars().count());
-    }
-
-    #[test]
-    fn wysiwyg_reads_click_and_drag_selection_from_the_post_pointer_state() {
-        use egui::{Event, Id, Modifiers, PointerButton, RawInput, Rect, pos2, vec2};
-
-        fn run_frame(
-            context: &Context,
-            id: Id,
-            text: &mut String,
-            events: Vec<Event>,
-            request_focus: bool,
-        ) -> (Arc<egui::Galley>, egui::Pos2, Option<CCursorRange>) {
-            let mut result = None;
-            let _ = context.run_ui(
-                RawInput {
-                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 160.0))),
-                    events,
-                    ..RawInput::default()
-                },
-                |ui| {
-                    ui.set_width(480.0);
-                    if request_focus {
-                        ui.memory_mut(|memory| memory.request_focus(id));
-                    }
-                    let output = TextEdit::singleline(text).id(id).show(ui);
-                    result = Some((
-                        output.galley.clone(),
-                        output.galley_pos,
-                        text_edit_cursor_after_input(&output),
-                    ));
-                },
-            );
-            result.expect("text edit should be laid out")
-        }
-
-        fn cursor_position(
-            galley: &egui::Galley,
-            galley_pos: egui::Pos2,
-            index: usize,
-        ) -> egui::Pos2 {
-            galley_pos
-                + galley
-                    .pos_from_cursor(CCursor::new(index))
-                    .center()
-                    .to_vec2()
-        }
-
-        let context = Context::default();
-        let id = Id::new("wysiwyg-pointer-selection-regression");
-        let mut text = "alpha beta 中文".to_owned();
-        let (galley, galley_pos, _) = run_frame(&context, id, &mut text, Vec::new(), true);
-        let click = cursor_position(&galley, galley_pos, 2);
-        let (_, _, clicked) = run_frame(
-            &context,
-            id,
-            &mut text,
-            vec![
-                Event::PointerMoved(click),
-                Event::PointerButton {
-                    pos: click,
-                    button: PointerButton::Primary,
-                    pressed: true,
-                    modifiers: Modifiers::NONE,
-                },
-            ],
-            false,
-        );
-        assert_eq!(clicked.map(cursor_range_to_char_range), Some(2..2));
-
-        let (galley, galley_pos, _) = run_frame(&context, id, &mut text, Vec::new(), false);
-        let drag_to = cursor_position(&galley, galley_pos, 10);
-        let (_, _, selected) = run_frame(
-            &context,
-            id,
-            &mut text,
-            vec![Event::PointerMoved(drag_to)],
-            false,
-        );
-        let selected = selected.expect("dragging should create a selection");
-        assert_eq!(cursor_range_to_char_range(selected), 2..10);
-        assert_eq!(selected.primary.index.0, 10);
-        assert_eq!(selected.secondary.index.0, 2);
-
-        let (galley, galley_pos, _) = run_frame(
-            &context,
-            id,
-            &mut text,
-            vec![Event::PointerButton {
-                pos: drag_to,
-                button: PointerButton::Primary,
-                pressed: false,
-                modifiers: Modifiers::NONE,
-            }],
-            false,
-        );
-
-        let reverse_start = cursor_position(&galley, galley_pos, 12);
-        let (_, _, reverse_anchor) = run_frame(
-            &context,
-            id,
-            &mut text,
-            vec![
-                Event::PointerMoved(reverse_start),
-                Event::PointerButton {
-                    pos: reverse_start,
-                    button: PointerButton::Primary,
-                    pressed: true,
-                    modifiers: Modifiers::NONE,
-                },
-            ],
-            false,
-        );
-        assert_eq!(reverse_anchor.map(cursor_range_to_char_range), Some(12..12));
-
-        let (galley, galley_pos, _) = run_frame(&context, id, &mut text, Vec::new(), false);
-        let reverse_to = cursor_position(&galley, galley_pos, 6);
-        let (_, _, reverse_selected) = run_frame(
-            &context,
-            id,
-            &mut text,
-            vec![Event::PointerMoved(reverse_to)],
-            false,
-        );
-        let reverse_selected = reverse_selected.expect("reverse dragging should select text");
-        assert_eq!(cursor_range_to_char_range(reverse_selected), 6..12);
-        assert_eq!(reverse_selected.primary.index.0, 6);
-        assert_eq!(reverse_selected.secondary.index.0, 12);
-
-        let reverse = cursor_range_with_direction(
-            2..10,
-            CCursorRange::two(CCursor::new(10), CCursor::new(2)),
-        );
-        assert_eq!(reverse.primary.index.0, 2);
-        assert_eq!(reverse.secondary.index.0, 10);
-    }
-
-    #[test]
-    fn wysiwyg_text_edit_keeps_source_cursor_when_markers_become_hidden() {
-        use egui::{Event, Id, Modifiers, RawInput};
-
-        fn edit_frame(
-            context: &Context,
-            id: Id,
-            source: &str,
-            source_selection: std::ops::Range<usize>,
-            events: Vec<Event>,
-        ) -> crate::wysiwyg::VisualSourceEdit {
-            let projection = VisualProjection::from_markdown_with_selection(
-                source,
-                Some(source_selection.clone()),
-            );
-            let visual_selection = projection.visual_char_range(source, source_selection);
-            let mut visual_content = projection.text().to_owned();
-            let mut result = None;
-            let _ = context.run_ui(
-                RawInput {
-                    events,
-                    ..RawInput::default()
-                },
-                |ui| {
-                    let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
-                    state
-                        .cursor
-                        .set_char_range(Some(CCursorRange::one(CCursor::new(
-                            visual_selection.start,
-                        ))));
-                    state.store(ui.ctx(), id);
-                    ui.memory_mut(|memory| memory.request_focus(id));
-                    let output = TextEdit::multiline(&mut visual_content)
-                        .id(id)
-                        .hint_text("开始写作…")
-                        .show(ui);
-                    let visual_cursor = text_edit_cursor_after_input(&output)
-                        .map(cursor_range_to_char_range)
-                        .expect("focused TextEdit should retain a cursor");
-                    result = projection.apply_edit(source, &visual_content, visual_cursor);
-                },
-            );
-            result.expect("typed frame should update the source")
-        }
-
-        fn type_frame(
-            context: &Context,
-            id: Id,
-            source: &str,
-            source_selection: std::ops::Range<usize>,
-            text: &str,
-        ) -> crate::wysiwyg::VisualSourceEdit {
-            edit_frame(
-                context,
-                id,
-                source,
-                source_selection,
-                vec![Event::Text(text.to_owned())],
-            )
-        }
-
-        let context = Context::default();
-        let id = Id::new("wysiwyg-hidden-marker-cursor-regression");
-        let mut update = type_frame(&context, id, "", 0..0, "#");
-        assert_eq!(update.source, "#");
-        update = type_frame(&context, id, &update.source, update.selection, " ");
-        assert_eq!(update.source, "# ");
-        update = type_frame(&context, id, &update.source, update.selection, "ATX 标题");
-        assert_eq!(update.source, "# ATX 标题");
-
-        update = edit_frame(
-            &context,
-            id,
-            &update.source,
-            update.selection,
-            vec![Event::Key {
-                key: Key::Enter,
-                physical_key: Some(Key::Enter),
-                pressed: true,
-                repeat: false,
-                modifiers: Modifiers::NONE,
-            }],
-        );
-        update.selection = complete_visual_enter(&mut update.source, update.selection, false);
-        assert_eq!(update.source, "# ATX 标题\n");
-        update = type_frame(&context, id, &update.source, update.selection, "下一行");
-        assert_eq!(update.source, "# ATX 标题\n下一行");
-    }
-
-    #[test]
-    fn block_boundary_backspace_can_remove_one_blank_line_at_a_time() {
-        let mut source = "`a\n\n\n`".to_owned();
-        for expected in ["`a\n\n`", "`a\n`"] {
-            let blocks = markdown::blocks(&source);
-            let closing = source.chars().count() - 1;
-            let block = block_for_char_index(&source, &blocks, closing);
-            let edit_range = hybrid_edit_range(&source, &blocks, block.id);
-            assert_eq!(&source[edit_range.clone()], "`");
-
-            let original_block = source[edit_range.clone()].to_owned();
-            let (replacement_range, cursor) = boundary_backspace_edit(&source, edit_range).unwrap();
-            source.replace_range(replacement_range, &original_block);
-            assert_eq!(source, expected);
-            assert_eq!(cursor, expected.chars().count() - 1);
-        }
-
-        assert_eq!(line_break_before("one\r\ntwo", 5), Some(3..5));
-        assert_eq!(line_break_before("one two", 4), None);
-    }
-
-    #[test]
-    fn paragraph_boundary_backspace_removes_each_extra_blank_line() {
-        let mut source = "first\n\n\n\nsecond".to_owned();
-        for expected in ["first\n\n\nsecond", "first\n\nsecond"] {
-            let blocks = markdown::blocks(&source);
-            let second_range = hybrid_edit_range(&source, &blocks, blocks[1].id);
-            let second = source[second_range.clone()].to_owned();
-            let (replacement, cursor) = boundary_backspace_edit(&source, second_range).unwrap();
-            source.replace_range(replacement, &second);
-            assert_eq!(source, expected);
-            assert_eq!(cursor, expected.find("second").unwrap());
-        }
-    }
-
-    #[test]
-    fn wysiwyg_editor_preserves_extra_blank_lines_between_blocks() {
-        for (source, expected) in [
-            ("第一段\n\n第二段", 0),
-            ("第一段\n\n\n第二段", 1),
-            ("第一段\n\n\n\n第二段", 2),
-        ] {
-            let blocks = markdown::blocks(source);
-            assert_eq!(blocks.len(), 2, "source: {source:?}");
-            let gap = blocks[0].range.end..blocks[1].range.start;
-            assert_eq!(
-                extra_inter_block_blank_lines(source, gap),
-                expected,
-                "source: {source:?}"
-            );
-        }
-
-        let source = "第一段\n\n\n\n第二段";
-        let blocks = markdown::blocks(source);
-        let first_range = hybrid_edit_range(source, &blocks, blocks[0].id);
-        assert_eq!(&source[first_range], "第一段\n\n\n\n");
-
-        let gap = blocks[0].range.end..blocks[1].range.start;
-        let first_blank_cursor = "第一段\n\n".chars().count();
-        assert_eq!(
-            block_for_char_index(source, &blocks, first_blank_cursor).id,
-            blocks[0].id
-        );
-        assert_eq!(
-            block_for_char_index(source, &blocks, "第一段\n\n\n\n".chars().count()).id,
-            blocks[1].id
-        );
-        assert_eq!(
-            inter_block_blank_line_cursor_byte(source, gap.clone(), 0),
-            Some("第一段\n\n".len())
-        );
-        assert_eq!(
-            inter_block_blank_line_cursor_byte(source, gap, 1),
-            Some("第一段\n\n\n".len())
-        );
-
-        let crlf = "first\r\n\r\n\r\n\r\nsecond";
-        let crlf_blocks = markdown::blocks(crlf);
-        let crlf_gap = crlf_blocks[0].range.end..crlf_blocks[1].range.start;
-        assert_eq!(extra_inter_block_blank_lines(crlf, crlf_gap.clone()), 2);
-        assert_eq!(
-            inter_block_blank_line_cursor_byte(crlf, crlf_gap, 0),
-            Some("first\r\n\r\n".len())
-        );
-    }
-
-    #[test]
-    fn classifies_ime_preedit_commit_and_cancel_frames() {
-        use egui::{Event, ImeEvent};
-
-        assert_eq!(
-            ime_frame_action(&[Event::Ime(ImeEvent::Preedit {
-                text: "ni".to_owned(),
-                active_range_chars: Some(0..2),
-            })]),
-            ImeFrameAction::Preedit
-        );
-        assert_eq!(
-            ime_frame_action(&[Event::Ime(ImeEvent::Commit("你".to_owned()))]),
-            ImeFrameAction::Commit
-        );
-        assert_eq!(
-            ime_frame_action(&[Event::Ime(ImeEvent::Preedit {
-                text: String::new(),
-                active_range_chars: None,
-            })]),
-            ImeFrameAction::Cancel
-        );
-    }
-
-    #[test]
-    fn wysiwyg_ime_session_preserves_preedit_text_between_frames() {
-        use egui::{Event, Id, ImeEvent, RawInput};
-
-        fn run_frame(
-            context: &Context,
-            text: &mut String,
-            events: Vec<Event>,
-            request_focus: bool,
-        ) {
-            let _ = context.run_ui(
-                RawInput {
-                    events,
-                    ..RawInput::default()
-                },
-                |ui| {
-                    let id = Id::new("wysiwyg-ime-regression");
-                    if request_focus {
-                        ui.memory_mut(|memory| memory.request_focus(id));
-                    }
-                    TextEdit::multiline(text).id(id).show(ui);
-                },
-            );
-        }
-
-        let context = Context::default();
-        let block_id = markdown::blocks("")[0].id;
-        let mut session = HybridImeSession {
-            document_id: 1,
-            block_id,
-            base_source: String::new(),
-            visual_content: String::new(),
-        };
-
-        run_frame(&context, &mut session.visual_content, Vec::new(), true);
-        run_frame(
-            &context,
-            &mut session.visual_content,
-            vec![Event::Ime(ImeEvent::Preedit {
-                text: "n".to_owned(),
-                active_range_chars: Some(0..1),
-            })],
-            false,
-        );
-        assert_eq!(session.visual_content, "n");
-
-        run_frame(
-            &context,
-            &mut session.visual_content,
-            vec![Event::Ime(ImeEvent::Preedit {
-                text: "ni".to_owned(),
-                active_range_chars: Some(0..2),
-            })],
-            false,
-        );
-        assert_eq!(session.visual_content, "ni");
-
-        run_frame(
-            &context,
-            &mut session.visual_content,
-            vec![Event::Ime(ImeEvent::Commit("你".to_owned()))],
-            false,
-        );
-        assert_eq!(session.visual_content, "你");
-    }
-
-    #[test]
-    fn wysiwyg_third_backtick_accepts_code_on_the_very_next_frame() {
-        use egui::{Event, Id, Modifiers, RawInput};
-
-        fn edit_frame(
-            context: &Context,
-            id: Id,
-            source: &str,
-            source_selection: std::ops::Range<usize>,
-            events: Vec<Event>,
-        ) -> crate::wysiwyg::VisualSourceEdit {
-            let projection = VisualProjection::from_markdown_with_selection(
-                source,
-                Some(source_selection.clone()),
-            );
-            let visual_selection = projection.visual_char_range(source, source_selection);
-            let mut visual_content = projection.text().to_owned();
-            let mut result = None;
-            let _ = context.run_ui(
-                RawInput {
-                    events,
-                    ..RawInput::default()
-                },
-                |ui| {
-                    let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
-                    state
-                        .cursor
-                        .set_char_range(Some(CCursorRange::one(CCursor::new(
-                            visual_selection.start,
-                        ))));
-                    state.store(ui.ctx(), id);
-                    ui.memory_mut(|memory| memory.request_focus(id));
-                    let mut editor = TextEdit::multiline(&mut visual_content).id(id);
-                    if is_fenced_code_block(source) {
-                        editor = editor.code_editor();
-                    }
-                    let output = editor.show(ui);
-                    let visual_cursor = text_edit_cursor_after_input(&output)
-                        .map(cursor_range_to_char_range)
-                        .expect("focused editor should retain a cursor");
-                    result = projection.apply_edit(source, &visual_content, visual_cursor);
-                },
-            );
-            result.expect("typing should update the projected source")
-        }
-
-        fn type_frame(
-            context: &Context,
-            id: Id,
-            source: &str,
-            source_selection: std::ops::Range<usize>,
-            text: &str,
-        ) -> crate::wysiwyg::VisualSourceEdit {
-            edit_frame(
-                context,
-                id,
-                source,
-                source_selection,
-                vec![Event::Text(text.to_owned())],
-            )
-        }
-
-        let context = Context::default();
-        let id = Id::new("wysiwyg-fence-first-code-regression");
-        let mut update = crate::wysiwyg::VisualSourceEdit {
-            source: String::new(),
-            selection: 0..0,
-        };
-        for marker in ["`", "`", "`"] {
-            update = type_frame(&context, id, &update.source, update.selection, marker);
-            if let Some(selection) =
-                complete_bare_fenced_code_after_typing(&mut update.source, update.selection.clone())
-            {
-                update.selection = selection;
-            }
-        }
-        assert_eq!(update.source, "```\n\n```");
-        assert_eq!(update.selection, 4..4);
-
-        update = type_frame(
-            &context,
-            id,
-            &update.source,
-            update.selection,
-            "fn main() {} 中文",
-        );
-        assert_eq!(update.source, "```\nfn main() {} 中文\n```");
-        assert_eq!(
-            VisualProjection::from_markdown(&update.source).text(),
-            "fn main() {} 中文"
-        );
-
-        update = edit_frame(
-            &context,
-            id,
-            &update.source,
-            update.selection,
-            vec![Event::Key {
-                key: Key::Enter,
-                physical_key: Some(Key::Enter),
-                pressed: true,
-                repeat: false,
-                modifiers: Modifiers::NONE,
-            }],
-        );
-        for marker in ["`", "`", "`"] {
-            update = type_frame(&context, id, &update.source, update.selection, marker);
-            if let Some(selection) =
-                consume_paired_fenced_code_closer(&mut update.source, update.selection.clone())
-            {
-                update.selection = selection;
-            } else if let Some(selection) =
-                complete_bare_fenced_code_after_typing(&mut update.source, update.selection.clone())
-            {
-                update.selection = selection;
-            }
-        }
-        assert_eq!(update.source, "```\nfn main() {} 中文\n```\n\n");
-        assert_eq!(update.selection.end, update.source.chars().count());
-
-        update = type_frame(&context, id, &update.source, update.selection, "AFTER");
-        assert_eq!(update.source, "```\nfn main() {} 中文\n```\n\nAFTER");
-    }
-
-    #[test]
-    fn cross_block_input_is_consumed_before_the_active_widget_can_duplicate_it() {
-        use egui::{Event, RawInput};
-
-        let context = Context::default();
-        let mut action = None;
-        let mut remaining = usize::MAX;
-        let _ = context.run_ui(
-            RawInput {
-                events: vec![Event::Text("替换".to_owned())],
-                ..RawInput::default()
-            },
-            |ui| {
-                action = take_cross_block_input(ui);
-                remaining = ui.input(|input| input.events.len());
-            },
-        );
-        assert!(matches!(action, Some(CrossBlockInput::Replace(ref text)) if text == "替换"));
-        assert_eq!(remaining, 0);
-
-        let selected = "前段\n\n```\ncode\n```";
-        let range = clamp_char_range(selected, 2..selected.chars().count());
-        let start = char_to_byte(selected, range.start);
-        let end = char_to_byte(selected, range.end);
-        let mut replaced = selected.to_owned();
-        replaced.replace_range(start..end, "新");
-        assert_eq!(replaced, "前段新");
-    }
-
-    #[test]
-    fn cross_block_selection_intersects_each_unicode_block_in_source_coordinates() {
-        let source = "段落 alpha\n\n```\n代码 beta\n```";
-        let blocks = markdown::blocks(source);
-        assert_eq!(blocks.len(), 2);
-        let selection_start = source[..source.find("alpha").unwrap()].chars().count() + 2;
-        let selection_end = source[..source.find("beta").unwrap()].chars().count() + 2;
-        let selection = selection_start..selection_end;
-
-        let first = hybrid_region_selection(source, &blocks[0].range, &selection).unwrap();
-        let second = hybrid_region_selection(source, &blocks[1].range, &selection).unwrap();
-        assert_eq!(first.start, "段落 al".chars().count());
-        assert_eq!(first.end, source[blocks[0].range.clone()].chars().count());
-        assert_eq!(second.start, 0);
-        assert!(second.end > "```\n代码 b".chars().count());
-    }
-}
+#[path = "product_document_tests.rs"]
+mod product_document_tests;
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod tests;

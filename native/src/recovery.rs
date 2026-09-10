@@ -1,6 +1,6 @@
 use std::{
-    cell::Cell,
-    collections::hash_map::DefaultHasher,
+    cell::{Cell, RefCell},
+    collections::{HashSet, hash_map::DefaultHasher},
     fs::{self, File},
     hash::{Hash, Hasher},
     io::{Read, Write},
@@ -140,6 +140,22 @@ struct BoundedByteCounter {
     exceeded: bool,
 }
 
+fn entries_fit_budget(entries: &[RecoveryEntry]) -> Result<bool, String> {
+    if entries.len() > MAX_RECOVERY_DOCUMENTS {
+        return Ok(false);
+    }
+    let mut counter = BoundedByteCounter {
+        bytes: 0,
+        limit: (MAX_RECOVERY_BYTES as usize).saturating_sub(1_024),
+        exceeded: false,
+    };
+    match serde_json::to_writer(&mut counter, entries) {
+        Ok(()) => Ok(true),
+        Err(_) if counter.exceeded => Ok(false),
+        Err(error) => Err(format!("无法估算恢复快照编码大小：{error}")),
+    }
+}
+
 impl Write for BoundedByteCounter {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         let Some(next) = self.bytes.checked_add(buffer.len()) else {
@@ -171,6 +187,13 @@ enum RecoveryLoadError {
 pub struct RecoveryStore {
     path: Option<PathBuf>,
     preserve_blocked: Cell<bool>,
+    written_snapshot: RefCell<Option<WrittenSnapshot>>,
+}
+
+#[derive(Clone)]
+struct WrittenSnapshot {
+    checksum: String,
+    document_ids: Vec<u64>,
 }
 
 impl RecoveryStore {
@@ -179,6 +202,7 @@ impl RecoveryStore {
         Self {
             path,
             preserve_blocked: Cell::new(false),
+            written_snapshot: RefCell::new(None),
         }
     }
 
@@ -187,6 +211,7 @@ impl RecoveryStore {
         Self {
             path: Some(path),
             preserve_blocked: Cell::new(false),
+            written_snapshot: RefCell::new(None),
         }
     }
 
@@ -234,12 +259,13 @@ impl RecoveryStore {
             return Err("恢复快照来自不受支持的版本或暂时不可读，已禁止覆盖".to_owned());
         }
         let mut entries = Vec::new();
+        let mut document_ids = Vec::new();
         let mut estimated_bytes = 1_024usize;
-        let mut omitted_documents = 0usize;
+        let mut omitted_ids = HashSet::new();
         let dirty_documents = documents.iter().filter(|document| document.dirty).count();
         for document in documents.iter().filter(|document| document.dirty) {
             if entries.len() >= MAX_RECOVERY_DOCUMENTS {
-                omitted_documents += 1;
+                omitted_ids.insert(document.id());
                 continue;
             }
             let base_content = document.recovery_base_content();
@@ -266,18 +292,19 @@ impl RecoveryStore {
                 if !counter.exceeded {
                     return Err(format!("无法估算恢复条目编码大小：{error}"));
                 }
-                omitted_documents += 1;
+                omitted_ids.insert(document.id());
                 continue;
             }
             let Some(next_estimate) = estimated_bytes.checked_add(counter.bytes + 1) else {
-                omitted_documents += 1;
+                omitted_ids.insert(document.id());
                 continue;
             };
             if next_estimate as u64 > MAX_RECOVERY_BYTES {
-                omitted_documents += 1;
+                omitted_ids.insert(document.id());
                 continue;
             }
             estimated_bytes = next_estimate;
+            document_ids.push(document.id());
             entries.push(RecoveryEntry {
                 path: None,
                 path_native,
@@ -291,8 +318,43 @@ impl RecoveryStore {
         if dirty_documents == 0 {
             return self.clear();
         }
+        let mut updated_documents = entries.len();
+        let mut retained_documents = 0;
+        if !omitted_ids.is_empty()
+            && let Some(previous) = self.previous_snapshot_for(documents)?
+        {
+            for (id, entry) in &previous {
+                if omitted_ids.contains(id) {
+                    document_ids.push(*id);
+                    entries.push(entry.clone());
+                    retained_documents += 1;
+                }
+            }
+            if !entries_fit_budget(&entries)? {
+                // Updating some entries must not evict the only recovery
+                // copy of another. If both cannot fit, retain the previous
+                // copies, pruning documents explicitly closed or saved.
+                document_ids.clear();
+                entries.clear();
+                for (id, entry) in previous {
+                    document_ids.push(id);
+                    entries.push(entry);
+                }
+                updated_documents = 0;
+                retained_documents = entries.len();
+            }
+            if entries.is_empty() {
+                // The known old snapshot contained only documents that
+                // were closed or saved. Do not resurrect them merely
+                // because every remaining draft is too large to store.
+                self.clear()?;
+            }
+        }
         if entries.is_empty() {
-            return Err("所有未保存文档都超过恢复资源预算；已保留之前的快照".to_owned());
+            return Err(
+                "所有未保存文档都超过恢复资源预算，当前没有可保留的恢复副本；最新修改未保存"
+                    .to_owned(),
+            );
         }
         let Some(path) = self.path.as_deref() else {
             return Ok(());
@@ -306,12 +368,12 @@ impl RecoveryStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let checksum_sha256 = Some(entries_sha256(&entries)?);
+        let checksum = entries_sha256(&entries)?;
         let snapshot = RecoverySnapshot {
             version: RECOVERY_VERSION,
             saved_at_unix_ms,
             checksum: None,
-            checksum_sha256,
+            checksum_sha256: Some(checksum.clone()),
             documents: entries,
         };
         let json = serde_json::to_vec(&snapshot)
@@ -320,10 +382,14 @@ impl RecoveryStore {
             return Err("恢复快照编码后超过资源预算；已保留之前的快照".to_owned());
         }
         write_atomically(path, &json)?;
-        if omitted_documents > 0 {
+        *self.written_snapshot.borrow_mut() = Some(WrittenSnapshot {
+            checksum,
+            document_ids,
+        });
+        if !omitted_ids.is_empty() {
+            let unprotected_documents = dirty_documents - updated_documents - retained_documents;
             Err(format!(
-                "已保存 {} 个恢复文档，另有 {omitted_documents} 个超过资源预算未纳入",
-                dirty_documents - omitted_documents
+                "恢复资源预算不足：已更新 {updated_documents} 个文档，{retained_documents} 个仅保留上次快照，{unprotected_documents} 个无恢复副本；其余最新修改未保存"
             ))
         } else {
             Ok(())
@@ -337,11 +403,84 @@ impl RecoveryStore {
         let Some(path) = self.path.as_deref() else {
             return Ok(());
         };
-        match fs::remove_file(path) {
+        let result = match fs::remove_file(path) {
             Ok(()) => sync_parent_directory(path.parent().unwrap_or_else(|| Path::new("."))),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("无法清理恢复数据 {}：{error}", path.display())),
+        };
+        if result.is_ok() {
+            *self.written_snapshot.borrow_mut() = None;
         }
+        result
+    }
+
+    fn previous_snapshot_for(
+        &self,
+        documents: &[Document],
+    ) -> Result<Option<Vec<(u64, RecoveryEntry)>>, String> {
+        let Some(path) = self.path.as_deref() else {
+            return Ok(None);
+        };
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "恢复资源预算不足，无法检查旧快照：{error}；本次未写入"
+                ));
+            }
+            Ok(_) => {}
+        }
+        // Persisted snapshots do not contain session document IDs. Only a
+        // snapshot written by this store can be safely matched to untitled
+        // documents; path, content, and tab order are not substitutes for ID.
+        let Some(written) = self.written_snapshot.borrow().clone() else {
+            return Err(
+                "恢复资源预算不足，无法确认旧快照的文档身份；本次未写入，已完整保留旧快照"
+                    .to_owned(),
+            );
+        };
+        let mut entries = self.load_snapshot(path).map_err(|error| {
+            let (RecoveryLoadError::Corrupt(error) | RecoveryLoadError::Preserve(error)) = error;
+            format!("无法验证旧恢复快照：{error}；本次未写入")
+        })?;
+        // load_snapshot exposes decoded native paths to callers. Restore their
+        // serialized shape before comparing the exact payload we last wrote.
+        for entry in &mut entries {
+            if entry.path_native.is_some() {
+                entry.path = None;
+            }
+        }
+        if entries.len() != written.document_ids.len()
+            || entries_sha256(&entries)? != written.checksum
+        {
+            return Err(
+                "恢复资源预算不足，旧快照已变化，无法确认文档身份；本次未写入，已保留旧快照"
+                    .to_owned(),
+            );
+        }
+        let mut retained = Vec::new();
+        for (id, mut entry) in written.document_ids.into_iter().zip(entries) {
+            let Some(document) = documents
+                .iter()
+                .find(|document| document.id() == id && document.dirty)
+            else {
+                continue;
+            };
+            let previous_path = entry
+                .path_native
+                .as_ref()
+                .map(RecoveryPath::decode)
+                .transpose()?
+                .or_else(|| entry.path.clone());
+            if previous_path != document.path {
+                // A save-as or relink can change the file associated with this
+                // ID. Preserve old text as a copy, never against the old file.
+                entry.path = None;
+                entry.path_native = None;
+            }
+            retained.push((id, entry));
+        }
+        Ok(Some(retained))
     }
 
     fn load_snapshot(&self, path: &Path) -> Result<Vec<RecoveryEntry>, RecoveryLoadError> {
@@ -511,6 +650,136 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_partial_recovery_save_keeps_the_omitted_documents_previous_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::at(directory.path().join("recovery.json"));
+        let mut documents = vec![Document::untitled(1), Document::untitled(2)];
+        documents[0].content = "draft A before growth".to_owned();
+        documents[0].update_after_edit();
+        documents[1].content = "draft B before update".to_owned();
+        documents[1].update_after_edit();
+        store.save(&documents).unwrap();
+
+        // The document's allowed text size still fits its own 64 MiB limit,
+        // while recovery JSON needs additional room for metadata and a base.
+        documents[0].content = "x".repeat(MAX_RECOVERY_BYTES as usize);
+        documents[1].content = "draft B latest".to_owned();
+        documents[1].update_after_edit();
+        let error = store.save(&documents).unwrap_err();
+        let recovered = store.load().unwrap();
+
+        assert!(error.contains("预算"), "{error}");
+        assert!(
+            recovered
+                .iter()
+                .any(|entry| entry.content == "draft A before growth"),
+            "a failed partial save discarded A's previous recovery copy"
+        );
+        assert!(
+            recovered
+                .iter()
+                .any(|entry| entry.content == "draft B latest"),
+            "B still fits the budget and should receive its current snapshot"
+        );
+    }
+
+    #[test]
+    fn audit_partial_recovery_save_with_unknown_ids_preserves_the_complete_old_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recovery.json");
+        let mut documents = audit_dirty_documents(2);
+        RecoveryStore::at(path.clone()).save(&documents).unwrap();
+        let original = fs::read(&path).unwrap();
+        let new_store = RecoveryStore::at(path.clone());
+        assert_eq!(new_store.load().unwrap().len(), 2);
+        documents[0].content = "x".repeat(MAX_RECOVERY_BYTES as usize);
+        documents[1].content = "newer B".to_owned();
+
+        let error = new_store.save(&documents).unwrap_err();
+
+        assert!(error.contains("身份"), "{error}");
+        assert!(error.contains("本次未写入"), "{error}");
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn audit_partial_recovery_save_does_not_resurrect_closed_document_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::at(directory.path().join("recovery.json"));
+        let mut documents = audit_dirty_documents(3);
+        store.save(&documents).unwrap();
+        documents.remove(2);
+        documents[0].content = "x".repeat(MAX_RECOVERY_BYTES as usize);
+        documents[1].content = "newer B".to_owned();
+
+        assert!(store.save(&documents).is_err());
+        let entries = store.load().unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.content == "draft 0"));
+        assert!(entries.iter().any(|entry| entry.content == "newer B"));
+        assert!(!entries.iter().any(|entry| entry.content == "draft 2"));
+
+        // Closing the final previously snapshotted documents must remove their
+        // entries even when a newly created draft is too large to recover.
+        documents.remove(1);
+        let mut replacement = Document::untitled(1);
+        replacement.content = std::mem::take(&mut documents[0].content);
+        replacement.dirty = true;
+        let error = store.save(&[replacement]).unwrap_err();
+        assert!(error.contains("没有可保留的恢复副本"), "{error}");
+        assert!(store.load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn audit_recovery_count_fallback_retains_old_drafts_and_prunes_closed_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::at(directory.path().join("recovery.json"));
+        let mut documents = audit_dirty_documents(MAX_RECOVERY_DOCUMENTS);
+        store.save(&documents).unwrap();
+        documents.remove(0);
+        documents.splice(0..0, audit_dirty_documents(2));
+
+        let error = store.save(&documents).unwrap_err();
+        let entries = store.load().unwrap();
+
+        assert!(error.contains("已更新 0 个文档"), "{error}");
+        assert_eq!(entries.len(), MAX_RECOVERY_DOCUMENTS - 1);
+        assert!(entries.iter().any(|entry| entry.content == "draft 99"));
+        assert!(!entries.iter().any(|entry| entry.content == "draft 0"));
+    }
+
+    #[test]
+    fn audit_partial_recovery_save_rejects_a_replaced_snapshot_identity_map() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recovery.json");
+        let store = RecoveryStore::at(path.clone());
+        let mut documents = audit_dirty_documents(MAX_RECOVERY_DOCUMENTS);
+        store.save(&documents).unwrap();
+        RecoveryStore::at(path.clone())
+            .save(&audit_dirty_documents(1))
+            .unwrap();
+        let replaced = fs::read(&path).unwrap();
+        documents.extend(audit_dirty_documents(1));
+
+        let error = store.save(&documents).unwrap_err();
+
+        assert!(error.contains("旧快照已变化"), "{error}");
+        assert_eq!(fs::read(path).unwrap(), replaced);
+    }
+
+    fn audit_dirty_documents(count: usize) -> Vec<Document> {
+        (0..count)
+            .map(|index| {
+                let mut document = Document::untitled(index + 1);
+                document.content = format!("draft {index}");
+                document.update_after_edit();
+                document
+            })
+            .collect()
+    }
 
     #[test]
     fn saves_only_dirty_documents_and_loads_them_back() {

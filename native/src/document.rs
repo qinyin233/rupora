@@ -39,6 +39,54 @@ pub struct HistoryOutcome {
     pub selection: Option<Range<usize>>,
 }
 
+/// An opaque version of one document's content and path context.
+///
+/// Equal text after an undo or reload does not make an older token current again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SnapshotToken {
+    document_id: u64,
+    revision: u64,
+}
+
+impl SnapshotToken {
+    pub fn document_id(self) -> u64 {
+        self.document_id
+    }
+}
+
+/// Owned inputs for delayed work. Accessors cannot change the captured version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentSnapshot {
+    token: SnapshotToken,
+    text: String,
+    path: Option<PathBuf>,
+}
+
+impl DocumentSnapshot {
+    pub fn token(&self) -> SnapshotToken {
+        self.token
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaleSnapshot;
+
+impl std::fmt::Display for StaleSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("document changed after the snapshot was captured")
+    }
+}
+
+impl std::error::Error for StaleSnapshot {}
+
 #[derive(Debug)]
 pub struct RecoveryOutcome {
     pub document: Document,
@@ -96,6 +144,7 @@ impl LineEnding {
 #[derive(Debug)]
 pub struct Document {
     id: u64,
+    revision: u64,
     pub path: Option<PathBuf>,
     pub content: String,
     pub encoding: TextEncoding,
@@ -120,6 +169,7 @@ impl Document {
         let block_index = BlockIndex::new(&content);
         Self {
             id: next_document_id(),
+            revision: 0,
             path: None,
             analysis: analyze(&content),
             content,
@@ -162,6 +212,7 @@ impl Document {
         let file_fingerprint = fingerprint_from_metadata(&bounded.metadata, &bytes);
         Ok(Self {
             id: next_document_id(),
+            revision: 0,
             path: Some(path.to_path_buf()),
             analysis: analyze(&content),
             saved_content: content.clone(),
@@ -195,12 +246,76 @@ impl Document {
             })
     }
 
-    /// Returns an identity that remains stable while the document moves within the tab list.
+    /// Stable across tab moves, reloads and Save As; revisions identify changes within it.
     pub fn id(&self) -> u64 {
         self.id
     }
 
+    pub fn snapshot_token(&self) -> SnapshotToken {
+        SnapshotToken {
+            document_id: self.id,
+            revision: self.revision,
+        }
+    }
+
+    pub fn snapshot(&self) -> DocumentSnapshot {
+        DocumentSnapshot {
+            token: self.snapshot_token(),
+            text: self.content.clone(),
+            path: self.path.clone(),
+        }
+    }
+
+    /// Applies an action as one document edit, capturing its actual pre-edit text.
+    ///
+    /// The closure receives a working copy. If it panics, the panic propagates and
+    /// the document's text, history, dirty state, and version remain unchanged.
+    /// If its final text equals the original, no transaction is committed and
+    /// redo history is preserved. Typing edits retain the existing coalescing rules.
+    /// Selection ranges use Unicode character indices, as in `record_edit`.
+    pub fn edit(
+        &mut self,
+        kind: EditKind,
+        selection_before: Option<Range<usize>>,
+        action: impl FnOnce(&mut String) -> Option<Range<usize>>,
+    ) -> bool {
+        let mut working = self.content.clone();
+        let selection_after = action(&mut working);
+        if working == self.content {
+            return false;
+        }
+        let before = std::mem::replace(&mut self.content, working);
+        self.record_edit(before, selection_before, selection_after, kind)
+    }
+
+    /// Validates delayed work before running its closure, then commits through `edit`.
+    pub fn edit_if_current(
+        &mut self,
+        token: SnapshotToken,
+        kind: EditKind,
+        selection_before: Option<Range<usize>>,
+        action: impl FnOnce(&mut String) -> Option<Range<usize>>,
+    ) -> Result<bool, StaleSnapshot> {
+        if token != self.snapshot_token() {
+            return Err(StaleSnapshot);
+        }
+        Ok(self.edit(kind, selection_before, action))
+    }
+
+    fn advance_revision(&mut self) {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("document revision exhausted");
+    }
+
+    /// Publishes a legacy direct content edit and refreshes derived state.
+    ///
+    /// This explicit notification conservatively advances the version. Callers
+    /// using the public content field must call this or `record_edit`; prefer
+    /// `edit` for actions so a missing notification cannot lose an edit.
     pub fn update_after_edit(&mut self) {
+        self.advance_revision();
         self.dirty = self.content != self.saved_content;
         self.analysis = analyze(&self.content);
         self.block_index.update(&self.content);
@@ -209,6 +324,7 @@ impl Document {
     }
 
     fn mark_after_edit(&mut self, edited_at: Instant) {
+        self.advance_revision();
         self.dirty = self.content != self.saved_content;
         self.derived_state_stale = true;
         self.last_content_edit = Some(edited_at);
@@ -243,6 +359,11 @@ impl Document {
     pub fn blocks(&mut self) -> &[MarkdownBlock] {
         self.refresh_derived_state();
         self.block_index.blocks()
+    }
+
+    pub(crate) fn references(&mut self) -> std::sync::Arc<crate::markdown::ReferenceDefinitions> {
+        self.refresh_derived_state();
+        self.block_index.references()
     }
 
     pub fn record_edit(
@@ -477,6 +598,7 @@ impl Document {
         self.saved_content.clone_from(&self.content);
         self.dirty = false;
         self.typing_group_open = false;
+        self.advance_revision();
         Ok(())
     }
 
@@ -486,6 +608,10 @@ impl Document {
             .clone()
             .ok_or_else(|| "未命名文档无法从磁盘重新加载".to_owned())?;
         let mut reloaded = Self::open_unlocked(path)?;
+        // Reload replaces content, not the identity used by tabs and pending jobs.
+        reloaded.id = self.id;
+        reloaded.revision = self.revision;
+        reloaded.advance_revision();
         reloaded.lock = self.lock.take();
         *self = reloaded;
         Ok(())
@@ -1157,6 +1283,261 @@ impl TextPatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_rejects_path_changes_even_when_document_text_is_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let original_directory = directory.path().join("original");
+        let moved_directory = directory.path().join("moved");
+        fs::create_dir(&original_directory).unwrap();
+        fs::create_dir(&moved_directory).unwrap();
+        let original_path = original_directory.join("document.md");
+        let moved_path = moved_directory.join("document.md");
+        fs::write(&original_path, "相同正文🙂").unwrap();
+        let mut document = Document::open(&original_path).unwrap();
+        let snapshot = document.snapshot();
+
+        assert_eq!(snapshot.token().document_id(), document.id());
+        assert_eq!(snapshot.text(), "相同正文🙂");
+        assert_eq!(
+            snapshot.path(),
+            Some(canonical_document_path(&original_path).unwrap().as_path())
+        );
+        document.save(false).unwrap();
+        document.save_as(original_path, true).unwrap();
+        assert_eq!(document.snapshot_token(), snapshot.token());
+
+        document.save_as(moved_path.clone(), false).unwrap();
+        assert_ne!(document.snapshot_token(), snapshot.token());
+        assert_eq!(document.content, snapshot.text());
+        assert_eq!(fs::read_to_string(&moved_path).unwrap(), snapshot.text());
+        assert_ne!(document.path.as_deref(), snapshot.path());
+        let mut invoked = false;
+        let result = document.edit_if_current(snapshot.token(), EditKind::Other, None, |text| {
+            invoked = true;
+            text.push_str("old-directory-result");
+            None
+        });
+        assert_eq!(result, Err(StaleSnapshot));
+        assert!(!invoked);
+        assert_eq!(document.content, snapshot.text());
+        assert!(!document.dirty);
+    }
+
+    #[test]
+    fn atomic_edit_updates_dirty_and_derived_state_as_one_undo_step() {
+        let mut document = Document::untitled(1);
+        let original = document.snapshot();
+        assert!(document.edit(EditKind::Format, Some(0..0), |text| {
+            text.push_str("# 标题🙂\n\n正文");
+            let cursor = text.chars().count();
+            Some(cursor..cursor)
+        }));
+        let after = document.snapshot_token();
+        assert_ne!(after, original.token());
+        assert_eq!(original.text(), "");
+        assert!(document.dirty);
+        assert!(document.derived_state_is_stale());
+        assert_eq!(document.blocks().len(), 2);
+        assert_eq!(document.analysis.headings[0].text, "标题🙂");
+        assert!(!document.derived_state_is_stale());
+        assert_eq!(document.snapshot_token(), after);
+
+        assert_eq!(document.undo().unwrap().selection, Some(0..0));
+        assert_eq!(document.content, "");
+        assert!(!document.dirty);
+        assert!(!document.can_undo());
+        let after_undo = document.snapshot_token();
+        assert_ne!(after_undo, after);
+        assert_ne!(after_undo, original.token());
+        let end = "# 标题🙂\n\n正文".chars().count();
+        assert_eq!(document.redo().unwrap().selection, Some(end..end));
+        assert_eq!(document.content, "# 标题🙂\n\n正文");
+        assert_ne!(document.snapshot_token(), after_undo);
+    }
+
+    #[test]
+    fn conditional_edits_reject_foreign_tokens_and_text_undo_aba_before_the_closure() {
+        let mut document = Document::untitled(1);
+        let foreign = Document::untitled(2).snapshot_token();
+        let original = document.snapshot();
+        let mut invoked = false;
+        assert_eq!(
+            document.edit_if_current(foreign, EditKind::Other, None, |_| {
+                invoked = true;
+                None
+            }),
+            Err(StaleSnapshot)
+        );
+        assert!(!invoked);
+        assert_eq!(document.snapshot_token(), original.token());
+
+        document.edit(EditKind::Other, None, |text| {
+            text.push_str("temporary change");
+            None
+        });
+        document.undo().unwrap();
+        assert_eq!(document.content, original.text());
+        assert_eq!(
+            document.edit_if_current(original.token(), EditKind::Other, None, |_| {
+                invoked = true;
+                None
+            }),
+            Err(StaleSnapshot)
+        );
+        assert!(!invoked);
+
+        let current = document.snapshot_token();
+        assert_eq!(
+            document.edit_if_current(current, EditKind::Replace, Some(0..0), |text| {
+                text.push_str("fresh result");
+                Some(12..12)
+            }),
+            Ok(true)
+        );
+        assert_eq!(document.content, "fresh result");
+        assert!(!document.can_redo());
+    }
+
+    #[test]
+    fn no_change_edits_and_unavailable_history_leave_the_token_and_redo_intact() {
+        let mut document = Document::untitled(1);
+        let initial = document.snapshot_token();
+        assert!(document.undo().is_none());
+        assert!(document.redo().is_none());
+        assert_eq!(document.snapshot_token(), initial);
+        document.edit(EditKind::Other, None, |text| {
+            text.push('x');
+            None
+        });
+        document.undo().unwrap();
+        let current = document.snapshot_token();
+        assert!(!document.edit(EditKind::Replace, None, |text| {
+            text.push_str("transient");
+            text.clear();
+            Some(0..0)
+        }));
+        assert_eq!(
+            document.edit_if_current(current, EditKind::Other, None, |_| None),
+            Ok(false)
+        );
+        assert_eq!(document.snapshot_token(), current);
+        assert_eq!(document.content, "");
+        assert!(document.can_redo());
+        assert!(!document.can_undo());
+        document.redo().unwrap();
+        assert_eq!(document.content, "x");
+    }
+
+    #[test]
+    fn panicking_edit_closures_leave_content_version_and_history_unchanged() {
+        let mut document = Document::untitled(1);
+        document.edit(EditKind::Other, None, |text| {
+            text.push_str("原文🙂");
+            None
+        });
+        document.blocks();
+        let before = document.snapshot();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            document.edit(EditKind::Replace, None, |text| {
+                text.clear();
+                text.push_str("partial replacement");
+                panic!("abort this action");
+            })
+        }));
+        assert!(result.is_err());
+        assert_eq!(document.snapshot(), before);
+        assert!(document.dirty);
+        assert!(!document.derived_state_is_stale());
+        document.undo().unwrap();
+        assert_eq!(document.content, "");
+        assert!(!document.can_undo());
+    }
+
+    #[test]
+    fn reload_preserves_identity_and_never_reuses_an_earlier_snapshot_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reload-version.md");
+        fs::write(&path, "saved").unwrap();
+        let mut document = Document::open(&path).unwrap();
+        let saved = document.snapshot();
+        document.edit(EditKind::Other, None, |text| {
+            text.push_str(" temporary");
+            None
+        });
+        let edited = document.snapshot_token();
+        document.reload().unwrap();
+        assert_eq!(document.id(), saved.token().document_id());
+        assert_eq!(document.content, saved.text());
+        assert_ne!(document.snapshot_token(), saved.token());
+        assert_ne!(document.snapshot_token(), edited);
+        assert!(!document.dirty);
+        assert!(!document.can_undo());
+        let first_reload = document.snapshot_token();
+        document.reload().unwrap();
+        assert_ne!(document.snapshot_token(), first_reload);
+    }
+
+    #[test]
+    fn failed_file_operations_do_not_advance_the_snapshot_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("original.md");
+        let occupied = directory.path().join("occupied.md");
+        fs::write(&path, "original").unwrap();
+        fs::write(&occupied, "other document").unwrap();
+        let mut document = Document::open(&path).unwrap();
+        let before = document.snapshot();
+        assert!(document.save_as(occupied, false).is_err());
+        assert_eq!(document.snapshot(), before);
+        assert!(
+            document
+                .relink_external(directory.path().join("missing.md"))
+                .is_err()
+        );
+        assert_eq!(document.snapshot(), before);
+        fs::remove_file(path).unwrap();
+        assert!(document.reload().is_err());
+        assert!(document.merge_external().is_err());
+        assert_eq!(document.snapshot(), before);
+    }
+
+    #[test]
+    fn successful_merge_and_relink_invalidate_snapshots_even_with_unchanged_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.md");
+        let relinked = directory.path().join("relinked.md");
+        fs::write(&original, "same").unwrap();
+        fs::write(&relinked, "same").unwrap();
+        let mut document = Document::open(&original).unwrap();
+        let before_merge = document.snapshot_token();
+        assert_eq!(document.merge_external().unwrap(), 0);
+        assert_ne!(document.snapshot_token(), before_merge);
+        let before_relink = document.snapshot_token();
+        assert_eq!(document.relink_external(relinked.clone()).unwrap(), 0);
+        assert_ne!(document.snapshot_token(), before_relink);
+        assert_eq!(document.content, "same");
+        assert_eq!(
+            document.path,
+            Some(canonical_document_path(&relinked).unwrap())
+        );
+        assert!(!document.can_undo());
+    }
+
+    #[test]
+    fn legacy_edit_notifications_also_invalidate_snapshot_tokens() {
+        let mut document = Document::untitled(1);
+        let original = document.snapshot_token();
+        document.content.push('x');
+        assert!(document.record_edit(String::new(), None, None, EditKind::Other));
+        assert_ne!(document.snapshot_token(), original);
+        let recorded = document.snapshot_token();
+        assert!(!document.record_edit("x".to_owned(), None, None, EditKind::Other));
+        assert_eq!(document.snapshot_token(), recorded);
+        document.content.push('y');
+        document.update_after_edit();
+        assert_ne!(document.snapshot_token(), recorded);
+        assert_eq!(document.blocks()[0].range, 0..2);
+    }
 
     #[test]
     fn detects_and_normalizes_crlf() {

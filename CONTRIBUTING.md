@@ -28,8 +28,13 @@ cargo build --release --locked
 
 ## 代码结构
 
-- `native/src/app.rs`：窗口、UI、命令、多文档和混合编辑交互
-- `native/src/document.rs`：文档状态、编码、换行、冲突检测和原子读写
+- `native/src/app.rs`：窗口、菜单、文件对话框与模块组合
+- `native/src/session.rs`：文档成员、活动身份和延迟结果的条件写回
+- `native/src/document.rs`：文档版本、快照、编辑事务、历史、编码和原子读写
+- `native/src/editor/`：源码/所见即所得输入、IME、选区和分栏视图
+- `native/src/rendering.rs`：渲染准备、布局、命中和缓存失效
+- `native/src/external_changes.rs`：外部变更扫描、冲突处理和逐文档错误去重
+- `native/src/background.rs`：后台任务生命周期与完成结果
 - `native/src/editing.rs`：查找替换、格式命令和字符位置映射
 - `native/src/markdown.rs`：Markdown 解析、块范围、大纲、统计和 HTML
 - `native/src/wysiwyg.rs`：统一排版/编辑投影、逐字形命中与 UTF-8 Markdown 源码边界映射
@@ -53,6 +58,11 @@ cargo build --release --locked
 
 涉及文档保存的修改必须补充编码、换行、冲突或失败路径测试。涉及编辑器位置的修改必须覆盖
 中文或 emoji，不能把 UTF-8 字节位置当成字符位置。
+
+新增文档命令使用 `Document::edit`，由文档捕获真实编辑基线；延迟结果携带文档快照，
+通过 `DocumentSession::edit_if_current` 提交。正文变回原样不会恢复旧快照的有效性。
+原生 `TextEdit` 保留首次修改才捕获全文的适配路径，避免空闲帧克隆正文。
+术语见 [`CONTEXT.md`](CONTEXT.md)，模块所有权见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 不要把分屏预览描述成完整所见即所得。当前实现边界见
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 和 [`docs/ROADMAP.md`](docs/ROADMAP.md)。

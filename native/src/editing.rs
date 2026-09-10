@@ -24,7 +24,7 @@ pub fn apply_markdown_command(
         MarkdownCommand::Bold => toggle_wrap(text, selection, "**", "**"),
         MarkdownCommand::Italic => toggle_wrap(text, selection, "*", "*"),
         MarkdownCommand::Strikethrough => toggle_wrap(text, selection, "~~", "~~"),
-        MarkdownCommand::InlineCode => toggle_wrap(text, selection, "`", "`"),
+        MarkdownCommand::InlineCode => toggle_inline_code(text, selection),
         MarkdownCommand::Link => insert_link(text, selection),
         MarkdownCommand::Heading(level) => {
             transform_selected_lines(text, selection, LineCommand::Heading(level.clamp(1, 6)))
@@ -36,7 +36,7 @@ pub fn apply_markdown_command(
         MarkdownCommand::OrderedList => {
             transform_selected_lines(text, selection, LineCommand::OrderedList)
         }
-        MarkdownCommand::CodeBlock => toggle_wrap(text, selection, "```\n", "\n```"),
+        MarkdownCommand::CodeBlock => toggle_code_block(text, selection),
     }
 }
 
@@ -138,6 +138,19 @@ pub fn continue_markdown_line(text: &mut String, cursor: usize) -> Option<Range<
         .map_or(0, |index| index + 1);
     let previous_line = &text[line_start..previous_newline];
     let continuation = continuation_prefix(previous_line)?;
+    // Markdown-looking lines inside fenced/indented code remain literal. Use
+    // the parser so nested containers and unclosed fences follow the same rule.
+    if pulldown_cmark::Parser::new_ext(text, crate::markdown::parser_options())
+        .into_offset_iter()
+        .any(|(event, range)| {
+            matches!(
+                event,
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_))
+            ) && range.contains(&previous_newline)
+        })
+    {
+        return None;
+    }
     let content = &previous_line[continuation.content_start..];
     let editor_indent_chars = editor_indent.chars().count();
 
@@ -363,6 +376,139 @@ fn toggle_wrap(
     }
 }
 
+fn longest_backtick_run(text: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for byte in text.bytes() {
+        if byte == b'`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
+fn toggle_inline_code(text: &mut String, selection: Range<usize>) -> Range<usize> {
+    let selected = char_to_byte(text, selection.start)..char_to_byte(text, selection.end);
+    let wrapper = pulldown_cmark::Parser::new_ext(text, crate::markdown::parser_options())
+        .into_offset_iter()
+        .find_map(|(event, syntax)| {
+            if !matches!(event, pulldown_cmark::Event::Code(_)) {
+                return None;
+            }
+            let marker_len = text[syntax.clone()]
+                .bytes()
+                .take_while(|byte| *byte == b'`')
+                .count();
+            let mut body = syntax.start + marker_len..syntax.end - marker_len;
+            let raw = &text[body.clone()];
+            // CommonMark strips one padding space only when both ends are
+            // spaces and the body contains a non-space character.
+            if raw.starts_with(' ') && raw.ends_with(' ') && raw.bytes().any(|byte| byte != b' ') {
+                body.start += 1;
+                body.end -= 1;
+            }
+            (body == selected).then_some(syntax)
+        });
+    if let Some(wrapper) = wrapper {
+        let start = text[..wrapper.start].chars().count();
+        let content = text[selected].to_owned();
+        let end = start + content.chars().count();
+        text.replace_range(wrapper, &content);
+        return start..end;
+    }
+    if selection.is_empty() {
+        return toggle_wrap(text, selection, "`", "`");
+    }
+
+    let content = &text[selected];
+    let fence = "`".repeat(longest_backtick_run(content) + 1);
+    let needs_padding = content.starts_with('`')
+        || content.ends_with('`')
+        || content.starts_with(' ')
+            && content.ends_with(' ')
+            && content.bytes().any(|byte| byte != b' ');
+    let padding = if needs_padding { " " } else { "" };
+    toggle_wrap(
+        text,
+        selection,
+        &format!("{fence}{padding}"),
+        &format!("{padding}{fence}"),
+    )
+}
+
+fn toggle_code_block(text: &mut String, selection: Range<usize>) -> Range<usize> {
+    let selected = char_to_byte(text, selection.start)..char_to_byte(text, selection.end);
+    let wrapper = pulldown_cmark::Parser::new_ext(text, crate::markdown::parser_options())
+        .into_offset_iter()
+        .find_map(|(event, syntax)| {
+            if !matches!(
+                event,
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(
+                    pulldown_cmark::CodeBlockKind::Fenced(_)
+                ))
+            ) {
+                return None;
+            }
+            let fragment = &text[syntax.clone()];
+            let opening_end = fragment.find('\n')?;
+            let opening = fragment[..opening_end].trim_start_matches(' ');
+            let marker = opening.chars().next()?;
+            let marker_len = opening
+                .chars()
+                .take_while(|character| *character == marker)
+                .count();
+            let end = syntax.start + fragment.trim_end_matches(['\r', '\n']).len();
+            let closing_start = syntax.start + text[syntax.start..end].rfind('\n')? + 1;
+            let closing_line = &text[closing_start..end];
+            let closing = closing_line.trim_start_matches(' ');
+            if closing_line.len() - closing.len() > 3 {
+                return None;
+            }
+            let closing_len = closing
+                .chars()
+                .take_while(|character| *character == marker)
+                .count();
+            if closing_len < marker_len || !closing[closing_len..].trim().is_empty() {
+                return None;
+            }
+            let body_start = syntax.start + opening_end + 1;
+            let body_end = if closing_start > body_start {
+                closing_start - 1
+            } else {
+                body_start
+            };
+            (selected == (body_start..body_end)).then_some(syntax.start..end)
+        });
+    if let Some(wrapper) = wrapper {
+        let start = text[..wrapper.start].chars().count();
+        let content = text[selected].to_owned();
+        let end = start + content.chars().count();
+        text.replace_range(wrapper, &content);
+        return start..end;
+    }
+
+    let fence = "`".repeat((longest_backtick_run(&text[selected.clone()]) + 1).max(3));
+    let leading = if selected.start > 0 && text.as_bytes()[selected.start - 1] != b'\n' {
+        "\n\n"
+    } else {
+        ""
+    };
+    let trailing = if selected.end < text.len() && text.as_bytes()[selected.end] != b'\n' {
+        "\n\n"
+    } else {
+        ""
+    };
+    toggle_wrap(
+        text,
+        selection,
+        &format!("{leading}{fence}\n"),
+        &format!("\n{fence}{trailing}"),
+    )
+}
+
 fn insert_link(text: &mut String, selection: Range<usize>) -> Range<usize> {
     let start_byte = char_to_byte(text, selection.start);
     let end_byte = char_to_byte(text, selection.end);
@@ -371,9 +517,57 @@ fn insert_link(text: &mut String, selection: Range<usize>) -> Range<usize> {
         let cursor = selection.start + 1;
         return cursor..cursor;
     }
-    text.insert_str(end_byte, "](https://)");
-    text.insert(start_byte, '[');
-    selection.start + 1..selection.end + 1
+    let label = escape_selected_link_label(&text[start_byte..end_byte]);
+    let end = selection.start + 1 + label.chars().count();
+    text.replace_range(start_byte..end_byte, &format!("[{label}](https://)"));
+    selection.start + 1..end
+}
+
+fn escape_selected_link_label(label: &str) -> String {
+    let literal_ranges = pulldown_cmark::Parser::new_ext(label, crate::markdown::parser_options())
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            matches!(
+                event,
+                pulldown_cmark::Event::Code(_)
+                    | pulldown_cmark::Event::Html(_)
+                    | pulldown_cmark::Event::InlineHtml(_)
+            )
+            .then_some(range)
+        })
+        .collect::<Vec<_>>();
+    let mut literal = literal_ranges.iter().peekable();
+    let mut output = String::with_capacity(label.len());
+    let mut cursor = 0;
+    while cursor < label.len() {
+        if let Some(range) = literal.peek()
+            && range.start == cursor
+        {
+            output.push_str(&label[(**range).clone()]);
+            cursor = range.end;
+            literal.next();
+            continue;
+        }
+        let mut characters = label[cursor..].chars();
+        let character = characters.next().expect("cursor precedes label end");
+        cursor += character.len_utf8();
+        if character == '\\' {
+            output.push(character);
+            if let Some(escaped) = characters.next() {
+                output.push(escaped);
+                cursor += escaped.len_utf8();
+            } else {
+                // A literal final backslash must not escape the new closing ].
+                output.push('\\');
+            }
+        } else {
+            if matches!(character, '[' | ']') {
+                output.push('\\');
+            }
+            output.push(character);
+        }
+    }
+    output
 }
 
 #[derive(Clone, Copy)]
@@ -634,6 +828,183 @@ fn byte_range_to_char_range(text: &str, range: Range<usize>) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_code_command_preserves_backticks_spaces_and_can_be_toggled_off() {
+        for original in ["a`b", "`", "``", " 中文`🙂 ", "   "] {
+            let mut source = original.to_owned();
+            let selected = apply_markdown_command(
+                &mut source,
+                0..original.chars().count(),
+                MarkdownCommand::InlineCode,
+            );
+            let codes = pulldown_cmark::Parser::new_ext(&source, crate::markdown::parser_options())
+                .filter_map(|event| match event {
+                    pulldown_cmark::Event::Code(code) => Some(code.into_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(codes, [original], "generated Markdown: {source:?}");
+            assert_eq!(
+                &source[char_to_byte(&source, selected.start)..char_to_byte(&source, selected.end)],
+                original,
+                "the selection must address the original content, not synthetic padding",
+            );
+            let unwrapped =
+                apply_markdown_command(&mut source, selected, MarkdownCommand::InlineCode);
+            assert_eq!(source, original);
+            assert_eq!(unwrapped, 0..original.chars().count());
+        }
+    }
+
+    #[test]
+    fn inline_code_command_preserves_unicode_selection_and_empty_cursor() {
+        let original = "前甲`🙂后";
+        let mut source = original.to_owned();
+        let selected = apply_markdown_command(&mut source, 1..4, MarkdownCommand::InlineCode);
+        assert_eq!(
+            &source[char_to_byte(&source, selected.start)..char_to_byte(&source, selected.end)],
+            "甲`🙂",
+        );
+        assert!(source.starts_with('前') && source.ends_with('后'));
+        assert_eq!(
+            crate::wysiwyg::VisualProjection::from_markdown(&source).text(),
+            original,
+        );
+        assert_eq!(
+            apply_markdown_command(&mut source, selected, MarkdownCommand::InlineCode),
+            1..4,
+        );
+        assert_eq!(source, original);
+
+        let mut source = "前后".to_owned();
+        let cursor = apply_markdown_command(&mut source, 1..1, MarkdownCommand::InlineCode);
+        assert_eq!(source, "前``后");
+        assert_eq!(cursor, 2..2);
+        assert_eq!(
+            apply_markdown_command(&mut source, cursor, MarkdownCommand::InlineCode),
+            1..1,
+        );
+        assert_eq!(source, "前后");
+    }
+
+    #[test]
+    fn link_command_escapes_selected_labels_and_selects_the_escaped_unicode_source() {
+        for (original, escaped) in [
+            ("a]b", r"a\]b"),
+            ("[中文]🙂", r"\[中文\]🙂"),
+            (r"C:\文档", r"C:\文档"),
+        ] {
+            let mut source = original.to_owned();
+            let selected = apply_markdown_command(
+                &mut source,
+                0..original.chars().count(),
+                MarkdownCommand::Link,
+            );
+            let links = pulldown_cmark::Parser::new_ext(&source, crate::markdown::parser_options())
+                .filter_map(|event| match event {
+                    pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link {
+                        dest_url, ..
+                    }) => Some(dest_url.into_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(links, ["https://"], "generated Markdown: {source:?}");
+            assert_eq!(
+                crate::wysiwyg::VisualProjection::from_markdown(&source).text(),
+                original,
+            );
+            assert_eq!(
+                &source[char_to_byte(&source, selected.start)..char_to_byte(&source, selected.end)],
+                escaped,
+            );
+        }
+    }
+
+    #[test]
+    fn link_command_keeps_existing_markdown_escapes_and_literal_code() {
+        for original in [r"\*literal\*", r"\\*emphasis*", "`a[b]`", r"tail\"] {
+            let expected = crate::wysiwyg::VisualProjection::from_markdown(original)
+                .text()
+                .to_owned();
+            let mut source = original.to_owned();
+            apply_markdown_command(
+                &mut source,
+                0..original.chars().count(),
+                MarkdownCommand::Link,
+            );
+            assert_eq!(
+                crate::wysiwyg::VisualProjection::from_markdown(&source).text(),
+                expected,
+                "generated Markdown: {source:?}",
+            );
+            assert!(
+                pulldown_cmark::Parser::new_ext(&source, crate::markdown::parser_options()).any(
+                    |event| matches!(
+                        event,
+                        pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link { .. })
+                    )
+                ),
+                "the selected Markdown must remain a valid link label: {source:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn code_block_command_preserves_embedded_fences_and_can_be_toggled_off() {
+        for original in ["first\n```\nlast", "中文🙂\n````\nend"] {
+            let mut source = original.to_owned();
+            let selected = apply_markdown_command(
+                &mut source,
+                0..original.chars().count(),
+                MarkdownCommand::CodeBlock,
+            );
+            assert_eq!(crate::wysiwyg::fenced_code_content(&source), Some(original));
+            assert_eq!(
+                &source[char_to_byte(&source, selected.start)..char_to_byte(&source, selected.end)],
+                original,
+            );
+            let unwrapped =
+                apply_markdown_command(&mut source, selected, MarkdownCommand::CodeBlock);
+            assert_eq!(source, original);
+            assert_eq!(unwrapped, 0..original.chars().count());
+        }
+    }
+
+    #[test]
+    fn code_block_command_at_a_midline_caret_preserves_the_surrounding_prose() {
+        let mut source = "before after".to_owned();
+        let cursor = apply_markdown_command(&mut source, 7..7, MarkdownCommand::CodeBlock);
+        let projected = crate::wysiwyg::VisualProjection::from_markdown(&source);
+        assert!(projected.text().contains("before"), "source: {source:?}");
+        assert!(projected.text().contains("after"), "source: {source:?}");
+        let cursor_byte = char_to_byte(&source, cursor.end);
+        assert!(
+            pulldown_cmark::Parser::new_ext(&source, crate::markdown::parser_options())
+                .into_offset_iter()
+                .any(|(event, range)| matches!(
+                    event,
+                    pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_))
+                ) && range.contains(&cursor_byte)),
+            "caret must be inside the inserted code block: {source:?} at {cursor:?}",
+        );
+    }
+
+    #[test]
+    fn code_block_command_preserves_a_unicode_line_selection_when_toggled() {
+        let original = "前\n甲🙂\n后";
+        let mut source = original.to_owned();
+        let selected = apply_markdown_command(&mut source, 2..4, MarkdownCommand::CodeBlock);
+        assert_eq!(
+            &source[char_to_byte(&source, selected.start)..char_to_byte(&source, selected.end)],
+            "甲🙂",
+        );
+        assert_eq!(
+            apply_markdown_command(&mut source, selected, MarkdownCommand::CodeBlock),
+            2..4,
+        );
+        assert_eq!(source, original);
+    }
 
     #[test]
     fn wraps_and_unwraps_unicode_selection() {

@@ -4,6 +4,7 @@ use std::{
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime},
 };
 
@@ -128,18 +129,14 @@ fn unique_pdf_image_resources(
     html: &str,
     images: &LocalImages,
 ) -> (String, BTreeMap<String, Base64OrRaw>) {
-    let mut rewritten = html.to_owned();
+    let mut replacements = BTreeMap::new();
     let mut resources = BTreeMap::new();
-    for (index, (source, image)) in images.iter().enumerate() {
-        let source = escape_html_attribute(source);
+    for (index, (source, image)) in encoded_image_sources(images).into_iter().enumerate() {
         let unique_key = format!("ruporaimage{index}");
-        rewritten = rewritten.replace(
-            &format!("src=\"{source}\""),
-            &format!("src=\"{unique_key}\""),
-        );
+        replacements.insert(source, unique_key.clone());
         resources.insert(unique_key, Base64OrRaw::Raw(image.bytes.clone()));
     }
-    (rewritten, resources)
+    (rewrite_image_sources(html, &replacements), resources)
 }
 
 fn reject_pdf_errors(stage: &str, warnings: &[PdfWarnMsg]) -> Result<(), String> {
@@ -226,7 +223,13 @@ pub fn load_local_images(
     for destination in destinations {
         let resource_path = local_resource_path(&canonical_base, &destination)?;
         let source_bytes = read_local_image(&resource_path)?;
-        let (bytes, mime, width, height) = normalize_local_image(&source_bytes, &resource_path)?;
+        let resource_root = if resource_path.starts_with(&canonical_base) {
+            canonical_base.as_path()
+        } else {
+            resource_path.parent().unwrap_or(&canonical_base)
+        };
+        let (bytes, mime, width, height) =
+            normalize_local_image(&source_bytes, &resource_path, resource_root)?;
         total_bytes = total_bytes
             .checked_add(bytes.len())
             .filter(|total| *total <= MAX_LOCAL_IMAGE_TOTAL_BYTES)
@@ -254,15 +257,23 @@ pub fn load_local_images(
 fn normalize_local_image(
     bytes: &[u8],
     path: &Path,
+    resource_root: &Path,
 ) -> Result<(Vec<u8>, &'static str, u32, u32), String> {
     if path
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
     {
-        return rasterize_svg(bytes, path);
+        return rasterize_svg(bytes, path, resource_root);
     }
 
+    normalize_raster_image(bytes, path)
+}
+
+fn normalize_raster_image(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<(Vec<u8>, &'static str, u32, u32), String> {
     let reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|error| format!("无法识别图片 {}：{error}", path.display()))?;
@@ -299,9 +310,53 @@ fn normalize_local_image(
     }
 }
 
-fn rasterize_svg(bytes: &[u8], path: &Path) -> Result<(Vec<u8>, &'static str, u32, u32), String> {
-    let tree = usvg::Tree::from_data(bytes, &usvg::Options::default())
+fn rasterize_svg(
+    bytes: &[u8],
+    path: &Path,
+    resource_root: &Path,
+) -> Result<(Vec<u8>, &'static str, u32, u32), String> {
+    static FONT_DATABASE: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
+    let fontdb = FONT_DATABASE.get_or_init(|| {
+        let mut database = usvg::fontdb::Database::new();
+        database.load_system_fonts();
+        Arc::new(database)
+    });
+    let resources = SvgResources::default();
+    let directory = path.parent().unwrap_or(resource_root);
+    let options = usvg::Options {
+        fontdb: Arc::clone(fontdb),
+        resources_dir: Some(directory.to_path_buf()),
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: Box::new(|mime, data, options| {
+                resources.resolve(|| normalize_svg_resource(mime, data, options, path))
+            }),
+            resolve_string: Box::new(|href, options| {
+                resources.resolve(|| {
+                    let resource_path = resolve_local_resource(directory, resource_root, href)?;
+                    let data = Arc::new(read_local_image(&resource_path)?);
+                    let mime = if resource_path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+                    {
+                        "image/svg+xml"
+                    } else {
+                        "text/plain"
+                    };
+                    normalize_svg_resource(mime, data, options, &resource_path)
+                })
+            }),
+        },
+        ..usvg::Options::default()
+    };
+    let tree = usvg::Tree::from_data(bytes, &options)
         .map_err(|error| format!("无法解析 SVG {}：{error}", path.display()))?;
+    if let Some(error) = &resources.0.lock().unwrap().error {
+        return Err(format!(
+            "无法导出 SVG {} 的图片资源：{error}",
+            path.display()
+        ));
+    }
     let size = tree.size();
     if !size.width().is_finite() || !size.height().is_finite() {
         return Err(format!("SVG {} 的尺寸无效", path.display()));
@@ -320,6 +375,96 @@ fn rasterize_svg(bytes: &[u8], path: &Path) -> Result<(Vec<u8>, &'static str, u3
         .encode_png()
         .map_err(|error| format!("无法规范化 SVG {}：{error}", path.display()))?;
     Ok((png, "image/png", width, height))
+}
+
+// The SVG parser's default resolver bypasses our file and decoding limits and
+// silently skips failed images. Keep its image references bounded and surface
+// failures before an incomplete SVG can replace an existing export.
+#[derive(Default)]
+struct SvgResources(Mutex<SvgResourceBudget>);
+
+#[derive(Default)]
+struct SvgResourceBudget {
+    count: usize,
+    bytes: usize,
+    pixels: u64,
+    error: Option<String>,
+}
+
+impl SvgResources {
+    fn resolve(
+        &self,
+        load: impl FnOnce() -> Result<(usvg::ImageKind, usize, u64), String>,
+    ) -> Option<usvg::ImageKind> {
+        let mut budget = self.0.lock().unwrap();
+        if budget.error.is_some() {
+            return None;
+        }
+        let result = (|| {
+            if budget.count >= MAX_LOCAL_IMAGES {
+                return Err(format!("SVG 图片资源超过 {MAX_LOCAL_IMAGES} 个导出上限"));
+            }
+            budget.count += 1;
+            let (image, bytes, pixels) = load()?;
+            budget.bytes = budget
+                .bytes
+                .checked_add(bytes)
+                .filter(|total| *total <= MAX_LOCAL_IMAGE_TOTAL_BYTES)
+                .ok_or_else(|| "SVG 图片资源总大小超过导出上限".to_owned())?;
+            budget.pixels = budget
+                .pixels
+                .checked_add(pixels)
+                .filter(|total| *total <= MAX_LOCAL_IMAGE_TOTAL_PIXELS)
+                .ok_or_else(|| "SVG 图片资源总像素超过导出上限".to_owned())?;
+            Ok(image)
+        })();
+        match result {
+            Ok(image) => Some(image),
+            Err(error) => {
+                budget.error = Some(error);
+                None
+            }
+        }
+    }
+}
+
+fn normalize_svg_resource(
+    mime: &str,
+    data: Arc<Vec<u8>>,
+    options: &usvg::Options<'_>,
+    path: &Path,
+) -> Result<(usvg::ImageKind, usize, u64), String> {
+    if data.len() as u64 > MAX_LOCAL_IMAGE_BYTES {
+        return Err(format!("SVG 图片资源 {} 超过大小上限", path.display()));
+    }
+    let source_bytes = data.len();
+    let image = (usvg::ImageHrefResolver::default_data_resolver())(mime, data, options)
+        .ok_or_else(|| format!("无法识别 SVG 图片资源：{}", path.display()))?;
+    let (image, bytes, width, height) = match image {
+        usvg::ImageKind::SVG(tree) => {
+            let size = tree.size();
+            let width = size.width().ceil() as u32;
+            let height = size.height().ceil() as u32;
+            validate_image_dimensions(path, width, height)?;
+            // usvg disables image references inside an SVG image, so sub-SVGs
+            // cannot recursively reopen files or evade this resource budget.
+            (usvg::ImageKind::SVG(tree), source_bytes, width, height)
+        }
+        usvg::ImageKind::JPEG(data)
+        | usvg::ImageKind::PNG(data)
+        | usvg::ImageKind::GIF(data)
+        | usvg::ImageKind::WEBP(data) => {
+            let (data, mime, width, height) = normalize_raster_image(&data, path)?;
+            let bytes = data.len();
+            let image = if mime == "image/jpeg" {
+                usvg::ImageKind::JPEG(Arc::new(data))
+            } else {
+                usvg::ImageKind::PNG(Arc::new(data))
+            };
+            (image, bytes, width, height)
+        }
+    };
+    Ok((image, bytes, u64::from(width) * u64::from(height)))
 }
 
 fn validate_image_dimensions(path: &Path, width: u32, height: u32) -> Result<(), String> {
@@ -392,14 +537,12 @@ pub fn embed_local_images(html: &str, images: &LocalImages) -> Result<String, St
         ));
     }
 
+    let images = encoded_image_sources(images);
     let mut projected_bytes = html.len();
-    for (source, image) in images {
-        let source = escape_html_attribute(source);
-        let needle = format!("src=\"{source}\"");
-        let occurrences = html.match_indices(&needle).count();
-        if occurrences == 0 {
+    for range in image_source_ranges(html) {
+        let Some(image) = images.get(&image_source_key(&html[range.clone()])) else {
             continue;
-        }
+        };
         let encoded_bytes = image
             .bytes
             .len()
@@ -407,15 +550,10 @@ pub fn embed_local_images(html: &str, images: &LocalImages) -> Result<String, St
             .and_then(|bytes| bytes.checked_div(3))
             .and_then(|groups| groups.checked_mul(4))
             .ok_or_else(|| "无法计算嵌入图片的 HTML 大小".to_owned())?;
-        let replacement_bytes = "src=\"data:".len()
-            + image.mime.len()
-            + ";base64,".len()
-            + encoded_bytes
-            + '"'.len_utf8();
-        let extra_per_reference = replacement_bytes.saturating_sub(needle.len());
-        projected_bytes = occurrences
-            .checked_mul(extra_per_reference)
-            .and_then(|extra| projected_bytes.checked_add(extra))
+        let replacement_bytes = "data:".len() + image.mime.len() + ";base64,".len() + encoded_bytes;
+        projected_bytes = projected_bytes
+            .checked_sub(range.len())
+            .and_then(|bytes| bytes.checked_add(replacement_bytes))
             .filter(|bytes| *bytes <= MAX_HTML_EXPORT_BYTES)
             .ok_or_else(|| {
                 format!(
@@ -425,19 +563,25 @@ pub fn embed_local_images(html: &str, images: &LocalImages) -> Result<String, St
             })?;
     }
 
-    let mut output = html.to_owned();
+    let mut replacements = BTreeMap::new();
     for (source, image) in images {
-        let source = escape_html_attribute(source);
-        let needle = format!("src=\"{source}\"");
         let encoded = STANDARD.encode(&image.bytes);
-        let replacement = format!("src=\"data:{};base64,{encoded}\"", image.mime);
-        output = output.replace(&needle, &replacement);
+        replacements.insert(source, format!("data:{};base64,{encoded}", image.mime));
     }
+    let output = rewrite_image_sources(html, &replacements);
     debug_assert_eq!(output.len(), projected_bytes);
     Ok(output)
 }
 
 fn local_resource_path(base_directory: &Path, destination: &str) -> Result<PathBuf, String> {
+    resolve_local_resource(base_directory, base_directory, destination)
+}
+
+fn resolve_local_resource(
+    base_directory: &Path,
+    resource_root: &Path,
+    destination: &str,
+) -> Result<PathBuf, String> {
     let path_part = destination.split(['?', '#']).next().unwrap_or_default();
     let decoded = percent_decode_path(path_part)?;
     let path = Path::new(&decoded);
@@ -450,7 +594,7 @@ fn local_resource_path(base_directory: &Path, destination: &str) -> Result<PathB
     let canonical = candidate
         .canonicalize()
         .map_err(|error| format!("无法解析图片 {destination}：{error}"))?;
-    if !absolute_destination && !canonical.starts_with(base_directory) {
+    if !absolute_destination && !canonical.starts_with(resource_root) {
         return Err(format!("图片路径越过文档目录：{destination}"));
     }
     Ok(canonical)
@@ -489,12 +633,45 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn escape_html_attribute(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+fn encoded_image_sources(images: &LocalImages) -> BTreeMap<String, &LocalImage> {
+    images
+        .iter()
+        .map(|(source, image)| {
+            let mut encoded = String::new();
+            pulldown_cmark_escape::escape_href(&mut encoded, source).unwrap();
+            (image_source_key(&encoded), image)
+        })
+        .collect()
+}
+
+fn image_source_key(source: &str) -> String {
+    // Ammonia serializes an apostrophe literally inside a double-quoted
+    // attribute; pulldown-cmark emits its entity. Both denote the same URL.
+    source.replace("&#x27;", "'")
+}
+
+fn image_source_ranges(html: &str) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+    html.match_indices("src=\"").filter_map(|(start, _)| {
+        let start = start + "src=\"".len();
+        let end = start + html[start..].find('"')?;
+        Some(start..end)
+    })
+}
+
+fn rewrite_image_sources(html: &str, replacements: &BTreeMap<String, String>) -> String {
+    let mut output = String::with_capacity(html.len());
+    let mut copied = 0;
+    // Always read URLs from the original HTML. A source named "ruporaimage0"
+    // must never match the resource key assigned to a preceding image.
+    for range in image_source_ranges(html) {
+        if let Some(replacement) = replacements.get(&image_source_key(&html[range.clone()])) {
+            output.push_str(&html[copied..range.start]);
+            output.push_str(replacement);
+            copied = range.end;
+        }
+    }
+    output.push_str(&html[copied..]);
+    output
 }
 
 pub fn write_pdf(path: &Path, html: &str, images: &LocalImages) -> Result<(), String> {
@@ -692,6 +869,217 @@ pub fn cjk_font_candidates() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_embeds_unicode_and_unescaped_space_image_paths_in_html() {
+        let directory = tempfile::tempdir().unwrap();
+        for filename in ["中文.png", "small icon.png", "single'quote.png"] {
+            fs::write(
+                directory.path().join(filename),
+                include_bytes!("../../assets/icons/32x32.png"),
+            )
+            .unwrap();
+            let source = format!("![image](<{filename}>)");
+            let images = load_local_images(&source, Some(directory.path())).unwrap();
+            let html = markdown::render_html_document(&source, "image paths", false);
+
+            let embedded = embed_local_images(&html, &images).unwrap();
+
+            assert!(
+                embedded.contains("src=\"data:image/png;base64,"),
+                "image was not embedded for {filename}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_embeds_unicode_and_unescaped_space_image_paths_in_pdf() {
+        let directory = tempfile::tempdir().unwrap();
+        for filename in ["中文.png", "small icon.png", "single'quote.png"] {
+            fs::write(
+                directory.path().join(filename),
+                include_bytes!("../../assets/icons/32x32.png"),
+            )
+            .unwrap();
+            let source = format!("![image](<{filename}>)");
+            let images = load_local_images(&source, Some(directory.path())).unwrap();
+            let html = markdown::render_html_document(&source, "image paths", false);
+
+            let document = create_pdf_document(&html, &images).unwrap();
+
+            assert!(
+                document
+                    .pages
+                    .iter()
+                    .any(|page| !page.get_xobject_ids().is_empty()),
+                "PDF did not draw the image for {filename}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_local_svg_text_is_visible_after_normalization() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("label.svg"),
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="40"><text x="2" y="28" font-family="sans-serif" font-size="24" fill="black">RUPORA</text></svg>"#,
+        )
+        .unwrap();
+
+        let images = load_local_images("![label](label.svg)", Some(directory.path())).unwrap();
+        let rendered = image::load_from_memory(&images["label.svg"].bytes)
+            .unwrap()
+            .to_rgba8();
+
+        assert!(
+            rendered.pixels().any(|pixel| pixel[3] > 0),
+            "SVG text disappeared into a fully transparent image"
+        );
+    }
+
+    #[test]
+    fn audit_local_svg_resolves_images_relative_to_its_own_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let svg_directory = directory.path().join("artwork");
+        fs::create_dir(&svg_directory).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(svg_directory.join("svg-sibling-tile.png"))
+            .unwrap();
+        fs::write(
+            svg_directory.join("diagram.svg"),
+            br#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="2" height="2"><image xlink:href="svg-sibling-tile.png" width="2" height="2"/></svg>"#,
+        )
+        .unwrap();
+
+        let images =
+            load_local_images("![diagram](artwork/diagram.svg)", Some(directory.path())).unwrap();
+        let rendered = image::load_from_memory(&images["artwork/diagram.svg"].bytes)
+            .unwrap()
+            .to_rgba8();
+
+        assert_eq!(rendered.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn audit_local_svg_can_reference_a_parent_asset_inside_the_document_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("artwork")).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255]))
+            .save(directory.path().join("shared tile.png"))
+            .unwrap();
+        fs::write(
+            directory.path().join("artwork/diagram.svg"),
+            br#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="2" height="2"><image xlink:href="../shared%20tile.png" width="2" height="2"/></svg>"#,
+        )
+        .unwrap();
+
+        let images =
+            load_local_images("![diagram](artwork/diagram.svg)", Some(directory.path())).unwrap();
+        let rendered = image::load_from_memory(&images["artwork/diagram.svg"].bytes)
+            .unwrap()
+            .to_rgba8();
+
+        assert_eq!(rendered.get_pixel(0, 0).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn audit_local_svg_reports_missing_and_oversized_resources() {
+        let directory = tempfile::tempdir().unwrap();
+        File::create(directory.path().join("oversized.png"))
+            .unwrap()
+            .set_len(MAX_LOCAL_IMAGE_BYTES + 1)
+            .unwrap();
+        image::RgbaImage::new(MAX_LOCAL_IMAGE_EDGE + 1, 1)
+            .save(directory.path().join("too-wide.png"))
+            .unwrap();
+        for (href, expected) in [
+            ("missing.png", "无法解析图片"),
+            ("oversized.png", "超过"),
+            ("too-wide.png", "像素超过"),
+        ] {
+            fs::write(
+                directory.path().join("diagram.svg"),
+                format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="2" height="2"><image xlink:href="{href}" width="2" height="2"/></svg>"#,
+                ),
+            )
+            .unwrap();
+
+            let error =
+                load_local_images("![diagram](diagram.svg)", Some(directory.path())).unwrap_err();
+
+            assert!(error.contains("SVG"), "{error}");
+            assert!(error.contains(expected), "{href}: {error}");
+        }
+    }
+
+    #[test]
+    fn audit_local_svg_references_obey_the_image_count_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("tile.png"),
+            include_bytes!("../../assets/icons/32x32.png"),
+        )
+        .unwrap();
+        let references =
+            r#"<image xlink:href="tile.png" width="2" height="2"/>"#.repeat(MAX_LOCAL_IMAGES + 1);
+        fs::write(
+            directory.path().join("diagram.svg"),
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="2" height="2">{references}</svg>"#
+            ),
+        )
+        .unwrap();
+
+        let error =
+            load_local_images("![diagram](diagram.svg)", Some(directory.path())).unwrap_err();
+
+        assert!(error.contains("SVG 图片资源超过"), "{error}");
+    }
+
+    #[test]
+    fn audit_html_image_aliases_share_the_same_embedding_size_calculation() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("中文.png"),
+            include_bytes!("../../assets/icons/32x32.png"),
+        )
+        .unwrap();
+        let source = "![raw](中文.png)\n![encoded](%E4%B8%AD%E6%96%87.png)";
+        let images = load_local_images(source, Some(directory.path())).unwrap();
+        let html = markdown::render_html_document(source, "image aliases", false);
+
+        let embedded = embed_local_images(&html, &images).unwrap();
+
+        assert_eq!(embedded.matches("src=\"data:image/png;base64,").count(), 2);
+    }
+
+    #[test]
+    fn audit_pdf_does_not_rewrite_an_already_assigned_image_resource() {
+        let directory = tempfile::tempdir().unwrap();
+        for (filename, color) in [
+            ("a.png", [255, 0, 0, 255]),
+            ("ruporaimage0", [0, 0, 255, 255]),
+        ] {
+            image::RgbaImage::from_pixel(2, 2, image::Rgba(color))
+                .save_with_format(directory.path().join(filename), ImageFormat::Png)
+                .unwrap();
+        }
+        let source = "![red](a.png)\n\n![blue](ruporaimage0)";
+        let images = load_local_images(source, Some(directory.path())).unwrap();
+        let html = markdown::render_html_document(source, "distinct images", false);
+
+        let document = create_pdf_document(&html, &images).unwrap();
+        let mut drawn_images = document
+            .pages
+            .iter()
+            .flat_map(|page| page.get_xobject_ids())
+            .collect::<Vec<_>>();
+        drawn_images.sort();
+        drawn_images.dedup();
+
+        assert_eq!(drawn_images.len(), 2, "PDF drew the same image twice");
+    }
 
     #[cfg(windows)]
     #[test]

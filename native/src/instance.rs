@@ -149,11 +149,10 @@ impl InstanceCoordinator {
                     .paths
                     .into_iter()
                     .filter_map(|path| path.decode().ok())
-                    .take(MAX_PATHS_PER_REQUEST.saturating_sub(paths.len())),
+                    // The limit belongs to each launch, not the combined inbox. All
+                    // accepted requests must survive draining this bounded inbox.
+                    .take(MAX_PATHS_PER_REQUEST),
             );
-            if paths.len() == MAX_PATHS_PER_REQUEST {
-                break;
-            }
         }
         Ok(found_request.then_some(OpenRequest { paths }))
     }
@@ -358,6 +357,85 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(request.paths.iter().all(|path| path.is_absolute()));
+    }
+
+    #[test]
+    fn draining_two_valid_launches_keeps_all_160_paths_in_order() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let mut primary = match InstanceCoordinator::acquire_at(directory.path(), &[]).unwrap() {
+            InstanceRole::Primary(primary) => primary,
+            InstanceRole::Secondary => panic!("first instance must be primary"),
+        };
+        let first = (0..80)
+            .map(|index| directory.path().join(format!("first-{index}.md")))
+            .collect::<Vec<_>>();
+        let second = (0..80)
+            .map(|index| directory.path().join(format!("second-{index}.md")))
+            .collect::<Vec<_>>();
+        for paths in [&first, &second] {
+            assert!(matches!(
+                InstanceCoordinator::acquire_at(directory.path(), paths).unwrap(),
+                InstanceRole::Secondary
+            ));
+        }
+        let expected = first.into_iter().chain(second).collect::<Vec<_>>();
+        // Previously read_inbox cleared all requests and silently dropped the final 32.
+        assert_eq!(primary.poll().unwrap().unwrap().paths, expected);
+        assert!(primary.read_inbox().unwrap().is_none());
+    }
+
+    #[test]
+    fn each_queued_launch_retains_its_own_path_limit() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let mut primary = match InstanceCoordinator::acquire_at(directory.path(), &[]).unwrap() {
+            InstanceRole::Primary(primary) => primary,
+            InstanceRole::Secondary => panic!("first instance must be primary"),
+        };
+        let paths = (0..MAX_PATHS_PER_REQUEST + 7)
+            .map(|index| directory.path().join(format!("document-{index}.md")))
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            forward_request(&primary.inbox_path, &paths).unwrap();
+        }
+        let expected = paths[..MAX_PATHS_PER_REQUEST]
+            .iter()
+            .chain(&paths[..MAX_PATHS_PER_REQUEST])
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(primary.poll().unwrap().unwrap().paths, expected);
+        assert!(primary.read_inbox().unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_wire_request_does_not_consume_the_next_requests_budget() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let mut primary = match InstanceCoordinator::acquire_at(directory.path(), &[]).unwrap() {
+            InstanceRole::Primary(primary) => primary,
+            InstanceRole::Secondary => panic!("first instance must be primary"),
+        };
+        let paths = (0..MAX_PATHS_PER_REQUEST + 3)
+            .map(|index| directory.path().join(format!("wire-{index}.md")))
+            .collect::<Vec<_>>();
+        let mut encoded = serde_json::to_vec(&WireRequest {
+            version: REQUEST_VERSION,
+            paths: paths
+                .iter()
+                .cloned()
+                .map(WirePath::encode)
+                .collect::<Result<_, _>>()
+                .unwrap(),
+        })
+        .unwrap();
+        encoded.push(b'\n');
+        fs::write(&primary.inbox_path, encoded).unwrap();
+        let last = directory.path().join("next-request.md");
+        forward_request(&primary.inbox_path, std::slice::from_ref(&last)).unwrap();
+        let expected = paths[..MAX_PATHS_PER_REQUEST]
+            .iter()
+            .cloned()
+            .chain(std::iter::once(last))
+            .collect::<Vec<_>>();
+        assert_eq!(primary.poll().unwrap().unwrap().paths, expected);
     }
 
     #[test]

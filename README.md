@@ -164,6 +164,9 @@ RUPORA 原生编辑与布局 ── 可逆视觉投影 ── Markdown 源码
 | `Ctrl/Cmd + S` | 保存 |
 | `Ctrl/Cmd + Shift + S` | 另存为 |
 | `Ctrl/Cmd + Z` | 撤销 |
+| `Ctrl/Cmd + A` | 写作模式先选择当前块，再按一次全选文档；源码模式全选文档 |
+| `Ctrl + Home` / `Ctrl + End` | 写作模式定位全文首尾；加 `Shift` 扩展选区 |
+| `PageUp` / `PageDown` | 写作模式跨段翻页；加 `Shift` 扩展选区 |
 | `Ctrl/Cmd + Shift + Z` / `Ctrl/Cmd + Y` | 重做 |
 | `Ctrl/Cmd + F` | 查找 |
 | `Ctrl/Cmd + H` | 查找与替换 |
@@ -235,6 +238,7 @@ cargo build --locked --example extension_uppercase
 | 文档 | 内容 |
 |---|---|
 | [架构](docs/ARCHITECTURE.md) | 原生重写边界、编辑投影、文档不变量和数据流 |
+| [整体评估](docs/PROJECT-ASSESSMENT-2026-09-10.md) | 源码行为评估、架构升级依据、验证和剩余限制 |
 | [路线图](docs/ROADMAP.md) | P1–P8 完成情况与后续边界 |
 | [质量](docs/QUALITY.md) | 测试层次、性能预算和依赖策略 |
 | [发布](docs/RELEASE.md) | 多平台打包、签名、验证与回滚 |

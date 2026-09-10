@@ -3,15 +3,7 @@ use std::{collections::HashMap, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::editing::MarkdownCommand;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum ViewMode {
-    Edit,
-    Split,
-    #[default]
-    Hybrid,
-    Preview,
-}
+pub(crate) use crate::editor::ViewMode;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]

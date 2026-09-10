@@ -67,7 +67,7 @@ fn tokens(text: &str, language: Option<&str>) -> Vec<Token> {
 
     while cursor < text.len() {
         let remaining = &text[cursor..];
-        if remaining.starts_with("//") {
+        if !hash_comments && remaining.starts_with("//") {
             let end = remaining.find('\n').map_or(text.len(), |end| cursor + end);
             tokens.push(Token {
                 range: cursor..end,
@@ -76,7 +76,7 @@ fn tokens(text: &str, language: Option<&str>) -> Vec<Token> {
             cursor = end;
             continue;
         }
-        if let Some(comment_body) = remaining.strip_prefix("/*") {
+        if !hash_comments && let Some(comment_body) = remaining.strip_prefix("/*") {
             let end = comment_body
                 .find("*/")
                 .map_or(text.len(), |end| cursor + 2 + end + 2);
@@ -248,6 +248,19 @@ fn is_keyword(word: &str, language: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_audit_python_floor_division_is_not_a_comment() {
+        let source = "result = total // 2 # actual comment";
+        let highlighted = tokens(source, Some("python"));
+        let comments = highlighted
+            .iter()
+            .filter(|token| token.kind == TokenKind::Comment)
+            .map(|token| &source[token.range.clone()])
+            .collect::<Vec<_>>();
+        assert_eq!(comments, vec!["# actual comment"]);
+        assert!(highlighted.iter().any(|token| token.kind == TokenKind::Number && &source[token.range.clone()] == "2"));
+    }
 
     #[test]
     fn preserves_unicode_and_classifies_core_tokens() {
