@@ -25,3 +25,4 @@ mod external_changes;
 mod presentation;
 mod rendering;
 mod session;
+mod svg_fonts;

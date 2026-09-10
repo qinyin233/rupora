@@ -66,4 +66,12 @@
 
 日志：`target/source-input-audit-rich-layout-before.log`、`target/source-input-audit-rich-layout-after.log`。最后一组耗时约为原来的 1/140。实现将样式片段的字符到字节映射从反复扫描改为一次前向遍历，保留字体、正文和片段样式行为。
 
-本地验证环境为 Windows；没有把它等同于 Linux/macOS CI，也没有把 fuzz 编译检查等同于长时间模糊测试。源码审查和回归覆盖不能证明所有任意输入组合均无缺陷。
+## 推送后的跨平台补充
+
+提交 `80cffd7` 的 [Linux CI](https://github.com/qinyin233/rupora/actions/runs/34471581289) 复现 SVG 文字变透明，失败测试为 `audit_local_svg_text_is_visible_after_normalization`。字体库已经加载系统字体，但默认或 fontconfig 提供的通用别名可能指向未安装的字体；仅加载字体文件不能保证通用字体查询成功。
+
+增加共享的 `svg_fonts` 模块，供本地 SVG 导出和生成图解析使用：保留能够解析的系统字体选择，为缺失的通用字体选择已安装的同类字体，并共享缓存。新增两项使用 egui 内置字体构造隔离字体库的测试，验证五类通用字体及缺失字体名称仍能绘制文字，同时保留有效的原有字体映射。
+
+修复后的 Windows 全目标测试为 452 passed、0 failed、3 ignored（库测试 430 项，其他测试 22 项），日志为 `target/push-font-fix-all-tests.log`。前文发布程序哈希和窗口复测记录对应此次 CI 补充前的本地构建；后续远程构建以 [Native Rust CI](https://github.com/qinyin233/rupora/actions/workflows/native-ci.yml) 的具体提交结果为准。
+
+没有把 Windows 本地验证等同于 Linux/macOS CI，也没有把 fuzz 编译检查等同于长时间模糊测试。源码审查和回归覆盖不能证明所有任意输入组合均无缺陷。

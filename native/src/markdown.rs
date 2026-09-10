@@ -3,7 +3,6 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
     path::Path,
-    sync::{Arc, OnceLock},
 };
 
 use pulldown_cmark::{
@@ -1419,17 +1418,7 @@ fn bound_generated_svg(svg: String, kind: &str) -> Result<String, String> {
 }
 
 fn generated_svg_options() -> usvg::Options<'static> {
-    static FONT_DATABASE: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
-
-    let font_database = FONT_DATABASE.get_or_init(|| {
-        let mut database = usvg::fontdb::Database::new();
-        database.load_system_fonts();
-        Arc::new(database)
-    });
-    let mut options = usvg::Options {
-        fontdb: Arc::clone(font_database),
-        ..usvg::Options::default()
-    };
+    let mut options = crate::svg_fonts::options();
     // Export generated content only as static artwork. Resolving an image from
     // a user-controlled SVG could otherwise expose local or network resources.
     options.image_href_resolver = usvg::ImageHrefResolver {

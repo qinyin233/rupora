@@ -4,7 +4,7 @@ use std::{
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
@@ -315,16 +315,9 @@ fn rasterize_svg(
     path: &Path,
     resource_root: &Path,
 ) -> Result<(Vec<u8>, &'static str, u32, u32), String> {
-    static FONT_DATABASE: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
-    let fontdb = FONT_DATABASE.get_or_init(|| {
-        let mut database = usvg::fontdb::Database::new();
-        database.load_system_fonts();
-        Arc::new(database)
-    });
     let resources = SvgResources::default();
     let directory = path.parent().unwrap_or(resource_root);
     let options = usvg::Options {
-        fontdb: Arc::clone(fontdb),
         resources_dir: Some(directory.to_path_buf()),
         image_href_resolver: usvg::ImageHrefResolver {
             resolve_data: Box::new(|mime, data, options| {
@@ -347,7 +340,7 @@ fn rasterize_svg(
                 })
             }),
         },
-        ..usvg::Options::default()
+        ..crate::svg_fonts::options()
     };
     let tree = usvg::Tree::from_data(bytes, &options)
         .map_err(|error| format!("无法解析 SVG {}：{error}", path.display()))?;
