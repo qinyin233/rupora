@@ -21,7 +21,6 @@ pub(crate) const WYSIWYG_INLINE_CODE_VERTICAL_PADDING: f32 = 2.0;
 pub(crate) struct AppPalette {
     pub(crate) canvas: Color32,
     pub(crate) surface: Color32,
-    pub(crate) toolbar: Color32,
     pub(crate) sidebar: Color32,
     pub(crate) text: Color32,
     pub(crate) secondary: Color32,
@@ -39,55 +38,92 @@ pub(crate) struct AppPalette {
 pub(crate) fn app_palette(dark: bool) -> AppPalette {
     if dark {
         AppPalette {
-            canvas: Color32::from_rgb(24, 25, 27),
-            surface: Color32::from_rgb(32, 33, 36),
-            toolbar: Color32::from_rgb(29, 30, 33),
-            sidebar: Color32::from_rgb(28, 29, 32),
-            text: Color32::from_rgb(237, 238, 240),
-            secondary: Color32::from_rgb(155, 159, 168),
-            border: Color32::from_rgb(48, 50, 55),
-            accent: Color32::from_rgb(92, 164, 255),
-            accent_soft: Color32::from_rgb(37, 58, 83),
+            canvas: Color32::from_rgb(23, 25, 29),
+            surface: Color32::from_rgb(31, 34, 39),
+            sidebar: Color32::from_rgb(26, 29, 34),
+            text: Color32::from_rgb(238, 241, 246),
+            secondary: Color32::from_rgb(171, 180, 195),
+            border: Color32::from_rgb(53, 59, 69),
+            accent: Color32::from_rgb(115, 181, 255),
+            accent_soft: Color32::from_rgb(36, 58, 84),
             code_bg: Color32::from_rgb(39, 41, 45),
             code_keyword: Color32::from_rgb(198, 149, 255),
             code_string: Color32::from_rgb(143, 203, 157),
-            code_comment: Color32::from_rgb(126, 132, 146),
+            code_comment: Color32::from_rgb(164, 174, 190),
             code_number: Color32::from_rgb(235, 184, 116),
             hover: Color32::from_rgb(43, 45, 50),
         }
     } else {
         AppPalette {
-            canvas: Color32::from_rgb(245, 245, 247),
+            canvas: Color32::from_rgb(243, 244, 246),
             surface: Color32::WHITE,
-            toolbar: Color32::from_rgb(249, 249, 251),
-            sidebar: Color32::from_rgb(241, 242, 245),
-            text: Color32::from_rgb(29, 29, 31),
-            secondary: Color32::from_rgb(115, 119, 128),
-            border: Color32::from_rgb(229, 230, 234),
-            accent: Color32::from_rgb(0, 113, 227),
-            accent_soft: Color32::from_rgb(228, 240, 254),
+            sidebar: Color32::from_rgb(236, 238, 242),
+            text: Color32::from_rgb(32, 36, 44),
+            secondary: Color32::from_rgb(89, 97, 112),
+            border: Color32::from_rgb(217, 222, 230),
+            accent: Color32::from_rgb(0, 103, 217),
+            accent_soft: Color32::from_rgb(225, 236, 252),
             code_bg: Color32::from_rgb(247, 248, 250),
             code_keyword: Color32::from_rgb(126, 65, 196),
-            code_string: Color32::from_rgb(32, 128, 86),
-            code_comment: Color32::from_rgb(113, 121, 132),
+            code_string: Color32::from_rgb(25, 113, 75),
+            code_comment: Color32::from_rgb(93, 104, 118),
             code_number: Color32::from_rgb(177, 91, 22),
             hover: Color32::from_rgb(235, 237, 241),
         }
     }
 }
 
-pub(crate) fn document_page_frame(palette: AppPalette, dark: bool) -> egui::Frame {
+/// Shared by all document views, including narrow split panes.
+pub(crate) struct DocumentPageLayout {
+    pub(crate) side_margin: f32,
+    pub(crate) top_margin: f32,
+    pub(crate) content_width: f32,
+    pub(crate) min_content_height: f32,
+    horizontal_padding: i8,
+    vertical_padding: i8,
+}
+
+pub(crate) fn document_page_layout(width: f32, height: f32) -> DocumentPageLayout {
+    let gutter = if width < 280.0 {
+        0.0
+    } else if width < 640.0 {
+        12.0
+    } else {
+        24.0
+    };
+    let page_width = (width - 2.0 * gutter).clamp(1.0, 880.0);
+    let horizontal_padding = if page_width < 280.0 {
+        12
+    } else if page_width < 440.0 {
+        20
+    } else if page_width < 680.0 {
+        32
+    } else {
+        56
+    };
+    let vertical_padding = if width < 640.0 { 24 } else { 40 };
+    let top_margin = if width < 640.0 { 12.0 } else { 24.0 };
+    DocumentPageLayout {
+        side_margin: ((width - page_width) * 0.5).max(0.0),
+        top_margin,
+        content_width: (page_width - 2.0 * horizontal_padding as f32).max(1.0),
+        min_content_height: (height - 2.0 * top_margin - 2.0 * vertical_padding as f32).max(80.0),
+        horizontal_padding,
+        vertical_padding,
+    }
+}
+
+pub(crate) fn document_page_frame(
+    palette: AppPalette,
+    _dark: bool,
+    layout: &DocumentPageLayout,
+) -> egui::Frame {
     egui::Frame::new()
         .fill(palette.surface)
-        .stroke(Stroke::new(0.5, palette.border))
-        .corner_radius(14)
-        .shadow(egui::epaint::Shadow {
-            offset: [0, 5],
-            blur: 24,
-            spread: 0,
-            color: Color32::from_black_alpha(if dark { 32 } else { 8 }),
-        })
-        .inner_margin(Margin::symmetric(56, 44))
+        .inner_margin(Margin::symmetric(
+            layout.horizontal_padding,
+            layout.vertical_padding,
+        ))
 }
 
 pub(crate) fn code_block_frame(palette: AppPalette) -> egui::Frame {
@@ -131,6 +167,18 @@ pub(crate) enum AppIcon {
     Source,
     File,
     Close,
+    Search,
+    Write,
+    Read,
+    Split,
+    More,
+    Refresh,
+    ArrowUp,
+    ArrowDown,
+    Copy,
+    Check,
+    ChevronRight,
+    ChevronDown,
 }
 
 impl AppIcon {
@@ -139,12 +187,24 @@ impl AppIcon {
             Self::New => "新建",
             Self::Folder => "打开",
             Self::Save => "保存",
-            Self::Sidebar => "资源管理器",
+            Self::Sidebar => "文稿架",
             Self::Outline => "文档大纲",
             Self::Theme => "切换主题",
-            Self::Source => "源码 / 所见即所得",
+            Self::Source => "源码",
             Self::File => "Markdown 文档",
             Self::Close => "关闭",
+            Self::Search => "查找",
+            Self::Write => "写作",
+            Self::Read => "阅读",
+            Self::Split => "分栏",
+            Self::More => "更多操作",
+            Self::Refresh => "刷新",
+            Self::ArrowUp => "上一个匹配项",
+            Self::ArrowDown => "下一个匹配项",
+            Self::Copy => "复制",
+            Self::Check => "已完成",
+            Self::ChevronRight => "展开",
+            Self::ChevronDown => "折叠",
         }
     }
 }
@@ -160,7 +220,7 @@ impl egui::Widget for AppIconButton {
     fn ui(self, ui: &mut Ui) -> egui::Response {
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(self.size), egui::Sense::click());
         let enabled = ui.is_enabled();
-        let fill = if self.selected {
+        let fill = if enabled && (self.selected || response.is_pointer_button_down_on()) {
             self.palette.accent_soft
         } else if response.hovered() && enabled {
             self.palette.hover
@@ -168,6 +228,14 @@ impl egui::Widget for AppIconButton {
             Color32::TRANSPARENT
         };
         ui.painter().rect_filled(rect, 6.0, fill);
+        if response.has_focus() && enabled {
+            ui.painter().rect_stroke(
+                rect.shrink(1.0),
+                6.0,
+                Stroke::new(2.0, self.palette.accent),
+                egui::StrokeKind::Inside,
+            );
+        }
         let color = if !enabled {
             self.palette.secondary.gamma_multiply(0.45)
         } else if self.selected {
@@ -177,16 +245,37 @@ impl egui::Widget for AppIconButton {
         };
         paint_app_icon(
             ui.painter(),
-            rect.shrink(self.size * 0.25),
+            egui::Rect::from_center_size(
+                rect.center(),
+                Vec2::splat((self.size - 12.0).clamp(12.0, 20.0)),
+            ),
             self.icon,
             color,
         );
         response.widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::WidgetType::Button,
-                enabled,
-                self.icon.accessible_label(),
-            )
+            if matches!(
+                self.icon,
+                AppIcon::Sidebar
+                    | AppIcon::Outline
+                    | AppIcon::Source
+                    | AppIcon::Write
+                    | AppIcon::Read
+                    | AppIcon::Split
+                    | AppIcon::Search
+            ) {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::Button,
+                    enabled,
+                    self.selected,
+                    self.icon.accessible_label(),
+                )
+            } else {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    enabled,
+                    self.icon.accessible_label(),
+                )
+            }
         });
         response
     }
@@ -201,7 +290,7 @@ pub(crate) fn icon_button_widget(
         icon,
         selected,
         palette,
-        size: 30.0,
+        size: 32.0,
     }
 }
 
@@ -216,171 +305,345 @@ pub(crate) fn app_icon_button(
         .on_hover_text(tooltip)
 }
 
+/// A single focusable target for an icon and its visible label. The icon is
+/// decorative here; assistive technology receives the action once, as text.
+pub(crate) fn app_action_button(
+    ui: &mut Ui,
+    icon: AppIcon,
+    label: &str,
+    selected: bool,
+    palette: AppPalette,
+    width: f32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 34.0), egui::Sense::click());
+    let enabled = ui.is_enabled();
+    let fill = if enabled && (selected || response.is_pointer_button_down_on()) {
+        palette.accent_soft
+    } else if enabled && response.hovered() {
+        palette.hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 6.0, fill);
+    if response.has_focus() && enabled {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            6.0,
+            Stroke::new(2.0, palette.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let color = if !enabled {
+        palette.secondary.gamma_multiply(0.45)
+    } else if selected {
+        palette.accent
+    } else {
+        palette.text
+    };
+    paint_app_icon(
+        ui.painter(),
+        egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 19.0, rect.center().y),
+            Vec2::splat(18.0),
+        ),
+        icon,
+        color,
+    );
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        label.to_owned(),
+        FontId::proportional(13.0),
+        color,
+    );
+    job.wrap.max_width = (width - 42.0).max(1.0);
+    job.wrap.max_rows = 1;
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    ui.painter().galley(
+        egui::pos2(rect.left() + 35.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        color,
+    );
+    response.widget_info(|| {
+        if matches!(
+            icon,
+            AppIcon::Write | AppIcon::Read | AppIcon::Split | AppIcon::Source
+        ) && label == icon.accessible_label()
+        {
+            egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, selected, label)
+        } else {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label)
+        }
+    });
+    response
+}
+
+pub(crate) struct DocumentTabResponse {
+    pub(crate) response: egui::Response,
+    pub(crate) activate: bool,
+    pub(crate) close: bool,
+}
+
+pub(crate) fn document_tab(
+    ui: &mut Ui,
+    title: &str,
+    dirty: bool,
+    selected: bool,
+    palette: AppPalette,
+    width: f32,
+) -> DocumentTabResponse {
+    let mut activate = false;
+    let mut close = false;
+    let tab = egui::Frame::new()
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::new(0.5, Color32::TRANSPARENT))
+        .inner_margin(Margin::symmetric(10, 3))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.horizontal(|ui| {
+                let (marker, _) =
+                    ui.allocate_exact_size(Vec2::new(14.0, 28.0), egui::Sense::hover());
+                if dirty {
+                    ui.painter()
+                        .circle_filled(marker.center(), 3.0, palette.accent);
+                } else {
+                    paint_app_icon(
+                        ui.painter(),
+                        egui::Rect::from_center_size(marker.center(), Vec2::splat(13.0)),
+                        AppIcon::File,
+                        if selected {
+                            palette.accent
+                        } else {
+                            palette.secondary
+                        },
+                    );
+                }
+                let response = ui
+                    .add_sized(
+                        [(width - 71.0).max(40.0), 28.0],
+                        egui::Button::new("")
+                            .left_text(RichText::new(title).size(13.0).color(if selected {
+                                palette.text
+                            } else {
+                                palette.secondary
+                            }))
+                            .frame(false)
+                            .truncate(),
+                    )
+                    .on_hover_text(if dirty {
+                        format!("{title}\n有未保存的修改")
+                    } else {
+                        title.to_owned()
+                    });
+                activate = response.clicked();
+                response.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::Button,
+                        ui.is_enabled(),
+                        selected,
+                        title,
+                    )
+                });
+                close = ui
+                    .add(AppIconButton {
+                        icon: AppIcon::Close,
+                        selected: false,
+                        palette,
+                        size: 24.0,
+                    })
+                    .on_hover_text(format!("关闭 {title}"))
+                    .clicked();
+            });
+        });
+    if selected {
+        let rect = tab.response.rect;
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.left() + 10.0, rect.bottom() - 1.0),
+                egui::pos2(rect.right() - 10.0, rect.bottom() - 1.0),
+            ],
+            Stroke::new(2.0, palette.accent),
+        );
+    }
+    DocumentTabResponse {
+        response: tab.response,
+        activate,
+        close,
+    }
+}
+
 pub(crate) fn paint_app_icon(
     painter: &egui::Painter,
     rect: egui::Rect,
     icon: AppIcon,
     color: Color32,
 ) {
-    let stroke = Stroke::new(1.45, color);
-    let center = rect.center();
-    let left = rect.left();
-    let right = rect.right();
-    let top = rect.top();
-    let bottom = rect.bottom();
+    // Every icon uses the same 20 pt grid. Scale the paths and strokes together
+    // so a close control and a navigation icon retain the same optical weight.
+    let scale = rect.width().min(rect.height()) / 20.0;
+    let origin = rect.center() - Vec2::splat(10.0 * scale);
+    let point = |x: f32, y: f32| origin + egui::vec2(x, y) * scale;
+    let stroke = Stroke::new(1.5 * scale, color);
+    let line = |points: &[(f32, f32)]| {
+        let points: Vec<_> = points.iter().map(|&(x, y)| point(x, y)).collect();
+        painter.add(egui::Shape::line(points.clone(), stroke));
+        if let (Some(first), Some(last)) = (points.first(), points.last()) {
+            painter.circle_filled(*first, stroke.width * 0.5, color);
+            painter.circle_filled(*last, stroke.width * 0.5, color);
+        }
+    };
+    let rounded_rect = |min: (f32, f32), max: (f32, f32), radius: f32| {
+        painter.rect_stroke(
+            egui::Rect::from_min_max(point(min.0, min.1), point(max.0, max.1)),
+            radius * scale,
+            stroke,
+            egui::StrokeKind::Middle,
+        );
+    };
     match icon {
         AppIcon::New => {
-            painter.line_segment(
-                [egui::pos2(left, center.y), egui::pos2(right, center.y)],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(center.x, top), egui::pos2(center.x, bottom)],
-                stroke,
-            );
+            line(&[(4.0, 10.0), (16.0, 10.0)]);
+            line(&[(10.0, 4.0), (10.0, 16.0)]);
         }
         AppIcon::Folder => {
-            painter.add(egui::Shape::closed_line(
-                vec![
-                    egui::pos2(left, top + 3.0),
-                    egui::pos2(left + 5.0, top + 3.0),
-                    egui::pos2(left + 7.0, top + 5.0),
-                    egui::pos2(right, top + 5.0),
-                    egui::pos2(right, bottom - 1.0),
-                    egui::pos2(left, bottom - 1.0),
-                ],
-                stroke,
-            ));
+            line(&[
+                (3.0, 16.0),
+                (2.5, 5.0),
+                (7.0, 5.0),
+                (9.0, 7.0),
+                (17.0, 7.0),
+                (17.0, 9.0),
+            ]);
+            line(&[
+                (3.0, 16.0),
+                (5.0, 9.0),
+                (18.0, 9.0),
+                (16.0, 16.0),
+                (3.0, 16.0),
+            ]);
         }
         AppIcon::Save => {
-            painter.add(egui::Shape::closed_line(
-                vec![
-                    egui::pos2(left + 1.0, top),
-                    egui::pos2(right - 2.0, top),
-                    egui::pos2(right, top + 2.0),
-                    egui::pos2(right, bottom),
-                    egui::pos2(left + 1.0, bottom),
-                ],
-                stroke,
-            ));
-            painter.line_segment(
-                [
-                    egui::pos2(left + 4.0, top),
-                    egui::pos2(left + 4.0, top + 5.0),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(left + 4.0, bottom - 4.0),
-                    egui::pos2(right - 3.0, bottom - 4.0),
-                ],
-                stroke,
-            );
+            line(&[
+                (3.0, 3.0),
+                (13.5, 3.0),
+                (17.0, 6.5),
+                (17.0, 17.0),
+                (3.0, 17.0),
+                (3.0, 3.0),
+            ]);
+            line(&[(6.0, 3.0), (6.0, 8.0), (13.0, 8.0), (13.0, 3.0)]);
+            rounded_rect((6.0, 11.5), (14.0, 17.0), 1.0);
         }
         AppIcon::Sidebar => {
-            painter.add(egui::Shape::closed_line(
-                vec![
-                    egui::pos2(left, top),
-                    egui::pos2(right, top),
-                    egui::pos2(right, bottom),
-                    egui::pos2(left, bottom),
-                ],
-                stroke,
-            ));
-            painter.line_segment(
-                [egui::pos2(left + 4.5, top), egui::pos2(left + 4.5, bottom)],
-                stroke,
-            );
+            rounded_rect((2.5, 3.5), (17.5, 16.5), 2.0);
+            line(&[(7.5, 3.5), (7.5, 16.5)]);
+            line(&[(4.5, 7.0), (5.5, 7.0)]);
+            line(&[(4.5, 10.0), (5.5, 10.0)]);
         }
         AppIcon::Outline => {
-            for row in 0..3 {
-                let y = top + 2.0 + row as f32 * 5.0;
-                painter.circle_filled(egui::pos2(left + 1.5, y), 1.15, color);
-                painter.line_segment([egui::pos2(left + 5.0, y), egui::pos2(right, y)], stroke);
+            for y in [5.0, 10.0, 15.0] {
+                painter.circle_filled(point(3.5, y), scale, color);
+                line(&[(7.0, y), (17.0, y)]);
             }
         }
         AppIcon::Theme => {
-            painter.circle_stroke(center, 3.3, stroke);
+            painter.circle_stroke(point(10.0, 10.0), 3.25 * scale, stroke);
             for index in 0..8 {
                 let angle = index as f32 * std::f32::consts::TAU / 8.0;
-                let direction = egui::vec2(angle.cos(), angle.sin());
-                painter.line_segment([center + direction * 5.3, center + direction * 7.0], stroke);
+                let (x, y) = (angle.cos(), angle.sin());
+                line(&[
+                    (10.0 + x * 6.0, 10.0 + y * 6.0),
+                    (10.0 + x * 7.5, 10.0 + y * 7.5),
+                ]);
             }
         }
         AppIcon::Source => {
-            painter.line_segment(
-                [
-                    egui::pos2(center.x - 2.0, top + 1.5),
-                    egui::pos2(left, center.y),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(left, center.y),
-                    egui::pos2(center.x - 2.0, bottom - 1.5),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(center.x + 2.0, top + 1.5),
-                    egui::pos2(right, center.y),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(right, center.y),
-                    egui::pos2(center.x + 2.0, bottom - 1.5),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(center.x + 1.5, top),
-                    egui::pos2(center.x - 1.5, bottom),
-                ],
-                stroke,
-            );
+            line(&[(6.0, 5.5), (2.0, 10.0), (6.0, 14.5)]);
+            line(&[(14.0, 5.5), (18.0, 10.0), (14.0, 14.5)]);
+            line(&[(11.5, 3.5), (8.5, 16.5)]);
         }
         AppIcon::File => {
-            painter.add(egui::Shape::line(
-                vec![
-                    egui::pos2(left + 2.0, top),
-                    egui::pos2(right - 4.0, top),
-                    egui::pos2(right, top + 4.0),
-                    egui::pos2(right, bottom),
-                    egui::pos2(left + 2.0, bottom),
-                    egui::pos2(left + 2.0, top),
-                ],
-                stroke,
-            ));
-            painter.line_segment(
-                [
-                    egui::pos2(right - 4.0, top),
-                    egui::pos2(right - 4.0, top + 4.0),
-                ],
-                stroke,
-            );
+            line(&[
+                (11.5, 2.5),
+                (4.0, 2.5),
+                (4.0, 17.5),
+                (16.0, 17.5),
+                (16.0, 7.0),
+                (11.5, 2.5),
+                (11.5, 7.0),
+                (16.0, 7.0),
+            ]);
+            line(&[(7.0, 11.0), (13.0, 11.0)]);
+            line(&[(7.0, 14.0), (11.0, 14.0)]);
         }
         AppIcon::Close => {
-            painter.line_segment(
-                [
-                    egui::pos2(left + 2.0, top + 2.0),
-                    egui::pos2(right - 2.0, bottom - 2.0),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(right - 2.0, top + 2.0),
-                    egui::pos2(left + 2.0, bottom - 2.0),
-                ],
-                stroke,
-            );
+            line(&[(5.0, 5.0), (15.0, 15.0)]);
+            line(&[(15.0, 5.0), (5.0, 15.0)]);
         }
+        AppIcon::Search => {
+            painter.circle_stroke(point(8.5, 8.5), 5.5 * scale, stroke);
+            line(&[(12.5, 12.5), (17.0, 17.0)]);
+        }
+        AppIcon::Write => {
+            line(&[
+                (4.0, 13.0),
+                (13.5, 3.5),
+                (16.5, 6.5),
+                (7.0, 16.0),
+                (3.0, 17.0),
+                (4.0, 13.0),
+                (7.0, 16.0),
+            ]);
+            line(&[(11.5, 5.5), (14.5, 8.5)]);
+        }
+        AppIcon::Read => {
+            line(&[
+                (10.0, 5.0),
+                (6.0, 3.5),
+                (2.5, 3.5),
+                (2.5, 15.0),
+                (6.0, 15.0),
+                (10.0, 16.5),
+                (14.0, 15.0),
+                (17.5, 15.0),
+                (17.5, 3.5),
+                (14.0, 3.5),
+                (10.0, 5.0),
+                (10.0, 16.5),
+            ]);
+        }
+        AppIcon::Split => {
+            rounded_rect((2.5, 3.5), (17.5, 16.5), 2.0);
+            line(&[(10.0, 3.5), (10.0, 16.5)]);
+        }
+        AppIcon::More => {
+            for x in [4.0, 10.0, 16.0] {
+                painter.circle_filled(point(x, 10.0), 1.25 * scale, color);
+            }
+        }
+        AppIcon::Refresh => {
+            let points: Vec<_> = (0..=20)
+                .map(|step| {
+                    let angle = (-45.0 + step as f32 * 14.0).to_radians();
+                    (10.0 + 6.0 * angle.cos(), 10.0 + 6.0 * angle.sin())
+                })
+                .collect();
+            line(&points);
+            line(&[(14.3, 2.7), (14.3, 5.7), (17.3, 5.7)]);
+        }
+        AppIcon::ArrowUp => {
+            line(&[(10.0, 16.0), (10.0, 4.0)]);
+            line(&[(5.5, 8.5), (10.0, 4.0), (14.5, 8.5)]);
+        }
+        AppIcon::ArrowDown => {
+            line(&[(10.0, 4.0), (10.0, 16.0)]);
+            line(&[(5.5, 11.5), (10.0, 16.0), (14.5, 11.5)]);
+        }
+        AppIcon::Copy => {
+            rounded_rect((6.5, 6.5), (17.0, 17.0), 2.0);
+            line(&[(12.5, 3.0), (5.0, 3.0), (3.0, 5.0), (3.0, 12.5)]);
+        }
+        AppIcon::Check => line(&[(4.0, 10.0), (8.0, 14.0), (16.0, 6.0)]),
+        AppIcon::ChevronRight => line(&[(7.0, 4.5), (12.5, 10.0), (7.0, 15.5)]),
+        AppIcon::ChevronDown => line(&[(4.5, 7.0), (10.0, 12.5), (15.5, 7.0)]),
     }
 }
 
@@ -388,9 +651,18 @@ pub(crate) fn outline_row(ui: &mut Ui, heading: &Heading) -> bool {
     let indent = (heading.level.saturating_sub(1) as f32) * 12.0;
     ui.horizontal(|ui| {
         ui.add_space(indent);
-        ui.selectable_label(false, &heading.text)
-            .on_hover_text(format!("第 {} 行 · H{}", heading.line, heading.level))
-            .clicked()
+        ui.add_sized(
+            [ui.available_width(), 28.0],
+            egui::Button::new("")
+                .left_text(&heading.text)
+                .frame(false)
+                .truncate(),
+        )
+        .on_hover_text(format!(
+            "{}\n第 {} 行 · H{}",
+            heading.text, heading.line, heading.level
+        ))
+        .clicked()
     })
     .inner
 }
@@ -509,7 +781,7 @@ pub(crate) fn apply_theme(ctx: &Context, dark: bool) {
 
     visuals.widgets.active.bg_fill = palette.accent_soft;
     visuals.widgets.active.weak_bg_fill = palette.accent_soft;
-    visuals.widgets.active.bg_stroke = Stroke::NONE;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.5, palette.accent);
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, palette.text);
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
     visuals.widgets.active.expansion = 0.0;
@@ -524,7 +796,7 @@ pub(crate) fn apply_theme(ctx: &Context, dark: bool) {
         style.visuals = visuals;
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.button_padding = Vec2::new(10.0, 5.0);
-        style.spacing.interact_size = Vec2::new(32.0, 29.0);
+        style.spacing.interact_size = Vec2::new(32.0, 30.0);
         style.spacing.window_margin = Margin::same(18);
         style.spacing.scroll.bar_width = 7.0;
         style.spacing.scroll.floating_width = 2.0;
@@ -641,10 +913,157 @@ fn cjk_bold_font_candidates() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "windows")]
     use super::*;
     #[cfg(target_os = "windows")]
     use std::path::Path;
+
+    #[test]
+    fn normal_text_and_syntax_colors_remain_readable_in_both_themes() {
+        fn luminance(color: Color32) -> f32 {
+            let linear = |channel: u8| {
+                let value = channel as f32 / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+        }
+        let check = |foreground, background| {
+            let a = luminance(foreground);
+            let b = luminance(background);
+            let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+            assert!(
+                contrast >= 4.5,
+                "{foreground:?} on {background:?}: {contrast:.2}:1"
+            );
+        };
+        for dark in [false, true] {
+            let palette = app_palette(dark);
+            for background in [
+                palette.surface,
+                palette.canvas,
+                palette.sidebar,
+                palette.hover,
+                palette.accent_soft,
+            ] {
+                for foreground in [palette.text, palette.secondary] {
+                    check(foreground, background);
+                }
+            }
+            for foreground in [
+                palette.text,
+                palette.code_comment,
+                palette.code_keyword,
+                palette.code_string,
+                palette.code_number,
+            ] {
+                check(foreground, palette.code_bg);
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_document_page_fits_narrow_split_panes() {
+        for width in [120.0, 180.0, 240.0, 340.0, 600.0, 1000.0] {
+            let context = Context::default();
+            let _ = context.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 560.0))),
+                ..Default::default()
+            }, |ui| {
+                let available = ui.available_rect_before_wrap();
+                let layout = document_page_layout(available.width(), available.height());
+                ui.add_space(layout.top_margin);
+                let frame = ui.horizontal(|ui| {
+                    ui.add_space(layout.side_margin);
+                    document_page_frame(app_palette(false), false, &layout).show(ui, |ui| {
+                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                            ui.set_width(layout.content_width);
+                            ui.set_min_height(layout.min_content_height);
+                            ui.label("A narrow paragraph with enough words to wrap across multiple lines.");
+                        });
+                    }).response.rect
+                }).inner;
+                assert!(available.expand(1.0).contains_rect(frame), "width={width}: {frame:?} outside {available:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn long_document_tab_keeps_its_close_control_visible_and_clickable() {
+        for selected in [false, true] {
+            for dirty in [false, true] {
+                let context = Context::default();
+                let mut tab_rect = egui::Rect::NOTHING;
+                for phase in 0..3 {
+                    let position = egui::pos2(tab_rect.right() - 22.5, tab_rect.center().y);
+                    let events = if phase == 0 {
+                        vec![]
+                    } else {
+                        vec![
+                            egui::Event::PointerMoved(position),
+                            egui::Event::PointerButton {
+                                pos: position,
+                                button: egui::PointerButton::Primary,
+                                pressed: phase == 1,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]
+                    };
+                    let _ = context.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                        ui.horizontal(|ui| {
+                            let tab = document_tab(ui, "An extremely long document title that must never hide the close control.md", dirty, selected, app_palette(false), 160.0);
+                            tab_rect = tab.response.rect;
+                            assert!(tab_rect.width() <= 161.0, "tab grew to {}", tab_rect.width());
+                            assert_eq!(tab.close, phase == 2);
+                            assert!(!tab.activate);
+                        });
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn icon_keyboard_focus_is_visible_without_moving_the_control() {
+        let context = Context::default();
+        let palette = app_palette(false);
+        let mut initial = egui::Rect::NOTHING;
+        for phase in 0..3 {
+            let events = if phase == 2 {
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }]
+            } else {
+                vec![]
+            };
+            let output = context.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let response = ui.add(icon_button_widget(AppIcon::Sidebar, false, palette));
+                    if phase == 0 {
+                        initial = response.rect;
+                        response.request_focus();
+                    } else {
+                        assert!(response.has_focus());
+                        assert_eq!(response.rect, initial);
+                        assert_eq!(response.clicked(), phase == 2);
+                    }
+                },
+            );
+            if phase > 0 {
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.stroke.color == palette.accent && rect.stroke.width >= 2.0)), "keyboard focus must be painted");
+            }
+        }
+    }
 
     #[cfg(target_os = "windows")]
     #[test]

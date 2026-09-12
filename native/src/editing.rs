@@ -390,8 +390,19 @@ fn longest_backtick_run(text: &str) -> usize {
     longest
 }
 
+fn inline_code_wrappers(content: &str) -> (String, String) {
+    let fence = "`".repeat(longest_backtick_run(content) + 1);
+    let needs_padding = content.starts_with('`')
+        || content.ends_with('`')
+        || content.starts_with(' ')
+            && content.ends_with(' ')
+            && content.bytes().any(|byte| byte != b' ');
+    let padding = if needs_padding { " " } else { "" };
+    (format!("{fence}{padding}"), format!("{padding}{fence}"))
+}
+
 fn toggle_inline_code(text: &mut String, selection: Range<usize>) -> Range<usize> {
-    let selected = char_to_byte(text, selection.start)..char_to_byte(text, selection.end);
+    let mut selected = char_to_byte(text, selection.start)..char_to_byte(text, selection.end);
     let wrapper = pulldown_cmark::Parser::new_ext(text, crate::markdown::parser_options())
         .into_offset_iter()
         .find_map(|(event, syntax)| {
@@ -423,20 +434,31 @@ fn toggle_inline_code(text: &mut String, selection: Range<usize>) -> Range<usize
         return toggle_wrap(text, selection, "`", "`");
     }
 
-    let content = &text[selected];
-    let fence = "`".repeat(longest_backtick_run(content) + 1);
-    let needs_padding = content.starts_with('`')
-        || content.ends_with('`')
-        || content.starts_with(' ')
-            && content.ends_with(' ')
-            && content.bytes().any(|byte| byte != b' ');
-    let padding = if needs_padding { " " } else { "" };
-    toggle_wrap(
-        text,
-        selection,
-        &format!("{fence}{padding}"),
-        &format!("{padding}{fence}"),
-    )
+    // A generated pair may not parse as inline code in its surrounding Markdown
+    // (for example after a backslash or inside a fenced block).
+    let (before, after) = inline_code_wrappers(&text[selected.clone()]);
+    if selected.start >= before.len()
+        && text.get(selected.start - before.len()..selected.start) == Some(before.as_str())
+        && text.get(selected.end..selected.end + after.len()) == Some(after.as_str())
+    {
+        return toggle_wrap(text, selection, &before, &after);
+    }
+
+    // Adjacent source backticks would merge with the inserted fence, and a
+    // later toggle would then remove them as syntax. Include those runs in
+    // the content selection so they stay literal and can be restored intact.
+    selected.start -= text[..selected.start]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'`')
+        .count();
+    selected.end += text[selected.end..]
+        .bytes()
+        .take_while(|byte| *byte == b'`')
+        .count();
+    let selection = byte_range_to_char_range(text, selected.clone());
+    let (before, after) = inline_code_wrappers(&text[selected]);
+    toggle_wrap(text, selection, &before, &after)
 }
 
 fn toggle_code_block(text: &mut String, selection: Range<usize>) -> Range<usize> {
@@ -886,6 +908,74 @@ mod tests {
             1..1,
         );
         assert_eq!(source, "前后");
+    }
+
+    #[test]
+    fn inline_code_command_keeps_adjacent_backticks_as_content() {
+        for (original, selection, expanded) in [
+            ("```", 1..2, 0..3),
+            ("前`中`🙂`后", 2..5, 1..6),
+            ("前``🙂后", 3..4, 1..4),
+            ("前🙂``后", 1..2, 1..4),
+        ] {
+            let mut source = original.to_owned();
+            let expected_content = &original
+                [char_to_byte(original, expanded.start)..char_to_byte(original, expanded.end)];
+            let selected =
+                apply_markdown_command(&mut source, selection, MarkdownCommand::InlineCode);
+            assert_eq!(
+                &source[char_to_byte(&source, selected.start)..char_to_byte(&source, selected.end)],
+                expected_content,
+                "neighboring backticks must remain content rather than join the new fence",
+            );
+            let codes = pulldown_cmark::Parser::new_ext(&source, crate::markdown::parser_options())
+                .filter_map(|event| match event {
+                    pulldown_cmark::Event::Code(code) => Some(code.into_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(codes, [expected_content]);
+            assert_eq!(
+                apply_markdown_command(&mut source, selected, MarkdownCommand::InlineCode),
+                expanded,
+            );
+            assert_eq!(source, original);
+        }
+    }
+
+    #[test]
+    fn inline_code_command_removes_nonminimal_fences() {
+        for original in ["``foo``", "`` foo ``", "```foo```"] {
+            let mut source = original.to_owned();
+            let start = original.find("foo").unwrap();
+            let selected =
+                apply_markdown_command(&mut source, start..start + 3, MarkdownCommand::InlineCode);
+            assert_eq!(source, "foo");
+            assert_eq!(selected, 0..3);
+            assert_eq!(
+                apply_markdown_command(&mut source, selected, MarkdownCommand::InlineCode),
+                1..4,
+            );
+            assert_eq!(source, "`foo`");
+        }
+    }
+
+    #[test]
+    fn inline_code_command_round_trips_when_context_hides_the_fence() {
+        for (original, selection) in [("\\中🙂", 1..3), ("```\n中🙂\n```", 4..6)] {
+            let mut source = original.to_owned();
+            let selected =
+                apply_markdown_command(&mut source, selection.clone(), MarkdownCommand::InlineCode);
+            assert_eq!(
+                &source[char_to_byte(&source, selected.start)..char_to_byte(&source, selected.end)],
+                "中🙂",
+            );
+            assert_eq!(
+                apply_markdown_command(&mut source, selected, MarkdownCommand::InlineCode),
+                selection,
+            );
+            assert_eq!(source, original);
+        }
     }
 
     #[test]

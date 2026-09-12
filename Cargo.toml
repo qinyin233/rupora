@@ -1,6 +1,6 @@
 [package]
 name = "rupora"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 edition = "2024"
 rust-version = "1.92"
 description = "A native Rust Markdown editor"

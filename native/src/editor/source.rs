@@ -25,24 +25,20 @@ impl EditorSurface {
         }
         let mut context_command = None;
         let palette = app_palette(options.dark);
+        let viewport_height = ui.available_height();
         let output = scroll_area.show(ui, |ui| {
-            let viewport = ui.available_size();
-            ui.set_min_size(Vec2::new(viewport.x, viewport.y.max(420.0)));
-            ui.add_space(28.0);
-            let available_width = ui.available_width();
-            let page_width = (available_width - 48.0)
-                .clamp(280.0, 920.0)
-                .min(available_width);
-            let side_margin = ((available_width - page_width) * 0.5).max(0.0);
+            let page_layout = document_page_layout(ui.available_width(), viewport_height);
+            ui.add_space(page_layout.top_margin);
             ui.horizontal(|ui| {
-                ui.add_space(side_margin);
-                document_page_frame(palette, options.dark).show(ui, |ui| {
+                ui.add_space(page_layout.side_margin);
+                document_page_frame(palette, options.dark, &page_layout).show(ui, |ui| {
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                        ui.set_width((page_width - 112.0).max(160.0));
+                        ui.set_width(page_layout.content_width);
+                        ui.set_min_height(page_layout.min_content_height);
                         let available =
-                            Vec2::new(ui.available_width(), (viewport.y - 144.0).max(360.0));
+                            Vec2::new(ui.available_width(), page_layout.min_content_height);
                         let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
-                        let desired_rows = (available.y / row_height).max(20.0) as usize;
+                        let desired_rows = (available.y / row_height).max(1.0) as usize;
                         let editor_id = ui.make_persistent_id(("editor", document.id()));
                         self.editor_widget_id = Some(editor_id);
                         let requested_cursor = self.pending_editor_cursor;
@@ -60,7 +56,7 @@ impl EditorSurface {
                             .id(editor_id)
                             .font(egui::TextStyle::Monospace)
                             .code_editor()
-                            .hint_text("Markdown 源码编辑区")
+                            .hint_text("写下第一行…")
                             .desired_width(f32::INFINITY)
                             .desired_rows(desired_rows)
                             .lock_focus(true)

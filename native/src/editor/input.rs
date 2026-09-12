@@ -57,7 +57,7 @@ pub(super) fn hybrid_page_cursor(
     down: bool,
     dark: bool,
 ) -> usize {
-    let width = (ui.available_width().min(920.0) - 112.0).max(160.0);
+    let width = document_page_layout(ui.available_width(), ui.available_height()).content_width;
     let references = markdown::reference_definitions(source);
     let mut layouts = Vec::new();
     let mut top = 0.0;

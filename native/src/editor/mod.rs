@@ -318,17 +318,25 @@ impl EditorSurface {
                     .then_some(self.split_scroll_ratio * self.split_preview_maximum);
                 let mut editor_scroll = PaneScroll::default();
                 let mut preview_scroll = PaneScroll::default();
+                let pane_bounds = ui.available_rect_before_wrap();
+                let mut divider_x = pane_bounds.center().x;
                 ui.columns(2, |columns| {
+                    divider_x =
+                        (columns[0].max_rect().right() + columns[1].max_rect().left()) * 0.5;
                     columns[0].push_id("source-pane", |ui| {
                         editor_scroll =
                             self.edit_pane(ui, document, &options, &mut output, editor_target);
                     });
-                    columns[1].separator();
                     columns[1].push_id("preview-pane", |ui| {
                         preview_scroll =
                             self.preview_pane(ui, document, &options, &mut output, preview_target);
                     });
                 });
+                ui.painter().vline(
+                    divider_x,
+                    pane_bounds.y_range(),
+                    Stroke::new(1.0, app_palette(options.dark).border),
+                );
                 self.split_editor_maximum = editor_scroll.maximum;
                 self.split_preview_maximum = preview_scroll.maximum;
                 if editor_scroll.hovered {

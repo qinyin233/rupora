@@ -1657,7 +1657,188 @@ impl RuporaApp {
         }
     }
 
+    fn navigation_rail(&mut self, root: &mut Ui) {
+        let palette = app_palette(self.state.dark);
+        Panel::left("workspace-rail")
+            .exact_size(64.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.sidebar)
+                    .inner_margin(Margin::symmetric(12, 14)),
+            )
+            .show(root, |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                let (brand, _) = ui.allocate_exact_size(Vec2::splat(40.0), egui::Sense::hover());
+                ui.painter().text(
+                    brand.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "R",
+                    egui::FontId::proportional(27.0),
+                    palette.text,
+                );
+                ui.add_space(18.0);
+                let rail_button = |ui: &mut Ui, icon, selected, tooltip: &str| {
+                    ui.add(AppIconButton {
+                        icon,
+                        selected,
+                        palette,
+                        size: 40.0,
+                    })
+                    .on_hover_text(tooltip)
+                };
+                if rail_button(
+                    ui,
+                    AppIcon::Sidebar,
+                    self.state.show_sidebar,
+                    "文稿架：显示 / 隐藏文稿与文件夹",
+                )
+                .clicked()
+                {
+                    self.state.show_sidebar = !self.state.show_sidebar;
+                }
+                if rail_button(ui, AppIcon::Search, self.find_open, "查找文稿内容 · Ctrl+F")
+                    .clicked()
+                {
+                    self.find_open = !self.find_open;
+                    self.find_focus_requested = self.find_open;
+                }
+                ui.add_space(8.0);
+                if rail_button(ui, AppIcon::New, false, "新建文稿 · Ctrl+N").clicked() {
+                    self.execute(AppCommand::New);
+                }
+                if rail_button(ui, AppIcon::Folder, false, "打开 Markdown 文件 · Ctrl+O").clicked()
+                {
+                    self.execute(AppCommand::Open);
+                }
+                ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+                    if rail_button(ui, AppIcon::Theme, false, "切换浅色 / 深色外观").clicked()
+                    {
+                        self.state.dark = !self.state.dark;
+                        apply_theme(ui.ctx(), self.state.dark);
+                    }
+                });
+            });
+    }
+
     fn top_bar(&mut self, root: &mut Ui) {
+        let palette = app_palette(self.state.dark);
+        let document = self
+            .session
+            .active_index()
+            .map(|index| &self.session[index]);
+        let title = document
+            .map(Document::title)
+            .unwrap_or_else(|| "RUPORA".to_owned());
+        let identity = document
+            .map(|document| {
+                if document.dirty {
+                    "有未保存的修改".to_owned()
+                } else if let Some(path) = document.path.as_deref() {
+                    path.parent()
+                        .map(|parent| parent.display().to_string())
+                        .unwrap_or_else(|| "已保存".to_owned())
+                } else {
+                    "开始新的文稿".to_owned()
+                }
+            })
+            .unwrap_or_else(|| "你的写作空间".to_owned());
+        let document_exists = document.is_some();
+        Panel::top("toolbar")
+            .exact_size(76.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.surface)
+                    .inner_margin(Margin::symmetric(24, 14)),
+            )
+            .show(root, |ui| {
+                let labelled_modes = ui.available_width() >= 720.0;
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.more_menu(ui);
+                    if ui
+                        .add_enabled(
+                            document_exists,
+                            icon_button_widget(AppIcon::Save, false, palette),
+                        )
+                        .on_hover_text("保存当前文稿 · Ctrl+S")
+                        .clicked()
+                    {
+                        self.execute(AppCommand::Save);
+                    }
+                    if app_icon_button(
+                        ui,
+                        AppIcon::Outline,
+                        self.state.show_outline,
+                        "显示 / 隐藏文稿大纲",
+                        palette,
+                    )
+                    .clicked()
+                    {
+                        self.state.show_outline = !self.state.show_outline;
+                    }
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(palette.canvas)
+                        .corner_radius(8)
+                        .inner_margin(3)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                for (mode, icon, label) in [
+                                    (ViewMode::Preview, AppIcon::Read, "阅读"),
+                                    (ViewMode::Split, AppIcon::Split, "分栏"),
+                                    (ViewMode::Edit, AppIcon::Source, "源码"),
+                                    (ViewMode::Hybrid, AppIcon::Write, "写作"),
+                                ] {
+                                    let selected = self.state.view_mode == mode;
+                                    let response = if labelled_modes {
+                                        app_action_button(ui, icon, label, selected, palette, 76.0)
+                                    } else {
+                                        app_icon_button(ui, icon, selected, label, palette)
+                                    };
+                                    if response
+                                        .on_hover_text(format!("切换到{label}视图"))
+                                        .clicked()
+                                    {
+                                        self.execute(AppCommand::SetView(mode));
+                                    }
+                                }
+                            });
+                        });
+                    ui.add_space(12.0);
+                    let identity_width = ui.available_width().max(32.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(identity_width, 46.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_min_size(Vec2::new(identity_width, 46.0));
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&title)
+                                        .size(17.0)
+                                        .strong()
+                                        .color(palette.text),
+                                )
+                                .halign(Align::Min)
+                                .truncate(),
+                            )
+                            .on_hover_text(&title);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&identity).size(12.0).color(palette.secondary),
+                                )
+                                .halign(Align::Min)
+                                .truncate(),
+                            )
+                            .on_hover_text(&identity);
+                        },
+                    );
+                });
+            });
+    }
+
+    fn more_menu(&mut self, ui: &mut Ui) {
         let extension_names = self
             .background
             .extensions()
@@ -1666,247 +1847,197 @@ impl RuporaApp {
             .map(|service| service.name.clone())
             .collect::<Vec<_>>();
         let palette = app_palette(self.state.dark);
-        let toolbar_frame = egui::Frame::new()
-            .fill(palette.toolbar)
-            .inner_margin(Margin::symmetric(16, 10));
-        Panel::top("toolbar")
-            .exact_size(56.0)
-            .frame(toolbar_frame)
-            .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    if app_icon_button(
-                        ui,
-                        AppIcon::Sidebar,
-                        self.state.show_sidebar,
-                        "显示 / 隐藏文档侧栏",
-                        palette,
-                    )
+        let response = app_icon_button(ui, AppIcon::More, false, "更多操作与设置", palette);
+        egui::Popup::menu(&response).width(248.0).show(|ui| {
+            Self::compact_menu_contents(ui, "more-menu-scroll", |ui| {
+                ui.label(RichText::new("全部操作").small().color(palette.secondary));
+                ui.separator();
+                if ui.button("新建").on_hover_text("Ctrl+N").clicked() {
+                    self.execute(AppCommand::New);
+                }
+                if ui.button("打开").on_hover_text("Ctrl+O").clicked() {
+                    self.execute(AppCommand::Open);
+                }
+                if ui.button("文件夹").on_hover_text("Ctrl+Shift+O").clicked() {
+                    self.execute(AppCommand::OpenFolder);
+                }
+                if ui.button("保存").on_hover_text("Ctrl+S").clicked() {
+                    self.execute(AppCommand::Save);
+                }
+                if ui.button("另存为").on_hover_text("Ctrl+Shift+S").clicked() {
+                    self.execute(AppCommand::SaveAs);
+                }
+                let can_undo = self
+                    .session
+                    .active_index()
+                    .and_then(|index| self.session.documents().get(index))
+                    .is_some_and(Document::can_undo);
+                if ui
+                    .add_enabled(can_undo, Button::new("撤销"))
+                    .on_hover_text("Ctrl+Z")
                     .clicked()
-                    {
-                        self.state.show_sidebar = !self.state.show_sidebar;
-                    }
-                    ui.label(
-                        RichText::new("RUPORA")
-                            .size(14.0)
-                            .strong()
-                            .color(palette.text),
-                    );
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-
-                    if app_icon_button(ui, AppIcon::New, false, "新建文档 · Ctrl+N", palette)
-                        .clicked()
-                    {
-                        self.execute(AppCommand::New);
-                    }
-                    if app_icon_button(
-                        ui,
-                        AppIcon::Folder,
-                        false,
-                        "打开 Markdown · Ctrl+O",
-                        palette,
-                    )
+                {
+                    self.execute(AppCommand::Undo);
+                }
+                let can_redo = self
+                    .session
+                    .active_index()
+                    .and_then(|index| self.session.documents().get(index))
+                    .is_some_and(Document::can_redo);
+                if ui
+                    .add_enabled(can_redo, Button::new("重做"))
+                    .on_hover_text("Ctrl+Shift+Z / Ctrl+Y")
                     .clicked()
-                    {
-                        self.execute(AppCommand::Open);
-                    }
-                    if ui
-                        .add_enabled(
-                            self.session.active_index().is_some(),
-                            icon_button_widget(AppIcon::Save, false, palette),
-                        )
-                        .on_hover_text("保存当前文档 · Ctrl+S")
-                        .clicked()
-                    {
-                        self.execute(AppCommand::Save);
-                    }
-                    ui.menu_button(RichText::new("···").size(17.0), |ui| {
-                        ui.set_min_width(180.0);
-                        ui.label(RichText::new("全部操作").small().color(palette.secondary));
-                        ui.separator();
-                        if ui.button("新建").on_hover_text("Ctrl+N").clicked() {
-                            self.execute(AppCommand::New);
+                {
+                    self.execute(AppCommand::Redo);
+                }
+                ui.menu_button("导出", |ui| {
+                    Self::compact_menu_contents(ui, "export-menu-scroll", |ui| {
+                        if ui.button("HTML…").clicked() {
+                            self.execute(AppCommand::ExportHtml);
+                            ui.close();
                         }
-                        if ui.button("打开").on_hover_text("Ctrl+O").clicked() {
-                            self.execute(AppCommand::Open);
+                        if ui.button("PDF…").clicked() {
+                            self.execute(AppCommand::ExportPdf);
+                            ui.close();
                         }
-                        if ui.button("文件夹").on_hover_text("Ctrl+Shift+O").clicked() {
-                            self.execute(AppCommand::OpenFolder);
+                        if ui.button("打印…").clicked() {
+                            self.execute(AppCommand::Print);
+                            ui.close();
                         }
-                        if ui.button("保存").on_hover_text("Ctrl+S").clicked() {
-                            self.execute(AppCommand::Save);
+                    });
+                });
+                ui.menu_button("扩展", |ui| {
+                    Self::compact_menu_contents(ui, "extensions-menu-scroll", |ui| {
+                        if !self.background.extensions().is_enabled() {
+                            ui.label("扩展默认关闭");
+                        } else if extension_names.is_empty() {
+                            ui.label("没有已配置的扩展服务");
                         }
-                        if ui.button("另存为").on_hover_text("Ctrl+Shift+S").clicked() {
-                            self.execute(AppCommand::SaveAs);
-                        }
-                        let can_undo = self
-                            .session
-                            .active_index()
-                            .and_then(|index| self.session.documents().get(index))
-                            .is_some_and(Document::can_undo);
-                        if ui
-                            .add_enabled(can_undo, Button::new("撤销"))
-                            .on_hover_text("Ctrl+Z")
-                            .clicked()
-                        {
-                            self.execute(AppCommand::Undo);
-                        }
-                        let can_redo = self
-                            .session
-                            .active_index()
-                            .and_then(|index| self.session.documents().get(index))
-                            .is_some_and(Document::can_redo);
-                        if ui
-                            .add_enabled(can_redo, Button::new("重做"))
-                            .on_hover_text("Ctrl+Shift+Z / Ctrl+Y")
-                            .clicked()
-                        {
-                            self.execute(AppCommand::Redo);
-                        }
-                        ui.menu_button("导出", |ui| {
-                            if ui.button("HTML…").clicked() {
-                                self.execute(AppCommand::ExportHtml);
-                                ui.close();
-                            }
-                            if ui.button("PDF…").clicked() {
-                                self.execute(AppCommand::ExportPdf);
-                                ui.close();
-                            }
-                            if ui.button("打印…").clicked() {
-                                self.execute(AppCommand::Print);
-                                ui.close();
-                            }
-                        });
-                        ui.menu_button("扩展", |ui| {
-                            if !self.background.extensions().is_enabled() {
-                                ui.label("扩展默认关闭");
-                            } else if extension_names.is_empty() {
-                                ui.label("没有已配置的扩展服务");
-                            }
-                            for (index, name) in extension_names.iter().enumerate() {
-                                if ui
-                                    .add_enabled(
-                                        !self.background.extension_running()
-                                            && self.session.active_index().is_some(),
-                                        Button::new(name),
-                                    )
-                                    .clicked()
-                                {
-                                    self.execute(AppCommand::RunExtension(index));
-                                    ui.close();
-                                }
-                            }
-                            ui.separator();
-                            if ui.button("打开扩展配置").clicked() {
-                                self.execute(AppCommand::OpenExtensionConfig);
-                                ui.close();
-                            }
-                            if ui.button("重新加载扩展配置").clicked() {
-                                self.execute(AppCommand::ReloadExtensions);
-                                ui.close();
-                            }
-                        });
-                        ui.menu_button("帮助", |ui| {
+                        for (index, name) in extension_names.iter().enumerate() {
                             if ui
                                 .add_enabled(
-                                    !self.background.update_check_running(),
-                                    Button::new("检查更新…"),
+                                    !self.background.extension_running()
+                                        && self.session.active_index().is_some(),
+                                    Button::new(name),
                                 )
                                 .clicked()
                             {
-                                self.execute(AppCommand::CheckUpdates);
+                                self.execute(AppCommand::RunExtension(index));
                                 ui.close();
                             }
-                            if self.background.available_update().is_some()
-                                && ui.button("打开新版本发布页").clicked()
-                            {
-                                self.execute(AppCommand::OpenReleasePage);
-                                ui.close();
-                            }
-                            if ui.button("所有版本与校验信息").clicked() {
-                                self.execute(AppCommand::OpenReleasePage);
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("打开诊断日志目录").clicked() {
-                                self.execute(AppCommand::OpenDiagnostics);
-                                ui.close();
-                            }
-                            if ui.button("关于 RUPORA").clicked() {
-                                self.execute(AppCommand::About);
-                                ui.close();
-                            }
-                        });
-
+                        }
                         ui.separator();
-                        ui.menu_button("格式", |ui| {
-                            if ui.button("粗体    Ctrl+B").clicked() {
-                                self.execute(AppCommand::Format(MarkdownCommand::Bold));
+                        if ui.button("打开扩展配置").clicked() {
+                            self.execute(AppCommand::OpenExtensionConfig);
+                            ui.close();
+                        }
+                        if ui.button("重新加载扩展配置").clicked() {
+                            self.execute(AppCommand::ReloadExtensions);
+                            ui.close();
+                        }
+                    });
+                });
+                ui.menu_button("帮助", |ui| {
+                    Self::compact_menu_contents(ui, "help-menu-scroll", |ui| {
+                        if ui
+                            .add_enabled(
+                                !self.background.update_check_running(),
+                                Button::new("检查更新…"),
+                            )
+                            .clicked()
+                        {
+                            self.execute(AppCommand::CheckUpdates);
+                            ui.close();
+                        }
+                        if self.background.available_update().is_some()
+                            && ui.button("打开新版本发布页").clicked()
+                        {
+                            self.execute(AppCommand::OpenReleasePage);
+                            ui.close();
+                        }
+                        if ui.button("所有版本与校验信息").clicked() {
+                            self.execute(AppCommand::OpenReleasePage);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("打开诊断日志目录").clicked() {
+                            self.execute(AppCommand::OpenDiagnostics);
+                            ui.close();
+                        }
+                        if ui.button("关于 RUPORA").clicked() {
+                            self.execute(AppCommand::About);
+                            ui.close();
+                        }
+                    });
+                });
+
+                ui.separator();
+                ui.menu_button("格式", |ui| {
+                    Self::compact_menu_contents(ui, "format-menu-scroll", |ui| {
+                        if ui.button("粗体    Ctrl+B").clicked() {
+                            self.execute(AppCommand::Format(MarkdownCommand::Bold));
+                            ui.close();
+                        }
+                        if ui.button("斜体    Ctrl+I").clicked() {
+                            self.execute(AppCommand::Format(MarkdownCommand::Italic));
+                            ui.close();
+                        }
+                        if ui.button("删除线").clicked() {
+                            self.execute(AppCommand::Format(MarkdownCommand::Strikethrough));
+                            ui.close();
+                        }
+                        if ui.button("行内代码").clicked() {
+                            self.execute(AppCommand::Format(MarkdownCommand::InlineCode));
+                            ui.close();
+                        }
+                        if ui.button("链接    Ctrl+K").clicked() {
+                            self.execute(AppCommand::Format(MarkdownCommand::Link));
+                            ui.close();
+                        }
+                        ui.separator();
+                        for level in 1..=6 {
+                            if ui.button(format!("标题 {level}")).clicked() {
+                                self.execute(AppCommand::Format(MarkdownCommand::Heading(level)));
                                 ui.close();
                             }
-                            if ui.button("斜体    Ctrl+I").clicked() {
-                                self.execute(AppCommand::Format(MarkdownCommand::Italic));
-                                ui.close();
-                            }
-                            if ui.button("删除线").clicked() {
-                                self.execute(AppCommand::Format(MarkdownCommand::Strikethrough));
-                                ui.close();
-                            }
-                            if ui.button("行内代码").clicked() {
-                                self.execute(AppCommand::Format(MarkdownCommand::InlineCode));
-                                ui.close();
-                            }
-                            if ui.button("链接    Ctrl+K").clicked() {
-                                self.execute(AppCommand::Format(MarkdownCommand::Link));
-                                ui.close();
-                            }
-                            ui.separator();
-                            for level in 1..=6 {
-                                if ui.button(format!("标题 {level}")).clicked() {
-                                    self.execute(AppCommand::Format(MarkdownCommand::Heading(
-                                        level,
-                                    )));
-                                    ui.close();
-                                }
-                            }
-                            if ui.button("引用").clicked() {
-                                self.execute(AppCommand::Format(MarkdownCommand::Quote));
-                                ui.close();
-                            }
-                            if ui.button("无序列表").clicked() {
-                                self.execute(AppCommand::Format(MarkdownCommand::BulletList));
-                                ui.close();
-                            }
-                            if ui.button("有序列表").clicked() {
-                                self.execute(AppCommand::Format(MarkdownCommand::OrderedList));
-                                ui.close();
-                            }
-                            if ui.button("代码块").clicked() {
-                                self.execute(AppCommand::Format(MarkdownCommand::CodeBlock));
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("目录 [TOC]").clicked() {
-                                self.execute(AppCommand::InsertToc);
-                                ui.close();
-                            }
-                            if ui.button("脚注").clicked() {
-                                self.execute(AppCommand::InsertFootnote);
-                                ui.close();
-                            }
-                            if ui.button("可视化表格…").clicked() {
-                                self.execute(AppCommand::EditTable);
-                                ui.close();
-                            }
-                            let anchors = self
-                                .session
-                                .active_index()
-                                .map(|index| {
-                                    markdown::heading_anchors(&self.session[index].content)
-                                })
-                                .unwrap_or_default();
-                            ui.menu_button("交叉引用", |ui| {
+                        }
+                        if ui.button("引用").clicked() {
+                            self.execute(AppCommand::Format(MarkdownCommand::Quote));
+                            ui.close();
+                        }
+                        if ui.button("无序列表").clicked() {
+                            self.execute(AppCommand::Format(MarkdownCommand::BulletList));
+                            ui.close();
+                        }
+                        if ui.button("有序列表").clicked() {
+                            self.execute(AppCommand::Format(MarkdownCommand::OrderedList));
+                            ui.close();
+                        }
+                        if ui.button("代码块").clicked() {
+                            self.execute(AppCommand::Format(MarkdownCommand::CodeBlock));
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("目录 [TOC]").clicked() {
+                            self.execute(AppCommand::InsertToc);
+                            ui.close();
+                        }
+                        if ui.button("脚注").clicked() {
+                            self.execute(AppCommand::InsertFootnote);
+                            ui.close();
+                        }
+                        if ui.button("可视化表格…").clicked() {
+                            self.execute(AppCommand::EditTable);
+                            ui.close();
+                        }
+                        let anchors = self
+                            .session
+                            .active_index()
+                            .map(|index| markdown::heading_anchors(&self.session[index].content))
+                            .unwrap_or_default();
+                        ui.menu_button("交叉引用", |ui| {
+                            Self::compact_menu_contents(ui, "references-menu-scroll", |ui| {
                                 if anchors.is_empty() {
                                     ui.label("当前文档没有标题");
                                 }
@@ -1925,126 +2056,73 @@ impl RuporaApp {
                                 }
                             });
                         });
-                        if ui.button("查找").on_hover_text("Ctrl+F").clicked() {
-                            self.find_open = true;
-                            self.find_focus_requested = true;
-                        }
-                        if ui.button("命令").on_hover_text("Ctrl+Shift+P").clicked() {
-                            self.command_palette_open = true;
-                            self.command_focus_requested = true;
-                        }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let theme_label = if self.state.dark { "浅色" } else { "深色" };
-                            if ui.button(theme_label).clicked() {
-                                self.state.dark = !self.state.dark;
-                                apply_theme(ui.ctx(), self.state.dark);
-                            }
-                            ui.checkbox(&mut self.state.show_outline, "大纲");
-                            ui.checkbox(&mut self.state.show_sidebar, "文档");
-                        });
                     });
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if app_icon_button(
-                            ui,
-                            AppIcon::Theme,
-                            false,
-                            "切换浅色 / 深色外观",
-                            palette,
-                        )
-                        .clicked()
-                        {
+                });
+                if ui.button("查找").on_hover_text("Ctrl+F").clicked() {
+                    self.find_open = true;
+                    self.find_focus_requested = true;
+                }
+                if ui.button("命令").on_hover_text("Ctrl+Shift+P").clicked() {
+                    self.command_palette_open = true;
+                    self.command_focus_requested = true;
+                }
+                ui.separator();
+                ui.menu_button("外观与导航", |ui| {
+                    Self::compact_menu_contents(ui, "appearance-menu-scroll", |ui| {
+                        let theme_label = if self.state.dark { "浅色" } else { "深色" };
+                        if ui.button(theme_label).clicked() {
                             self.state.dark = !self.state.dark;
                             apply_theme(ui.ctx(), self.state.dark);
                         }
-                        if app_icon_button(
-                            ui,
-                            AppIcon::Outline,
-                            self.state.show_outline,
-                            "显示 / 隐藏大纲",
-                            palette,
-                        )
-                        .clicked()
-                        {
-                            self.state.show_outline = !self.state.show_outline;
-                        }
-                        ui.add_space(6.0);
-                        egui::Frame::new()
-                            .fill(palette.hover)
-                            .corner_radius(9)
-                            .inner_margin(3)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 2.0;
-                                    // The toolbar lays out from the right edge.
-                                    for (mode, label) in [
-                                        (ViewMode::Preview, "阅读"),
-                                        (ViewMode::Split, "分栏"),
-                                        (ViewMode::Edit, "源码"),
-                                        (ViewMode::Hybrid, "写作"),
-                                    ] {
-                                        let selected = self.state.view_mode == mode;
-                                        if ui
-                                            .add(
-                                                Button::new(RichText::new(label).size(13.0).color(
-                                                    if selected {
-                                                        palette.text
-                                                    } else {
-                                                        palette.secondary
-                                                    },
-                                                ))
-                                                .fill(if selected {
-                                                    palette.surface
-                                                } else {
-                                                    Color32::TRANSPARENT
-                                                })
-                                                .stroke(Stroke::NONE)
-                                                .corner_radius(7)
-                                                .min_size(Vec2::new(46.0, 27.0)),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.execute(AppCommand::SetView(mode));
-                                        }
-                                    }
-                                });
-                            });
-                        if ui.available_width() > 130.0 {
-                            ui.add_space(10.0);
-                            if ui
-                                .add_sized(
-                                    [120.0, 30.0],
-                                    Button::new(
-                                        RichText::new("搜索与命令")
-                                            .size(12.0)
-                                            .color(palette.secondary),
-                                    )
-                                    .frame(false),
-                                )
-                                .on_hover_text("搜索命令 · Ctrl+Shift+P")
-                                .clicked()
-                            {
-                                self.command_palette_open = true;
-                                self.command_focus_requested = true;
-                            }
-                        }
+                        ui.checkbox(&mut self.state.show_outline, "大纲");
+                        ui.checkbox(&mut self.state.show_sidebar, "文稿架");
                     });
                 });
             });
+        });
+    }
+
+    /// Menus keep their own width and scrolling budget instead of inheriting
+    /// the application's horizontal toolbar layout or the popup's area width.
+    fn compact_menu_contents<R>(
+        ui: &mut Ui,
+        scroll_id: &'static str,
+        contents: impl FnOnce(&mut Ui) -> R,
+    ) -> R {
+        const MENU_WIDTH: f32 = 248.0;
+        ui.set_width(MENU_WIDTH);
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        ui.spacing_mut().item_spacing = Vec2::new(8.0, 2.0);
+        ui.spacing_mut().interact_size.y = 26.0;
+        let maximum_height = (ui.ctx().content_rect().height() - 140.0).clamp(120.0, 440.0);
+        ScrollArea::vertical()
+            .id_salt(scroll_id)
+            .max_height(maximum_height)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.set_max_width(MENU_WIDTH);
+                contents(ui)
+            })
+            .inner
     }
 
     fn find_bar(&mut self, root: &mut Ui) {
         if !self.find_open {
             return;
         }
+        let palette = app_palette(self.state.dark);
         Panel::top("find-and-replace")
-            .exact_size(76.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.canvas)
+                    .inner_margin(Margin::symmetric(20, 10)),
+            )
             .show(root, |ui| {
-                ui.add_space(4.0);
+                let field_width = (ui.available_width() - 278.0).clamp(110.0, 360.0);
                 ui.horizontal(|ui| {
-                    ui.label("查找");
+                    ui.label(RichText::new("查找").size(13.0));
                     let response = ui.add_sized(
-                        [240.0, 24.0],
+                        [field_width, 30.0],
                         TextEdit::singleline(&mut self.find_query).hint_text("查找内容"),
                     );
                     if self.find_focus_requested {
@@ -2057,27 +2135,47 @@ impl RuporaApp {
                     {
                         self.find_match(!ui.input(|input| input.modifiers.shift));
                     }
-                    if ui.button("上一个").clicked() {
+                    if app_icon_button(
+                        ui,
+                        AppIcon::ArrowUp,
+                        false,
+                        "上一个匹配项 · Shift+Enter",
+                        palette,
+                    )
+                    .clicked()
+                    {
                         self.find_match(false);
                     }
-                    if ui.button("下一个").clicked() {
+                    if app_icon_button(
+                        ui,
+                        AppIcon::ArrowDown,
+                        false,
+                        "下一个匹配项 · Enter",
+                        palette,
+                    )
+                    .clicked()
+                    {
                         self.find_match(true);
                     }
                     ui.checkbox(&mut self.find_match_case, "区分大小写");
-                    if ui.button("关闭").clicked() {
+                    if app_icon_button(ui, AppIcon::Close, false, "关闭查找", palette).clicked()
+                    {
                         self.find_open = false;
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.label("替换");
+                    ui.label(RichText::new("替换").size(13.0));
                     ui.add_sized(
-                        [240.0, 24.0],
+                        [field_width, 30.0],
                         TextEdit::singleline(&mut self.replace_query).hint_text("替换为"),
                     );
-                    if ui.button("替换").clicked() {
+                    if ui.add_sized([64.0, 30.0], Button::new("替换")).clicked() {
                         self.replace_current();
                     }
-                    if ui.button("全部替换").clicked() {
+                    if ui
+                        .add_sized([88.0, 30.0], Button::new("全部替换"))
+                        .clicked()
+                    {
                         self.replace_all_matches();
                     }
                 });
@@ -2259,234 +2357,285 @@ impl RuporaApp {
     }
 
     fn sidebar(&mut self, root: &mut Ui) {
-        let palette = app_palette(self.state.dark);
         if !self.state.show_sidebar {
             return;
         }
-
+        let palette = app_palette(self.state.dark);
+        let editor_width = if self.state.view_mode == ViewMode::Split {
+            400.0
+        } else {
+            380.0
+        };
+        let outline_width = if self.state.show_outline { 160.0 } else { 0.0 };
+        let maximum_width =
+            (root.available_width() - editor_width - outline_width).clamp(180.0, 320.0);
+        let mut activate = None;
+        let mut close = None;
+        let mut open_path = None;
+        let mut refresh_workspace = false;
+        let mut close_workspace = false;
+        let mut open_folder = false;
         Panel::left("documents")
-            .default_size(224.0)
-            .size_range(190.0..=360.0)
+            .default_size(220.0)
+            .size_range(180.0..=maximum_width)
             .resizable(true)
             .frame(
                 egui::Frame::new()
-                    .fill(palette.sidebar)
-                    .inner_margin(Margin::symmetric(12, 10))
-                    .stroke(Stroke::new(1.0, palette.border)),
+                    .fill(palette.canvas)
+                    .inner_margin(Margin::symmetric(14, 22)),
             )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("资源管理器")
-                            .size(11.5)
+                        RichText::new("文稿")
+                            .size(20.0)
                             .strong()
+                            .color(palette.text),
+                    );
+                    ui.label(
+                        RichText::new(self.session.documents().len().to_string())
+                            .size(12.0)
                             .color(palette.secondary),
                     );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if app_icon_button(ui, AppIcon::New, false, "新建文档", palette).clicked()
-                        {
-                            self.new_document();
-                        }
-                    });
                 });
-                ui.separator();
-                let mut workspace_file_to_open = None;
-                let mut refresh_workspace = false;
-                let mut close_workspace = false;
-                if let Some(workspace) = self.workspace.as_ref() {
-                    ui.horizontal(|ui| {
-                        let root_name = workspace
-                            .root
-                            .file_name()
-                            .map(|name| name.to_string_lossy())
-                            .unwrap_or_else(|| workspace.root.as_os_str().to_string_lossy());
-                        ui.strong(root_name);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("×").on_hover_text("关闭工作区").clicked() {
-                                close_workspace = true;
+                ui.add_space(18.0);
+                if app_action_button(
+                    ui,
+                    AppIcon::Write,
+                    "新建文稿",
+                    true,
+                    palette,
+                    ui.available_width(),
+                )
+                .on_hover_text("Ctrl+N")
+                .clicked()
+                {
+                    self.new_document();
+                }
+                ui.add_space(20.0);
+                ScrollArea::vertical()
+                    .id_salt("document-shelf")
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("打开的文稿")
+                                .size(12.0)
+                                .color(palette.secondary),
+                        );
+                        ui.add_space(8.0);
+                        for (index, document) in self.session.documents().iter().enumerate() {
+                            let selected = self.session.active_index() == Some(index);
+                            let row = egui::Frame::new()
+                                .fill(if selected {
+                                    palette.surface
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .corner_radius(6)
+                                .inner_margin(Margin::symmetric(6, 5))
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 5.0;
+                                    ui.horizontal(|ui| {
+                                        let (marker, _) = ui.allocate_exact_size(
+                                            Vec2::new(18.0, 28.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        if document.dirty {
+                                            ui.painter().circle_filled(
+                                                marker.center(),
+                                                3.0,
+                                                palette.accent,
+                                            );
+                                        } else {
+                                            paint_app_icon(
+                                                ui.painter(),
+                                                egui::Rect::from_center_size(
+                                                    marker.center(),
+                                                    Vec2::splat(16.0),
+                                                ),
+                                                AppIcon::File,
+                                                if selected {
+                                                    palette.accent
+                                                } else {
+                                                    palette.secondary
+                                                },
+                                            );
+                                        }
+                                        let title = document.title();
+                                        let title_width = (ui.available_width() - 29.0).max(24.0);
+                                        let response = ui
+                                            .add_sized(
+                                                [title_width, 28.0],
+                                                Button::new("")
+                                                    .left_text(
+                                                        RichText::new(&title)
+                                                            .size(13.0)
+                                                            .color(palette.text),
+                                                    )
+                                                    .frame(false)
+                                                    .truncate(),
+                                            )
+                                            .on_hover_text(format!(
+                                                "{}\n{}",
+                                                title,
+                                                document
+                                                    .path
+                                                    .as_deref()
+                                                    .map(Path::display)
+                                                    .map(|display| display.to_string())
+                                                    .unwrap_or_else(|| "尚未保存".to_owned())
+                                            ));
+                                        response.widget_info(|| {
+                                            egui::WidgetInfo::selected(
+                                                egui::WidgetType::Button,
+                                                ui.is_enabled(),
+                                                selected,
+                                                &title,
+                                            )
+                                        });
+                                        if response.clicked() {
+                                            activate = Some(index);
+                                        }
+                                        if ui
+                                            .add(AppIconButton {
+                                                icon: AppIcon::Close,
+                                                selected: false,
+                                                palette,
+                                                size: 24.0,
+                                            })
+                                            .on_hover_text(format!("关闭 {title}"))
+                                            .clicked()
+                                        {
+                                            close = Some(index);
+                                        }
+                                    });
+                                });
+                            if selected {
+                                let rect = row.response.rect;
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_center_size(
+                                        egui::pos2(rect.left(), rect.center().y),
+                                        Vec2::new(2.0, 18.0),
+                                    ),
+                                    1.0,
+                                    palette.accent,
+                                );
                             }
-                            if ui.small_button("↻").on_hover_text("刷新工作区").clicked() {
-                                refresh_workspace = true;
-                            }
-                        });
-                    });
-                    let active_path = self
-                        .session
-                        .active_index()
-                        .and_then(|index| self.session.documents().get(index))
-                        .and_then(|document| document.path.as_deref());
-                    ScrollArea::vertical()
-                        .id_salt("workspace-tree")
-                        .max_height(260.0)
-                        .show(ui, |ui| {
-                            workspace_file_to_open =
-                                workspace_entries_ui(ui, &workspace.entries, active_path);
-                        });
-                    ui.separator();
-                }
-
-                if close_workspace {
-                    self.workspace = None;
-                    self.state.workspace_root = None;
-                    self.status = "已关闭工作区".to_owned();
-                } else if refresh_workspace && let Some(workspace) = self.workspace.as_mut() {
-                    match workspace.refresh() {
-                        Ok(()) => self.status = "工作区已刷新".to_owned(),
-                        Err(error) => self.status = error,
-                    }
-                }
-                if let Some(path) = workspace_file_to_open {
-                    self.open_paths([path]);
-                }
-
-                if self.workspace.is_none() {
-                    ui.add_space(8.0);
-                    egui::Frame::new()
-                        .fill(palette.surface)
-                        .stroke(Stroke::new(1.0, palette.border))
-                        .corner_radius(8)
-                        .inner_margin(Margin::symmetric(12, 10))
-                        .show(ui, |ui| {
+                            ui.add_space(2.0);
+                        }
+                        ui.add_space(22.0);
+                        ui.label(RichText::new("文件夹").size(12.0).color(palette.secondary));
+                        ui.add_space(8.0);
+                        if let Some(workspace) = self.workspace.as_ref() {
+                            ui.horizontal(|ui| {
+                                let root_name = workspace
+                                    .root
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy())
+                                    .unwrap_or_else(|| {
+                                        workspace.root.as_os_str().to_string_lossy()
+                                    });
+                                ui.add_sized(
+                                    [(ui.available_width() - 61.0).max(24.0), 28.0],
+                                    egui::Label::new(RichText::new(root_name).strong().size(13.0))
+                                        .halign(Align::Min)
+                                        .truncate(),
+                                )
+                                .on_hover_text(workspace.root.display().to_string());
+                                if ui
+                                    .add(AppIconButton {
+                                        icon: AppIcon::Refresh,
+                                        selected: false,
+                                        palette,
+                                        size: 24.0,
+                                    })
+                                    .on_hover_text("刷新工作区")
+                                    .clicked()
+                                {
+                                    refresh_workspace = true;
+                                }
+                                if ui
+                                    .add(AppIconButton {
+                                        icon: AppIcon::Close,
+                                        selected: false,
+                                        palette,
+                                        size: 24.0,
+                                    })
+                                    .on_hover_text("关闭工作区")
+                                    .clicked()
+                                {
+                                    close_workspace = true;
+                                }
+                            });
+                            let active_path = self
+                                .session
+                                .active_index()
+                                .and_then(|index| self.session[index].path.as_deref());
+                            open_path = workspace_entries_ui(ui, &workspace.entries, active_path);
+                        } else if app_action_button(
+                            ui,
+                            AppIcon::Folder,
+                            "打开文件夹",
+                            false,
+                            palette,
+                            ui.available_width(),
+                        )
+                        .on_hover_text("Ctrl+Shift+O")
+                        .clicked()
+                        {
+                            open_folder = true;
+                        }
+                        if !self.state.recent_files.is_empty() {
+                            ui.add_space(22.0);
                             ui.label(
-                                RichText::new("尚未打开工作区")
-                                    .size(12.5)
-                                    .strong()
-                                    .color(palette.text),
-                            );
-                            ui.label(
-                                RichText::new("打开文件夹，快速浏览和管理 Markdown 文稿。")
-                                    .small()
+                                RichText::new("最近打开")
+                                    .size(12.0)
                                     .color(palette.secondary),
                             );
-                            ui.add_space(7.0);
-                            if ui
-                                .add(
-                                    Button::new("打开文件夹")
-                                        .fill(palette.accent_soft)
-                                        .stroke(Stroke::NONE)
-                                        .corner_radius(6),
-                                )
-                                .clicked()
-                            {
-                                self.execute(AppCommand::OpenFolder);
-                            }
-                        });
-                    ui.add_space(10.0);
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("打开的编辑器")
-                            .size(11.5)
-                            .strong()
-                            .color(palette.secondary),
-                    );
-                });
-                ui.add_space(3.0);
-
-                let mut activate = None;
-                let mut close = None;
-                ScrollArea::vertical().show(ui, |ui| {
-                    for (index, document) in self.session.documents().iter().enumerate() {
-                        let selected = self.session.active_index() == Some(index);
-                        egui::Frame::new()
-                            .fill(if selected {
-                                palette.accent_soft
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .corner_radius(6)
-                            .inner_margin(Margin::symmetric(5, 2))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    let (icon_rect, _) = ui.allocate_exact_size(
-                                        Vec2::splat(16.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    paint_app_icon(
-                                        ui.painter(),
-                                        icon_rect.shrink(2.0),
-                                        AppIcon::File,
-                                        if selected {
-                                            palette.accent
-                                        } else {
-                                            palette.secondary
-                                        },
-                                    );
-                                    let title = if document.dirty {
-                                        format!("{}  •", document.title())
-                                    } else {
-                                        document.title()
-                                    };
-                                    let title_width = (ui.available_width() - 26.0).max(40.0);
-                                    let response = ui
-                                        .add_sized(
-                                            [title_width, 25.0],
-                                            Button::new(RichText::new(title).color(if selected {
-                                                palette.text
-                                            } else {
-                                                palette.secondary
-                                            }))
-                                            .frame(false)
-                                            .truncate(),
-                                        )
-                                        .on_hover_text(
-                                            document
-                                                .path
-                                                .as_deref()
-                                                .map(Path::display)
-                                                .map(|display| display.to_string())
-                                                .unwrap_or_else(|| "尚未保存".to_owned()),
-                                        );
-                                    if response.clicked() {
-                                        activate = Some(index);
-                                    }
-                                    if ui
-                                        .add(AppIconButton {
-                                            icon: AppIcon::Close,
-                                            selected: false,
-                                            palette,
-                                            size: 22.0,
-                                        })
-                                        .on_hover_text("关闭")
-                                        .clicked()
-                                    {
-                                        close = Some(index);
-                                    }
-                                });
-                            });
-                    }
-                });
-
-                if let Some(index) = activate {
-                    self.activate_document(index);
-                }
-                if let Some(index) = close {
-                    self.close_document(index);
-                }
-
-                if !self.state.recent_files.is_empty() {
-                    ui.separator();
-                    ui.label(RichText::new("最近文件").weak());
-                    let mut open_recent = None;
-                    for path in self.state.recent_files.iter().take(6) {
-                        if ui
-                            .small_button(
-                                path.file_name()
+                            ui.add_space(8.0);
+                            for path in self.state.recent_files.iter().take(6) {
+                                let name = path
+                                    .file_name()
                                     .map(|name| name.to_string_lossy())
-                                    .unwrap_or_else(|| path.as_os_str().to_string_lossy()),
-                            )
-                            .on_hover_text(path.display().to_string())
-                            .clicked()
-                        {
-                            open_recent = Some(path.clone());
+                                    .unwrap_or_else(|| path.as_os_str().to_string_lossy());
+                                if app_action_button(
+                                    ui,
+                                    AppIcon::File,
+                                    &name,
+                                    false,
+                                    palette,
+                                    ui.available_width(),
+                                )
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                                {
+                                    open_path = Some(path.clone());
+                                }
+                            }
                         }
-                    }
-                    if let Some(path) = open_recent {
-                        self.open_paths([path]);
-                    }
-                }
+                    });
             });
+        if let Some(index) = activate {
+            self.activate_document(index);
+        }
+        if let Some(index) = close {
+            self.close_document(index);
+        }
+        if close_workspace {
+            self.workspace = None;
+            self.state.workspace_root = None;
+            self.status = "已关闭工作区".to_owned();
+        } else if refresh_workspace && let Some(workspace) = self.workspace.as_mut() {
+            self.status = match workspace.refresh() {
+                Ok(()) => "工作区已刷新".to_owned(),
+                Err(error) => error,
+            };
+        }
+        if open_folder {
+            self.execute(AppCommand::OpenFolder);
+        }
+        if let Some(path) = open_path {
+            self.open_paths([path]);
+        }
     }
 
     fn outline(&mut self, root: &mut Ui) {
@@ -2502,27 +2651,39 @@ impl RuporaApp {
 
         let mut jump_to_line = None;
         let palette = app_palette(self.state.dark);
+        let editor_width = if self.state.view_mode == ViewMode::Split {
+            380.0
+        } else {
+            340.0
+        };
+        let maximum_width = (root.available_width() - editor_width).clamp(160.0, 300.0);
         Panel::right("outline")
-            .default_size(220.0)
-            .size_range(180.0..=340.0)
+            .default_size(200.0)
+            .size_range(160.0..=maximum_width)
             .resizable(true)
             .frame(
                 egui::Frame::new()
-                    .fill(palette.sidebar)
-                    .inner_margin(Margin::symmetric(12, 10))
-                    .stroke(Stroke::new(1.0, palette.border)),
+                    .fill(palette.surface)
+                    .inner_margin(Margin::symmetric(16, 18))
+                    .stroke(Stroke::new(0.5, palette.border)),
             )
             .show(root, |ui| {
                 ui.label(
                     RichText::new("大纲")
-                        .size(11.5)
+                        .size(13.0)
                         .strong()
-                        .color(palette.secondary),
+                        .color(palette.text),
                 );
                 ui.add_space(4.0);
-                ui.separator();
+                ui.add_space(12.0);
                 if headings.is_empty() {
-                    ui.label(RichText::new("暂无标题").weak());
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("文档结构将在这里显示").color(palette.secondary));
+                    ui.label(
+                        RichText::new("在正文中添加标题，即可快速跳转。")
+                            .small()
+                            .color(palette.secondary),
+                    );
                 } else {
                     ScrollArea::vertical().show(ui, |ui| {
                         for heading in headings {
@@ -2539,7 +2700,7 @@ impl RuporaApp {
     }
 
     fn editor_tabs(&mut self, root: &mut Ui) {
-        if self.session.documents().is_empty() {
+        if self.session.documents().len() <= 1 {
             return;
         }
         let tabs = self
@@ -2552,11 +2713,11 @@ impl RuporaApp {
         let mut activate = None;
         let mut close = None;
         Panel::top("editor-tabs")
-            .exact_size(46.0)
+            .exact_size(44.0)
             .frame(
                 egui::Frame::new()
-                    .fill(palette.toolbar)
-                    .inner_margin(Margin::symmetric(16, 5)),
+                    .fill(palette.surface)
+                    .inner_margin(Margin::symmetric(14, 3)),
             )
             .show(root, |ui| {
                 let reveal_key = ui.id().with("visible-active-tab");
@@ -2566,6 +2727,7 @@ impl RuporaApp {
                     data.insert_temp(reveal_key, active_layout);
                     previous != Some(active_layout)
                 });
+                let tab_width = (ui.available_width() * 0.3).clamp(160.0, 240.0);
                 ScrollArea::horizontal()
                     .id_salt("editor-tabs-scroll")
                     .show(ui, |ui| {
@@ -2573,54 +2735,14 @@ impl RuporaApp {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             for (index, (title, dirty)) in tabs.iter().enumerate() {
                                 let selected = self.session.active_index() == Some(index);
-                                let tab = egui::Frame::new()
-                                    .fill(if selected {
-                                        palette.surface
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    })
-                                    .corner_radius(8)
-                                    .inner_margin(Margin::symmetric(10, 2))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            let label = if *dirty {
-                                                format!("{title}  •")
-                                            } else {
-                                                title.clone()
-                                            };
-                                            if ui
-                                                .add(
-                                                    Button::new(
-                                                        RichText::new(label).size(13.0).color(
-                                                            if selected {
-                                                                palette.text
-                                                            } else {
-                                                                palette.secondary
-                                                            },
-                                                        ),
-                                                    )
-                                                    .frame(false)
-                                                    .truncate()
-                                                    .min_size(Vec2::new(112.0, 26.0)),
-                                                )
-                                                .clicked()
-                                            {
-                                                activate = Some(index);
-                                            }
-                                            if ui
-                                                .add(AppIconButton {
-                                                    icon: AppIcon::Close,
-                                                    selected: false,
-                                                    palette,
-                                                    size: 21.0,
-                                                })
-                                                .on_hover_text("关闭编辑器")
-                                                .clicked()
-                                            {
-                                                close = Some(index);
-                                            }
-                                        });
-                                    });
+                                let tab =
+                                    document_tab(ui, title, *dirty, selected, palette, tab_width);
+                                if tab.activate {
+                                    activate = Some(index);
+                                }
+                                if tab.close {
+                                    close = Some(index);
+                                }
                                 if selected && reveal_active {
                                     tab.response.scroll_to_me(Some(Align::Center));
                                 }
@@ -2630,7 +2752,7 @@ impl RuporaApp {
                                 ui,
                                 AppIcon::New,
                                 false,
-                                "新建编辑器 · Ctrl+N",
+                                "新建文稿 · Ctrl+N",
                                 palette,
                             )
                             .clicked()
@@ -2651,55 +2773,64 @@ impl RuporaApp {
     fn editor(&mut self, root: &mut Ui) {
         let palette = app_palette(self.state.dark);
         CentralPanel::default()
-            .frame(egui::Frame::new().fill(palette.canvas))
+            .frame(egui::Frame::new().fill(palette.surface))
             .show(root, |ui| {
                 let Some(index) = self.session.active_index() else {
-                    ui.centered_and_justified(|ui| {
-                        egui::Frame::new()
-                            .fill(palette.canvas)
-                            .stroke(Stroke::NONE)
-                            .corner_radius(2)
-                            .inner_margin(Margin::symmetric(48, 40))
-                            .show(ui, |ui| {
-                                ui.vertical_centered(|ui| {
-                                    ui.label(RichText::new("R").size(42.0).color(palette.accent));
-                                    ui.add_space(8.0);
-                                    ui.label(RichText::new("开始书写").size(24.0).strong());
-                                    ui.label(
-                                        RichText::new("创建新文稿，或继续编辑已有 Markdown 文件")
-                                            .color(palette.secondary),
-                                    );
-                                    ui.add_space(18.0);
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .add(
-                                                Button::new(
-                                                    RichText::new("新建文稿").color(Color32::WHITE),
-                                                )
-                                                .fill(palette.accent)
-                                                .stroke(Stroke::NONE),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.execute(AppCommand::New);
-                                        }
-                                        if ui
-                                            .add(
-                                                Button::new("打开文件")
-                                                    .fill(palette.canvas)
-                                                    .stroke(Stroke::new(1.0, palette.border)),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.execute(AppCommand::Open);
-                                        }
-                                    });
-                                });
-                            });
+                    let gutter = (ui.available_width() * 0.12).clamp(24.0, 96.0);
+                    ui.add_space((ui.available_height() * 0.18).min(100.0));
+                    ui.horizontal(|ui| {
+                        ui.add_space(gutter);
+                        ui.vertical(|ui| {
+                            ui.set_max_width((ui.available_width() - gutter).max(100.0));
+                            ui.label(
+                                RichText::new("留一页给想法")
+                                    .size(30.0)
+                                    .strong()
+                                    .color(palette.text),
+                            );
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new("从一段文字开始，或打开已有的文稿。")
+                                    .size(15.0)
+                                    .color(palette.secondary),
+                            );
+                            ui.add_space(28.0);
+                            if app_action_button(
+                                ui,
+                                AppIcon::Write,
+                                "新建文稿",
+                                true,
+                                palette,
+                                180.0,
+                            )
+                            .on_hover_text("Ctrl+N")
+                            .clicked()
+                            {
+                                self.execute(AppCommand::New);
+                            }
+                            if app_action_button(
+                                ui,
+                                AppIcon::Folder,
+                                "打开 Markdown 文件",
+                                false,
+                                palette,
+                                220.0,
+                            )
+                            .on_hover_text("Ctrl+O")
+                            .clicked()
+                            {
+                                self.execute(AppCommand::Open);
+                            }
+                            ui.add_space(24.0);
+                            ui.label(
+                                RichText::new("Ctrl+N 新建   Ctrl+O 打开   Ctrl+Shift+P 命令")
+                                    .size(12.0)
+                                    .color(palette.secondary),
+                            );
+                        });
                     });
                     return;
                 };
-
                 self.show_editor_pane(ui, index, self.state.view_mode);
             });
     }
@@ -2863,36 +2994,57 @@ impl RuporaApp {
             .exact_size(30.0)
             .frame(
                 egui::Frame::new()
-                    .fill(palette.canvas)
-                    .inner_margin(Margin::symmetric(18, 4)),
+                    .fill(palette.surface)
+                    .inner_margin(Margin::symmetric(24, 2)),
             )
             .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&self.status).small().color(palette.secondary));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(AppIconButton {
-                                icon: AppIcon::Source,
-                                selected: source_mode,
-                                palette,
-                                size: 22.0,
-                            })
-                            .on_hover_text(if source_mode {
-                                "返回所见即所得模式"
-                            } else {
-                                "切换到 Markdown 源码模式"
-                            })
-                            .clicked()
-                        {
-                            toggle_source_mode = true;
-                        }
-                        ui.separator();
-                        ui.label(
-                            RichText::new(document_info)
-                                .small()
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(AppIconButton {
+                            icon: AppIcon::Source,
+                            selected: source_mode,
+                            palette,
+                            size: 24.0,
+                        })
+                        .on_hover_text(if source_mode {
+                            "返回所见即所得模式"
+                        } else {
+                            "切换到 Markdown 源码模式"
+                        })
+                        .clicked()
+                    {
+                        toggle_source_mode = true;
+                    }
+                    ui.separator();
+                    let info_width = (ui.available_width() * 0.48).min(360.0);
+                    ui.add_sized(
+                        [info_width, 24.0],
+                        egui::Label::new(
+                            RichText::new(&document_info)
+                                .size(12.0)
                                 .color(palette.secondary),
-                        );
-                    });
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&document_info);
+                    let status_width = ui.available_width().max(0.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(status_width, 24.0),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.set_min_width(status_width);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&self.status)
+                                        .size(12.0)
+                                        .color(palette.secondary),
+                                )
+                                .halign(Align::Min)
+                                .truncate(),
+                            )
+                            .on_hover_text(&self.status);
+                        },
+                    );
                 });
             });
         if toggle_source_mode {
@@ -2959,6 +3111,8 @@ impl eframe::App for RuporaApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
+        self.navigation_rail(ui);
+        self.sidebar(ui);
         self.top_bar(ui);
         self.find_bar(ui);
         self.command_palette(ui);
@@ -2968,7 +3122,6 @@ impl eframe::App for RuporaApp {
         self.table_editor_window(ui);
         self.external_change_bar(ui);
         self.status_bar(ui);
-        self.sidebar(ui);
         self.outline(ui);
         self.editor_tabs(ui);
         self.editor(ui);
@@ -3116,17 +3269,49 @@ fn workspace_entries_ui(
     let mut selected = None;
     for entry in entries {
         if entry.is_dir {
-            let response = egui::CollapsingHeader::new(&entry.name)
+            let mut job = egui::text::LayoutJob::simple_singleline(
+                entry.name.clone(),
+                egui::FontId::proportional(13.0),
+                ui.visuals().text_color(),
+            );
+            job.wrap.max_width =
+                (ui.available_width() - ui.spacing().indent - 2.0 * ui.spacing().button_padding.x)
+                    .max(1.0);
+            job.wrap.max_rows = 1;
+            let label = ui.fonts_mut(|fonts| fonts.layout_job(job));
+            let response = egui::CollapsingHeader::new(label)
                 .id_salt(&entry.path)
                 .default_open(false)
+                .icon(|ui, openness, response| {
+                    paint_app_icon(
+                        ui.painter(),
+                        response.rect.shrink(1.0),
+                        if openness > 0.5 {
+                            AppIcon::ChevronDown
+                        } else {
+                            AppIcon::ChevronRight
+                        },
+                        ui.visuals().weak_text_color(),
+                    );
+                })
                 .show(ui, |ui| {
                     workspace_entries_ui(ui, &entry.children, active_path)
                 });
+            response
+                .header_response
+                .on_hover_text(entry.path.display().to_string());
             if let Some(path) = response.body_returned.flatten() {
                 selected = Some(path);
             }
         } else if ui
-            .selectable_label(active_path == Some(entry.path.as_path()), &entry.name)
+            .add_sized(
+                [ui.available_width(), 28.0],
+                Button::new("")
+                    .left_text(&entry.name)
+                    .selected(active_path == Some(entry.path.as_path()))
+                    .frame(false)
+                    .truncate(),
+            )
             .on_hover_text(entry.path.display().to_string())
             .clicked()
         {

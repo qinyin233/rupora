@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://github.com/qinyin233/rupora/actions/workflows/native-ci.yml"><img src="https://github.com/qinyin233/rupora/actions/workflows/native-ci.yml/badge.svg" alt="Native Rust CI"></a>
-  <a href="https://github.com/qinyin233/rupora/releases"><img src="https://img.shields.io/badge/version-2.0.0--alpha.1-f59e0b" alt="Version 2.0.0-alpha.1"></a>
+  <a href="https://github.com/qinyin233/rupora/releases"><img src="https://img.shields.io/badge/version-2.0.0--alpha.2-f59e0b" alt="Version 2.0.0-alpha.2"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.92%2B-000000?logo=rust" alt="Rust 1.92 or newer"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2563eb" alt="MIT license"></a>
 </p>
@@ -26,8 +26,8 @@
 </p>
 
 > [!IMPORTANT]
-> RUPORA 2 当前处于 `2.0.0-alpha.1` 阶段。`main` 已经是完整的原生 Rust 重写，但尚未发布
-> 2.x 稳定安装包；现阶段建议从源码运行，并保留重要文档的独立备份。
+> RUPORA 2 当前处于 `2.0.0-alpha.2` 阶段。可从 [Releases](https://github.com/qinyin233/rupora/releases)
+> 下载 Windows、macOS 和 Linux 预发布安装包；使用前请保留重要文档的独立备份。
 
 ## 为什么选择 RUPORA
 

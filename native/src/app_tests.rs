@@ -45,6 +45,156 @@ fn code_and_following_paragraph_rects(
 use super::*;
 
 #[test]
+fn document_canvases_keep_text_inside_narrow_panes_without_changing_source() {
+    fn check(shape: &egui::Shape, clip: egui::Rect, mode: ViewMode, width: f32) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                assert!(
+                    bounds.left() >= clip.left() - 1.0 && bounds.right() <= clip.right() + 1.0,
+                    "{mode:?} width={width}: {:?} outside {clip:?}: {:?}",
+                    bounds,
+                    text.galley.job.text
+                );
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    check(shape, clip, mode, width);
+                }
+            }
+            _ => {}
+        }
+    }
+    let source = "# 安静地写作\n\n中文 English 🙂 and a long paragraph which wraps across the available page width.\n\n```rust\nprintln!(\"中文代码 🙂\");\n```\n\nAFTER CODE";
+    let context = Context::default();
+    install_fonts(&context);
+    apply_theme(&context, false);
+    for mode in [ViewMode::Edit, ViewMode::Preview, ViewMode::Hybrid] {
+        for width in [180.0, 340.0, 600.0] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = isolated_app(directory.path());
+            app.new_document();
+            app.session[0].content = source.to_owned();
+            app.session[0].update_after_edit();
+            let output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 560.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.show_editor_pane(ui, 0, mode),
+            );
+            for shape in output.shapes {
+                check(&shape.shape, shape.clip_rect, mode, width);
+            }
+            assert_eq!(app.session[0].content, source);
+        }
+    }
+}
+
+#[test]
+fn split_document_surfaces_start_at_the_same_height() {
+    fn collect(shape: &egui::Shape, tops: &mut [f32; 2]) {
+        match shape {
+            egui::Shape::Rect(rect) if rect.fill == app_palette(false).surface => {
+                let column = usize::from(rect.rect.center().x > 450.0);
+                tops[column] = tops[column].min(rect.rect.top());
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect(shape, tops);
+                }
+            }
+            _ => {}
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = isolated_app(directory.path());
+    app.new_document();
+    app.session[0].content = "# Heading\n\nText".to_owned();
+    app.session[0].update_after_edit();
+    let context = Context::default();
+    install_fonts(&context);
+    let output = context.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 640.0),
+            )),
+            ..Default::default()
+        },
+        |ui| app.show_editor_pane(ui, 0, ViewMode::Split),
+    );
+    let mut tops = [f32::INFINITY; 2];
+    for shape in output.shapes {
+        collect(&shape.shape, &mut tops);
+    }
+    assert!(
+        tops[0].is_finite() && tops[1].is_finite(),
+        "both page surfaces must be painted"
+    );
+    assert!(
+        (tops[0] - tops[1]).abs() <= 1.0,
+        "split page tops differ: {tops:?}"
+    );
+}
+
+#[test]
+fn workspace_identity_and_status_stay_left_aligned_at_different_widths() {
+    fn collect(shape: &egui::Shape, positions: &mut Vec<(String, f32)>) {
+        match shape {
+            egui::Shape::Text(text) => positions.push((text.galley.job.text.clone(), text.pos.x)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect(shape, positions);
+                }
+            }
+            _ => {}
+        }
+    }
+    for width in [820.0, 1440.0] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.status = "已保存".to_owned();
+        let title = app.session[0].title();
+        let context = Context::default();
+        install_fonts(&context);
+        apply_theme(&context, false);
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 560.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                app.top_bar(ui);
+                app.status_bar(ui);
+            },
+        );
+        let mut positions = Vec::new();
+        for shape in output.shapes {
+            collect(&shape.shape, &mut positions);
+        }
+        for label in [&title, "开始新的文稿", "已保存"] {
+            let x = positions
+                .iter()
+                .find(|(text, _)| text == label)
+                .expect("shell label must be visible")
+                .1;
+            assert!(
+                (x - 24.0).abs() <= 1.0,
+                "width={width}: {label:?} starts at {x}, expected the left inset"
+            );
+        }
+    }
+}
+
+#[test]
 fn full_audit_closing_a_saved_document_removes_its_old_recovery_entry() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = isolated_app(directory.path());

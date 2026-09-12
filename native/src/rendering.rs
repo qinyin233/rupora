@@ -15,7 +15,7 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Button, FontFamily, FontId, Margin, RichText, Stroke, Ui, Vec2,
+    self, FontFamily, FontId, Margin, RichText, Stroke, Ui, Vec2,
     text::{CCursor, CCursorRange, LayoutJob},
 };
 
@@ -28,8 +28,9 @@ use crate::{
         standalone_mermaid,
     },
     presentation::{
-        AppPalette, WYSIWYG_BODY_LINE_HEIGHT, WYSIWYG_INLINE_CODE_VERTICAL_PADDING, app_palette,
-        code_block_frame, show_code_header, visual_text_format,
+        AppIcon, AppIconButton, AppPalette, WYSIWYG_BODY_LINE_HEIGHT,
+        WYSIWYG_INLINE_CODE_VERTICAL_PADDING, app_palette, code_block_frame, show_code_header,
+        visual_text_format,
     },
     table,
     wysiwyg::{VisualProjection, fenced_code_language},
@@ -517,25 +518,36 @@ pub(crate) fn show_code_copy_button(
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
 
-    let size = Vec2::new(if recently_copied { 76.0 } else { 54.0 }, 25.0);
+    let size = Vec2::splat(28.0);
     let rect = egui::Rect::from_min_size(
         egui::pos2(code_rect.right() - size.x - 8.0, code_rect.top() + 8.0),
         size,
     );
     let label = if recently_copied {
-        "✓ 已复制"
+        "已复制代码"
     } else {
-        "复制"
+        "复制代码"
     };
     // This is an overlay on an already allocated block. Advancing the parent
     // cursor here would place the next paragraph below the button, inside code.
-    let response = ui.place(
-        rect,
-        Button::new(RichText::new(label).size(11.0).color(palette.text))
-            .fill(palette.surface.gamma_multiply(0.94))
-            .stroke(Stroke::new(1.0, palette.border))
-            .corner_radius(5),
-    );
+    let response = ui
+        .place(
+            rect,
+            AppIconButton {
+                icon: if recently_copied {
+                    AppIcon::Check
+                } else {
+                    AppIcon::Copy
+                },
+                selected: recently_copied,
+                palette,
+                size: size.x,
+            },
+        )
+        .on_hover_text(label);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
     if !response.clicked() {
         return false;
     }
@@ -1611,7 +1623,7 @@ mod tests {
 
         let context = Context::default();
         let code_rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(300.0, 90.0));
-        let click = pos2(274.0, 30.0);
+        let click = pos2(288.0, 32.0);
         let block_id = markdown::blocks("code")[0].id;
         let _ = context.run_ui(
             RawInput {

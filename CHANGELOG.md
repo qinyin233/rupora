@@ -4,6 +4,29 @@
 
 ## [Unreleased]
 
+## [2.0.0-alpha.2] - 2026-09-12
+
+### Changed
+
+- 重塑原生工作区：独立工具轨、文稿架、上下文工具栏、轻量标签和连续正文布局。
+- 所有操作图标统一为细线矢量样式，补全键盘焦点、选中状态和辅助技术名称。
+- 写作、源码和阅读视图共享页面度量，适配窄窗口、双侧栏与分栏。
+- 操作菜单及子菜单采用紧凑宽度和受限高度，支持滚动访问所有命令。
+
+### Fixed
+
+- 代码复制反馈导致按钮变宽及正文被遮挡的问题。
+- 长文件名挤占标签关闭按钮、标题与状态文字居中漂移的问题。
+- 分栏两侧页面起点不齐，以及翻页光标计算使用旧页边距的问题。
+- 行内代码围栏与相邻反引号融合，连续切换格式时误删原文的问题。
+
+### Added
+
+- 窄页面、分栏对齐、长标签关闭、图标键盘操作、颜色对比度及反引号边界回归测试。
+- 前端设计约定、skill 对比和真实窗口交互验收记录。
+
+## [2.0.0-alpha.1] - 2026-09-10
+
 ### Changed
 
 - 将默认应用从 Tauri + Vue + Vditor 重写为 `eframe` / `egui` 原生 Rust 程序。
@@ -53,5 +76,8 @@
 
 - 首个 Tauri 2 + Vue 3 + Vditor 版本。
 
+[Unreleased]: https://github.com/qinyin233/rupora/compare/v2.0.0-alpha.2...HEAD
+[2.0.0-alpha.2]: https://github.com/qinyin233/rupora/releases/tag/v2.0.0-alpha.2
+[2.0.0-alpha.1]: https://github.com/qinyin233/rupora/releases/tag/v2.0.0-alpha.1
 [1.1.0]: https://github.com/qinyin233/rupora/releases/tag/v1.1.0
 [1.0.0]: https://github.com/qinyin233/rupora/releases/tag/v1.0.0

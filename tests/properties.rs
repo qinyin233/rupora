@@ -14,7 +14,7 @@ proptest! {
     })]
 
     #[test]
-    fn paired_formatting_round_trips_arbitrary_unicode(
+    fn fixed_marker_formatting_round_trips_arbitrary_unicode(
         characters in prop::collection::vec(any::<char>(), 0..200),
         left in any::<usize>(),
         right in any::<usize>(),
@@ -29,12 +29,45 @@ proptest! {
             MarkdownCommand::Bold,
             MarkdownCommand::Italic,
             MarkdownCommand::Strikethrough,
-            MarkdownCommand::InlineCode,
         ] {
             let mut text = original.clone();
             let next = apply_markdown_command(&mut text, selection.clone(), command);
             apply_markdown_command(&mut text, next, command);
             prop_assert_eq!(&text, &original);
+        }
+    }
+
+    #[test]
+    fn inline_code_additions_round_trip_and_removals_preserve_content(
+        characters in prop::collection::vec(prop_oneof![
+            4 => any::<char>(),
+            2 => Just('`'),
+            1 => Just(' '),
+            1 => Just('\n'),
+        ], 0..200),
+        left in any::<usize>(),
+        right in any::<usize>(),
+    ) {
+        let original = characters.into_iter().collect::<String>();
+        let length = original.chars().count();
+        let left = left % (length + 1);
+        let right = right % (length + 1);
+        let selection = left.min(right)..left.max(right);
+        let mut text = original.clone();
+        let next = apply_markdown_command(&mut text, selection.clone(), MarkdownCommand::InlineCode);
+
+        if text.len() > original.len() {
+            apply_markdown_command(&mut text, next, MarkdownCommand::InlineCode);
+            prop_assert_eq!(text, original);
+        } else {
+            // Removing existing code preserves its selected content. Reapplying
+            // uses a minimal fence, so nonminimal original fences need not return
+            // byte for byte: ``foo`` -> foo -> `foo` is a valid toggle sequence.
+            let original_content = original.chars()
+                .skip(selection.start).take(selection.len()).collect::<String>();
+            let remaining_content = text.chars()
+                .skip(next.start).take(next.len()).collect::<String>();
+            prop_assert_eq!(remaining_content, original_content);
         }
     }
 

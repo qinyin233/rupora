@@ -434,20 +434,16 @@ impl EditorSurface {
         ScrollArea::vertical()
             .id_salt(("hybrid-scroll", document_id))
             .show(ui, |ui| {
-                ui.add_space(28.0);
-                let available_width = ui.available_width();
-                let page_width = (available_width - 48.0)
-                    .clamp(280.0, 920.0)
-                    .min(available_width);
-                let side_margin = ((available_width - page_width) * 0.5).max(0.0);
+                let page_layout = document_page_layout(ui.available_width(), viewport_height);
+                ui.add_space(page_layout.top_margin);
                 ui.horizontal(|ui| {
-                    ui.add_space(side_margin);
-                    let page = document_page_frame(palette, options.dark)
+                    ui.add_space(page_layout.side_margin);
+                    let page = document_page_frame(palette, options.dark, &page_layout)
                         .show(ui, |ui| {
                             set_wysiwyg_document_accessibility(ui, &document_title);
                             ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                                ui.set_width((page_width - 112.0).max(160.0));
-                                ui.set_min_height((viewport_height - 142.0).max(480.0));
+                                ui.set_width(page_layout.content_width);
+                                ui.set_min_height(page_layout.min_content_height);
                                 for (block_index, block) in blocks.iter().enumerate() {
                                     let source_block = &source[block.range.clone()];
                                     let code_content = fenced_code_content(source_block);
@@ -644,6 +640,8 @@ impl EditorSurface {
                                                         .layouter(&mut layouter)
                                                         .hint_text(if block_is_code {
                                                             "输入代码…"
+                                                        } else if source.is_empty() {
+                                                            "写下第一行…"
                                                         } else {
                                                             ""
                                                         })
