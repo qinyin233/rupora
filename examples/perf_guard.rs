@@ -2,10 +2,22 @@ use rupora::{
     document::{Document, EditKind},
     editing::replace_all,
     markdown::{BlockIndex, analyze, render_html_fragment},
+    wysiwyg::VisualProjection,
 };
 use std::time::{Duration, Instant};
 
 fn main() {
+    let rich_paragraph = "`中` ".repeat(128_000);
+    measure(
+        "project 128k inline code spans",
+        Duration::from_secs(2),
+        || {
+            let projection = VisualProjection::from_markdown(&rich_paragraph);
+            assert_eq!(projection.text(), "中 ".repeat(128_000));
+            std::hint::black_box(projection);
+        },
+    );
+
     let source = representative_document(20_000);
     measure("analyze 20k sections", Duration::from_secs(8), || {
         std::hint::black_box(analyze(&source));

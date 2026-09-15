@@ -1281,6 +1281,12 @@ struct ProjectionBuilder {
 }
 
 impl ProjectionBuilder {
+    /// Every visible character appends one boundary. Reuse that count instead
+    /// of scanning the growing UTF-8 text for each Markdown event.
+    fn char_count(&self) -> usize {
+        self.source_boundaries.len() - 1
+    }
+
     fn new() -> Self {
         Self {
             text: String::new(),
@@ -1300,7 +1306,7 @@ impl ProjectionBuilder {
         trailing_fenced_code_block: bool,
     ) -> VisualProjection {
         while self.text.ends_with('\n') {
-            let newline = self.text.chars().count() - 1;
+            let newline = self.char_count() - 1;
             let start = self.source_boundaries[newline];
             let end = self.source_boundaries[newline + 1];
             let maps_source_line_break = source
@@ -1326,14 +1332,14 @@ impl ProjectionBuilder {
         let trailing_breaks = trailing_line_break_ranges(source);
         let collapsed_breaks = usize::from(trailing_container_block && trailing_breaks.len() >= 2);
         let mut represented_breaks = 0usize;
-        let trailing_visual_start = self.text.chars().count().saturating_sub(
+        let trailing_visual_start = self.char_count().saturating_sub(
             self.text
                 .chars()
                 .rev()
                 .take_while(|character| *character == '\n')
                 .count(),
         );
-        for visual_index in trailing_visual_start..self.text.chars().count() {
+        for visual_index in trailing_visual_start..self.char_count() {
             let boundary = self.source_boundaries[visual_index + 1];
             if let Some(relative) = trailing_breaks[represented_breaks..]
                 .iter()
@@ -1349,7 +1355,7 @@ impl ProjectionBuilder {
             represented_breaks = represented_breaks.max(2);
         }
 
-        let trimmed_length = self.text.chars().count();
+        let trimmed_length = self.char_count();
         self.runs.retain_mut(|run| {
             run.range.end = run.range.end.min(trimmed_length);
             run.range.start < run.range.end
@@ -1362,7 +1368,7 @@ impl ProjectionBuilder {
                 // a SoftBreak event. Do not project that source break twice.
                 continue;
             }
-            let visual_start = self.text.chars().count();
+            let visual_start = self.char_count();
             self.text.push('\n');
             let boundary = line_break.end;
             self.source_left_boundaries.push(boundary);
@@ -1374,7 +1380,7 @@ impl ProjectionBuilder {
             );
         }
         self.append_trailing_editable_whitespace(source);
-        let length = self.text.chars().count();
+        let length = self.char_count();
         self.runs.retain_mut(|run| {
             run.range.end = run.range.end.min(length);
             run.range.start < run.range.end
@@ -1396,7 +1402,7 @@ impl ProjectionBuilder {
 
     fn begin_inline_wrapper(&mut self, source_start: usize) {
         self.inline_wrapper_stack
-            .push((self.text.chars().count(), source_start));
+            .push((self.char_count(), source_start));
     }
 
     fn append_source_line_breaks_until(
@@ -1419,7 +1425,7 @@ impl ProjectionBuilder {
                 None => break,
             };
             if let Some(line_break_end) = line_break_end {
-                let visual_start = self.text.chars().count();
+                let visual_start = self.char_count();
                 self.text.push('\n');
                 self.source_left_boundaries.push(line_break_end);
                 self.source_boundaries.push(line_break_end);
@@ -1435,7 +1441,7 @@ impl ProjectionBuilder {
         let Some((visual_start, source_start)) = self.inline_wrapper_stack.pop() else {
             return;
         };
-        let visual_end = self.text.chars().count();
+        let visual_end = self.char_count();
         if visual_start < visual_end && source_start < source_end {
             self.inline_wrappers.push(InlineWrapper {
                 visual: visual_start..visual_end,
@@ -1565,7 +1571,7 @@ impl ProjectionBuilder {
         if let Some(relative_start) = fragment.find(rendered) {
             let source_start = range.start + relative_start;
             self.set_current_boundary(source_start);
-            let visual_start = self.text.chars().count();
+            let visual_start = self.char_count();
             self.text.push_str(rendered);
             let mut consumed = 0usize;
             for character in rendered.chars() {
@@ -1574,11 +1580,8 @@ impl ProjectionBuilder {
                 self.source_left_boundaries.push(boundary);
                 self.source_boundaries.push(boundary);
             }
-            push_run(
-                &mut self.runs,
-                visual_start..self.text.chars().count(),
-                style,
-            );
+            let visual_end = self.char_count();
+            push_run(&mut self.runs, visual_start..visual_end, style);
             return;
         }
         self.append_transformed(source, rendered, range, style);
@@ -1753,7 +1756,7 @@ impl ProjectionBuilder {
         }
         self.set_current_boundary(source_range.start);
         let rendered_chars = rendered.chars().count();
-        let visual_start = self.text.chars().count();
+        let visual_start = self.char_count();
         self.text.push_str(rendered);
         let source_boundaries = source[source_range.clone()]
             .char_indices()
@@ -1766,7 +1769,7 @@ impl ProjectionBuilder {
             self.source_left_boundaries.push(boundary);
             self.source_boundaries.push(boundary);
         }
-        let visual_end = self.text.chars().count();
+        let visual_end = self.char_count();
         if !source_range.is_empty() {
             self.atomic_ranges.push(AtomicVisualRange {
                 visual: visual_start..visual_end,
@@ -1792,24 +1795,21 @@ impl ProjectionBuilder {
             return;
         }
         self.set_current_boundary(source_byte);
-        let visual_start = self.text.chars().count();
+        let visual_start = self.char_count();
         self.text.push_str(rendered);
         self.source_left_boundaries
             .extend(std::iter::repeat_n(source_byte, rendered.chars().count()));
         self.source_boundaries
             .extend(std::iter::repeat_n(source_byte, rendered.chars().count()));
-        push_run(
-            &mut self.runs,
-            visual_start..self.text.chars().count(),
-            style,
-        );
+        let visual_end = self.char_count();
+        push_run(&mut self.runs, visual_start..visual_end, style);
     }
 
     fn ensure_line_break(&mut self, source_byte: usize, style: VisualStyle) {
         if !self.text.is_empty() && !self.text.ends_with('\n') {
             let source_byte =
                 source_byte.max(self.source_boundaries.last().copied().unwrap_or_default());
-            let start = self.text.chars().count();
+            let start = self.char_count();
             self.text.push('\n');
             self.source_left_boundaries.push(source_byte);
             self.source_boundaries.push(source_byte);

@@ -14,6 +14,7 @@ cargo check --manifest-path fuzz/Cargo.toml --bins --locked
 `examples/perf_guard.rs` 使用宽松但明确的 CI 上限，防止算法意外退化：
 
 - 解析 2 万个 Markdown 段落不超过 8 秒。
+- 为包含 12.8 万个 Unicode 行内代码片段的单段落构建视觉投影不超过 2 秒。
 - 在 2 万块文档中协调一次小修改不超过 1 秒。
 - 在 2 万段文档中记录一次不触发同步分析的编辑不超过 250 毫秒。
 - 读取这次编辑后的块索引不超过 1 秒，且不提前刷新全文统计。
