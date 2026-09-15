@@ -381,24 +381,25 @@ impl EditorSurface {
         self.apply_hybrid_cross_selection_input(ui, document, effects);
         self.render_cache.begin_frame();
         let viewport_height = ui.available_height();
-        let source = document.content.clone();
         let document_id = document.id();
+        let document_title = document.title();
         let cursor_before = self.editor_cursor;
         let selection_before = cursor_before.map(cursor_range_to_char_range);
-        let blocks = document.blocks().to_vec();
-
-        let references = document.references();
+        let view = document.render_view();
+        let source = view.source;
+        let blocks = view.blocks;
+        let references = view.references;
         let base_path = options.base_path;
         let prepared_document =
             self.render_cache
-                .prepare_document(document_id, &source, &blocks, references.clone());
+                .prepare_document(document_id, source, blocks, references.clone());
         let dark = options.dark;
         let screen_reader = ui.ctx().options(|options| options.screen_reader);
 
         let mut pending_source_cursor = self.pending_editor_cursor.take();
         if let Some(cursor_range) = pending_source_cursor {
             let [selection_start, _] = cursor_range.sorted_cursors();
-            let selected_block = block_for_char_index(&source, &blocks, selection_start.index.0);
+            let selected_block = block_for_char_index(source, blocks, selection_start.index.0);
             self.hybrid_active = Some((document_id, selected_block.id));
         }
 
@@ -409,7 +410,6 @@ impl EditorSurface {
             })
             .map(|(_, id)| id)
             .or_else(|| source.is_empty().then(|| blocks[0].id));
-        let document_title = document.title();
         let ime_action = ui.input(|input| ime_frame_action(&input.events));
         let ime_has_commit = ui.input(|input| {
             input.events.iter().any(|event| {
@@ -473,9 +473,9 @@ impl EditorSurface {
                                     ui.push_id(("hybrid-block", document_id, block.id), |ui| {
                                         if Some(block.id) == active_id {
                                             let mut edit_range =
-                                                hybrid_edit_range(&source, &blocks, block.id);
+                                                hybrid_edit_range(source, blocks, block.id);
                                             if let Some(cursor) = cursor_before {
-                                                let byte = char_to_byte(&source, cursor.primary.index.0);
+                                                let byte = char_to_byte(source, cursor.primary.index.0);
                                                 if byte < edit_range.start
                                                     && block_index > 0
                                                     && fenced_code_content(&source[blocks[block_index - 1].range.clone()]).is_some()
@@ -737,7 +737,7 @@ impl EditorSurface {
                                                 if output.response.has_focus() {
                                                     let accessible_remainder =
                                                         accessible_document_remainder(
-                                                            &source, &blocks, block.id,
+                                                            source, blocks, block.id,
                                                         );
                                                     append_accessible_text_runs(
                                                         ui,
@@ -834,7 +834,7 @@ impl EditorSurface {
                                                 } else if focused
                                                     && let Some(selection) = local_source_selection_before.as_ref()
                                                     && let Some(cursor) = fenced_boundary_delete_cursor(
-                                                        &source, &blocks, block_index,
+                                                        source, blocks, block_index,
                                                         selection.clone(), input_action.backspace, input_action.delete,
                                                     )
                                                 {
@@ -880,7 +880,7 @@ impl EditorSurface {
                                                     )
                                                     && !selection.is_empty()
                                                     && selection_before.as_ref().is_some_and(|selection| {
-                                                        !selection_intersects_code(&source, selection)
+                                                        !selection_intersects_code(source, selection)
                                                     })
                                                 {
                                                     let source_selection = projection
@@ -954,8 +954,8 @@ impl EditorSurface {
                                                 {
                                                     let replacement_range =
                                                         code_block_removal_range(
-                                                            &source,
-                                                            &blocks,
+                                                            source,
+                                                            blocks,
                                                             block_index,
                                                         );
                                                     let cursor = source[..replacement_range.start]
@@ -984,7 +984,7 @@ impl EditorSurface {
                                                     )
                                                     && let Some((replacement_range, cursor)) =
                                                         boundary_backspace_edit(
-                                                            &source,
+                                                            source,
                                                             edit_range.clone(),
                                                         )
                                                 {
@@ -1115,7 +1115,7 @@ impl EditorSurface {
                                                         source_update
                                                 {
                                                     if block.range.is_empty() && !updated.trim().is_empty() {
-                                                        let (prefix, suffix) = empty_paragraph_separators(&source, &blocks, block_index);
+                                                        let (prefix, suffix) = empty_paragraph_separators(source, blocks, block_index);
                                                         if prefix > 0 { updated.insert_str(0, &"\n".repeat(prefix)); }
                                                         updated.push_str(&"\n".repeat(suffix));
                                                         selection = selection.start + prefix..selection.end + prefix;
@@ -1304,8 +1304,8 @@ impl EditorSurface {
                                         if response.double_clicked() && pending_edit.is_none() {
                                             let (tail_range, replacement, cursor) =
                                                 paragraph_after_code_double_click(
-                                                    &source,
-                                                    &blocks,
+                                                    source,
+                                                    blocks,
                                                     block_index,
                                                 );
                                             next_global_cursor =
@@ -1358,7 +1358,7 @@ impl EditorSurface {
         if pointer.0
             && let Some(origin) = pointer.4
             && let Some((block_id, source_char)) =
-                hybrid_pointer_hit(&source, &pointer_regions, origin)
+                hybrid_pointer_hit(source, &pointer_regions, origin)
         {
             self.hybrid_pointer_anchor = Some(HybridPointerAnchor {
                 document_id,
@@ -1372,12 +1372,12 @@ impl EditorSurface {
             && let (Some(anchor), Some(position)) = (self.hybrid_pointer_anchor, pointer.5)
             && anchor.document_id == document_id
             && let Some((current_block, current_char)) =
-                hybrid_pointer_hit(&source, &pointer_regions, position)
+                hybrid_pointer_hit(source, &pointer_regions, position)
         {
             if current_block != anchor.block_id {
                 let cursor = snap_atomic_cross_block_selection(
-                    &source,
-                    &blocks,
+                    source,
+                    blocks,
                     anchor.block_id,
                     anchor.source_char,
                     current_block,
@@ -1415,7 +1415,7 @@ impl EditorSurface {
             .filter(|selection| selection.document_id == document_id)
         {
             next_global_cursor = Some(selection.cursor);
-            paint_hybrid_cross_selection(ui, &source, &pointer_regions, selection.cursor);
+            paint_hybrid_cross_selection(ui, source, &pointer_regions, selection.cursor);
         }
 
         let deactivate = ui.input(|input| {
@@ -1430,15 +1430,19 @@ impl EditorSurface {
         if let Some(cursor_range) = next_global_cursor {
             self.editor_cursor = Some(cursor_range);
         }
+        // Resolve activation while the rendered source is still borrowed. An
+        // edit below can change its byte offsets before activation is applied.
+        let activate = activate.map(|(id, start)| (id, source[..start].chars().count()));
         if let Some((range, replacement, kind)) = pending_edit {
-            document.content.replace_range(range.clone(), &replacement);
             let selection_after = next_global_cursor.map(cursor_range_to_char_range);
-            document.record_edit(source.clone(), selection_before, selection_after, kind);
+            document.edit(kind, selection_before, |content| {
+                content.replace_range(range, &replacement);
+                selection_after
+            });
             let cursor_block_id = next_global_cursor.map(|cursor_range| {
                 let cursor = cursor_range.sorted_cursors()[1].index.0;
-                let updated_source = document.content.clone();
-                let updated_blocks = document.blocks().to_vec();
-                block_for_char_index(&updated_source, &updated_blocks, cursor).id
+                let updated = document.render_view();
+                block_for_char_index(updated.source, updated.blocks, cursor).id
             });
             if let Some(next_active_id) = cursor_block_id.or(active_id) {
                 self.hybrid_active = Some((document_id, next_active_id));
@@ -1462,8 +1466,7 @@ impl EditorSurface {
             self.hybrid_active = None;
             ime_session = None;
         }
-        if let Some((id, start)) = activate {
-            let char_start = source[..start].chars().count();
+        if let Some((id, char_start)) = activate {
             self.hybrid_active = Some((document_id, id));
             ime_session = None;
             self.queue_editor_selection(char_start..char_start);

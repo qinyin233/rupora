@@ -32,6 +32,25 @@ fn main() {
         },
     );
 
+    measure(
+        "read updated blocks without forcing analysis",
+        Duration::from_secs(1),
+        || {
+            std::hint::black_box(document.blocks());
+            assert!(document.derived_state_is_stale());
+        },
+    );
+    measure(
+        "read unchanged blocks 1000 times during deferred analysis",
+        Duration::from_millis(100),
+        || {
+            for _ in 0..1_000 {
+                std::hint::black_box(document.blocks());
+            }
+            assert!(document.derived_state_is_stale());
+        },
+    );
+
     let export_source = representative_document(2_000);
     measure(
         "atomic command on 20k sections",

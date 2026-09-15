@@ -11,21 +11,22 @@ impl EditorSurface {
         scroll_offset: Option<f32>,
     ) -> PaneScroll {
         let viewport_height = ui.available_height();
-        let source = document.content.clone();
-        let references = document.references();
-        let blocks = document.blocks().to_vec();
+        let document_id = document.id();
+        let view = document.render_view();
+        let source = view.source;
+        let references = view.references;
+        let blocks = view.blocks;
         let scroll_to_block = if options.mode == ViewMode::Preview {
             self.pending_editor_cursor
                 .take()
-                .map(|cursor| block_for_char_index(&source, &blocks, cursor.primary.index.0).id)
+                .map(|cursor| block_for_char_index(source, blocks, cursor.primary.index.0).id)
         } else {
             None
         };
-        let document_id = document.id();
         let base_path = options.base_path;
         let prepared_document =
             self.render_cache
-                .prepare_document(document_id, &source, &blocks, references.clone());
+                .prepare_document(document_id, source, blocks, references.clone());
         let dark = options.dark;
         let palette = app_palette(options.dark);
         let mut task_toggle = None;
@@ -43,7 +44,7 @@ impl EditorSurface {
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         ui.set_width(page_layout.content_width);
                         ui.set_min_height(page_layout.min_content_height);
-                        for block in &blocks {
+                        for block in blocks {
                             let source_block = &source[block.range.clone()];
                             let prepared = prepared_document.block(
                                 ui.ctx(),

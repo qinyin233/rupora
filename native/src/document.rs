@@ -141,6 +141,14 @@ impl LineEnding {
     }
 }
 
+/// Borrows current rendering inputs together so block ranges always refer to
+/// this source version. The borrow ends before the caller can edit the document.
+pub(crate) struct DocumentRenderView<'a> {
+    pub source: &'a str,
+    pub blocks: &'a [MarkdownBlock],
+    pub references: std::sync::Arc<crate::markdown::ReferenceDefinitions>,
+}
+
 #[derive(Debug)]
 pub struct Document {
     id: u64,
@@ -150,6 +158,8 @@ pub struct Document {
     pub encoding: TextEncoding,
     pub line_ending: LineEnding,
     pub dirty: bool,
+    /// Last computed statistics; refresh after idle or explicitly when current
+    /// statistics are required. Rendering reads do not force this computation.
     pub analysis: MarkdownAnalysis,
     untitled_id: usize,
     saved_content: String,
@@ -158,7 +168,8 @@ pub struct Document {
     redo_history: Vec<EditTransaction>,
     typing_group_open: bool,
     block_index: BlockIndex,
-    derived_state_stale: bool,
+    analysis_stale: bool,
+    block_index_stale: bool,
     last_content_edit: Option<Instant>,
     lock: Option<DocumentLock>,
 }
@@ -183,7 +194,8 @@ impl Document {
             redo_history: Vec::new(),
             typing_group_open: false,
             block_index,
-            derived_state_stale: false,
+            analysis_stale: false,
+            block_index_stale: false,
             last_content_edit: None,
             lock: None,
         }
@@ -226,7 +238,8 @@ impl Document {
             redo_history: Vec::new(),
             typing_group_open: false,
             block_index,
-            derived_state_stale: false,
+            analysis_stale: false,
+            block_index_stale: false,
             last_content_edit: None,
             lock,
         })
@@ -319,34 +332,41 @@ impl Document {
         self.dirty = self.content != self.saved_content;
         self.analysis = analyze(&self.content);
         self.block_index.update(&self.content);
-        self.derived_state_stale = false;
+        self.analysis_stale = false;
+        self.block_index_stale = false;
         self.last_content_edit = None;
     }
 
     fn mark_after_edit(&mut self, edited_at: Instant) {
         self.advance_revision();
         self.dirty = self.content != self.saved_content;
-        self.derived_state_stale = true;
+        self.analysis_stale = true;
+        self.block_index_stale = true;
         self.last_content_edit = Some(edited_at);
     }
 
+    /// Whether structure or statistics still need refreshing. Reading current
+    /// blocks alone may leave statistics stale until the typing burst ends.
     pub fn derived_state_is_stale(&self) -> bool {
-        self.derived_state_stale
+        self.analysis_stale || self.block_index_stale
     }
 
+    /// Refreshes both document statistics and the structure used by rendering.
     pub fn refresh_derived_state(&mut self) -> bool {
-        if !self.derived_state_stale {
+        if !self.derived_state_is_stale() {
             return false;
         }
-        self.analysis = analyze(&self.content);
-        self.block_index.update(&self.content);
-        self.derived_state_stale = false;
+        if self.analysis_stale {
+            self.analysis = analyze(&self.content);
+            self.analysis_stale = false;
+        }
+        self.refresh_block_index();
         self.last_content_edit = None;
         true
     }
 
     pub fn refresh_derived_state_if_idle(&mut self, delay: Duration) -> bool {
-        if !self.derived_state_stale
+        if !self.derived_state_is_stale()
             || self
                 .last_content_edit
                 .is_some_and(|edited_at| edited_at.elapsed() < delay)
@@ -356,14 +376,32 @@ impl Document {
         self.refresh_derived_state()
     }
 
+    fn refresh_block_index(&mut self) {
+        if self.block_index_stale {
+            self.block_index.update(&self.content);
+            self.block_index_stale = false;
+        }
+    }
+
+    /// Returns current blocks without interrupting the idle delay for statistics.
     pub fn blocks(&mut self) -> &[MarkdownBlock] {
-        self.refresh_derived_state();
+        self.refresh_block_index();
         self.block_index.blocks()
     }
 
     pub(crate) fn references(&mut self) -> std::sync::Arc<crate::markdown::ReferenceDefinitions> {
-        self.refresh_derived_state();
+        self.refresh_block_index();
         self.block_index.references()
+    }
+
+    /// Refreshes structure, then borrows one consistent set of rendering inputs.
+    pub(crate) fn render_view(&mut self) -> DocumentRenderView<'_> {
+        self.refresh_block_index();
+        DocumentRenderView {
+            source: &self.content,
+            blocks: self.block_index.blocks(),
+            references: self.block_index.references(),
+        }
     }
 
     pub fn record_edit(
@@ -1339,6 +1377,7 @@ mod tests {
         assert!(document.dirty);
         assert!(document.derived_state_is_stale());
         assert_eq!(document.blocks().len(), 2);
+        assert!(document.refresh_derived_state());
         assert_eq!(document.analysis.headings[0].text, "标题🙂");
         assert!(!document.derived_state_is_stale());
         assert_eq!(document.snapshot_token(), after);
@@ -1436,7 +1475,7 @@ mod tests {
             text.push_str("原文🙂");
             None
         });
-        document.blocks();
+        document.refresh_derived_state();
         let before = document.snapshot();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             document.edit(EditKind::Replace, None, |text| {
@@ -1770,15 +1809,108 @@ mod tests {
     }
 
     #[test]
-    fn requesting_blocks_refreshes_deferred_derived_state() {
+    fn requesting_blocks_keeps_analysis_deferred_during_typing() {
         let mut document = Document::untitled(1);
-        let before = document.content.clone();
-        document.content = "alpha\n\nbeta".to_owned();
-        document.record_edit(before, None, None, EditKind::Typing);
+        document.edit(EditKind::Typing, None, |text| {
+            text.push_str("# 标题🙂\n\n正文");
+            None
+        });
 
         assert!(document.derived_state_is_stale());
         assert_eq!(document.blocks().len(), 2);
+        assert!(document.analysis.headings.is_empty());
+        assert!(document.derived_state_is_stale());
+        assert!(!document.refresh_derived_state_if_idle(Duration::from_secs(60)));
+        assert!(document.refresh_derived_state_if_idle(Duration::ZERO));
+        assert_eq!(document.analysis.headings[0].text, "标题🙂");
         assert!(!document.derived_state_is_stale());
+    }
+
+    #[test]
+    fn render_view_tracks_text_blocks_and_references_across_history() {
+        let original = "# Old\n\n[go][target]\n\n[target]: old.md";
+        let updated = "# Fresh\n\n[go][target]\n\n[target]: new.md";
+        let mut document = Document::untitled(1);
+        document.content = original.to_owned();
+        document.update_after_edit();
+        document.edit(EditKind::Replace, None, |text| {
+            *text = updated.to_owned();
+            None
+        });
+
+        for (step, source, heading, destination) in [
+            (0, updated, "# Fresh", "new.md"),
+            (1, original, "# Old", "old.md"),
+            (2, updated, "# Fresh", "new.md"),
+        ] {
+            match step {
+                1 => {
+                    document.undo().unwrap();
+                }
+                2 => {
+                    document.redo().unwrap();
+                }
+                _ => {}
+            }
+            let view = document.render_view();
+            assert_eq!(view.source, source);
+            assert_eq!(&view.source[view.blocks[0].range.clone()], heading);
+            assert_eq!(
+                crate::markdown::link_destination_with_references(
+                    "[go][target]",
+                    1,
+                    &view.references,
+                )
+                .as_deref(),
+                Some(destination),
+            );
+            assert_eq!(document.analysis.headings[0].text, "Old");
+            assert!(document.derived_state_is_stale());
+        }
+        assert!(document.refresh_derived_state_if_idle(Duration::ZERO));
+        assert_eq!(document.analysis.headings[0].text, "Fresh");
+    }
+
+    #[test]
+    fn full_refresh_paths_replace_partially_refreshed_rendering_state() {
+        let refreshed = "# Fresh\n\n[go][target]\n\n[target]: fresh.md";
+        for reload in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("partial-state.md");
+            fs::write(&path, "# Old").unwrap();
+            let mut document = Document::open(&path).unwrap();
+            document.edit(EditKind::Typing, None, |text| {
+                *text = "# Pending\n\n[go][target]\n\n[target]: pending.md".to_owned();
+                None
+            });
+            let view = document.render_view();
+            assert_eq!(&view.source[view.blocks[0].range.clone()], "# Pending");
+            assert_eq!(document.analysis.headings[0].text, "Old");
+            assert!(document.derived_state_is_stale());
+
+            if reload {
+                fs::write(&path, refreshed).unwrap();
+                document.reload().unwrap();
+            } else {
+                document.content = refreshed.to_owned();
+                document.update_after_edit();
+            }
+            assert!(!document.derived_state_is_stale());
+            assert_eq!(document.analysis.headings[0].text, "Fresh");
+            let view = document.render_view();
+            assert_eq!(view.source, refreshed);
+            assert_eq!(&view.source[view.blocks[0].range.clone()], "# Fresh");
+            assert_eq!(
+                crate::markdown::link_destination_with_references(
+                    "[go][target]",
+                    1,
+                    &view.references,
+                )
+                .as_deref(),
+                Some("fresh.md"),
+            );
+            assert!(!document.refresh_derived_state_if_idle(Duration::ZERO));
+        }
     }
 
     #[test]

@@ -110,6 +110,35 @@ fn assert_split_preview(output: &egui::FullOutput, expected: &str) {
 }
 
 #[test]
+fn rendering_current_content_in_every_mode_preserves_deferred_statistics() {
+    for mode in [
+        ViewMode::Edit,
+        ViewMode::Hybrid,
+        ViewMode::Preview,
+        ViewMode::Split,
+    ] {
+        let ctx = context();
+        let mut surface = EditorSurface::default();
+        let mut document = document("# Old");
+        surface.bind_document(Some(&document), bookmark(0..0));
+        frame(&mut surface, &mut document, &ctx, mode, vec![]);
+        document.edit(EditKind::Replace, None, |text| {
+            *text = "# Fresh".to_owned();
+            None
+        });
+        let version = document.snapshot_token();
+        let (output, _) = frame(&mut surface, &mut document, &ctx, mode, vec![]);
+        assert!(painted_text(&output, 0.0).contains("Fresh"), "{mode:?}");
+        assert_eq!(document.content, "# Fresh");
+        assert_eq!(document.snapshot_token(), version);
+        assert_eq!(document.analysis.headings[0].text, "Old", "{mode:?}");
+        assert!(document.derived_state_is_stale(), "{mode:?}");
+        assert!(document.refresh_derived_state_if_idle(std::time::Duration::ZERO));
+        assert_eq!(document.analysis.headings[0].text, "Fresh");
+    }
+}
+
+#[test]
 fn full_audit_source_shift_tab_uses_the_key_event_modifiers() {
     let ctx = context();
     let mut surface = EditorSurface::default();
