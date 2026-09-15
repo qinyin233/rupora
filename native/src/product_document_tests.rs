@@ -87,6 +87,20 @@ fn product_painted_text(output: &egui::FullOutput) -> String {
 }
 
 #[test]
+fn product_document_utf8_save_as_is_discoverable_in_command_palette() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = product_app(directory.path());
+    app.new_document();
+    app.command_palette_open = true;
+    app.command_query = "UTF-8".to_owned();
+    let context = Context::default();
+    install_fonts(&context);
+    let _ = context.run_ui(egui::RawInput::default(), |ui| app.command_palette(ui));
+    let output = context.run_ui(egui::RawInput::default(), |ui| app.command_palette(ui));
+    assert!(product_painted_text(&output).contains("另存为 UTF-8…"));
+}
+
+#[test]
 fn product_document_indented_code_stays_literal_in_both_reading_canvases() {
     for hybrid in [false, true] {
         for active_code in [false, true] {

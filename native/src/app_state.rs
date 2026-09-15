@@ -85,6 +85,7 @@ pub(crate) enum AppCommand {
     ShortcutSettings,
     Save,
     SaveAs,
+    SaveAsUtf8,
     Undo,
     Redo,
     ExportHtml,

@@ -4,7 +4,7 @@ use crate::wysiwyg::*;
 use crate::{
     app_state::{AppCommand, KeyBindings, PersistedState, ShortcutAction, ViewMode},
     diagnostics,
-    document::{Document, DocumentSnapshot, EditKind},
+    document::{Document, DocumentSnapshot, EditKind, TextEncoding},
     editing::{self, MarkdownCommand, char_to_byte},
     editor::{
         EditorBookmark, EditorCommand, EditorOptions, EditorSurface, cursor_range_to_char_range,
@@ -415,15 +415,24 @@ impl RuporaApp {
     }
 
     fn save_active(&mut self, force_dialog: bool) {
+        self.save_active_with_encoding(force_dialog, None);
+    }
+
+    fn save_active_with_encoding(&mut self, force_dialog: bool, encoding: Option<TextEncoding>) {
         let Some(index) = self.session.active_index() else {
             return;
         };
 
-        let needs_path = self.session[index].path.is_none() || force_dialog;
+        let needs_path = self.session[index].path.is_none() || force_dialog || encoding.is_some();
         let selected_path = needs_path
             .then(|| {
                 let title = self.session[index].title();
                 FileDialog::new()
+                    .set_title(if encoding.is_some() {
+                        "另存为 UTF-8"
+                    } else {
+                        "另存为"
+                    })
                     .add_filter("Markdown", &["md", "markdown"])
                     .set_file_name(title)
                     .save_file()
@@ -470,7 +479,11 @@ impl RuporaApp {
         };
 
         let result = if let Some(path) = selected_path {
-            self.session[index].save_as(path, true)
+            if let Some(encoding) = encoding {
+                self.session[index].save_as_with_encoding(path, true, encoding)
+            } else {
+                self.session[index].save_as(path, true)
+            }
         } else {
             self.session[index].save(overwrite_external)
         };
@@ -836,6 +849,9 @@ impl RuporaApp {
             AppCommand::ShortcutSettings => self.shortcut_settings_open = true,
             AppCommand::Save => self.save_active(false),
             AppCommand::SaveAs => self.save_active(true),
+            AppCommand::SaveAsUtf8 => {
+                self.save_active_with_encoding(true, Some(TextEncoding::Utf8))
+            }
             AppCommand::Undo => self.undo_active(),
             AppCommand::Redo => self.redo_active(),
             AppCommand::ExportHtml => self.export_html(),
@@ -1867,6 +1883,9 @@ impl RuporaApp {
                 if ui.button("另存为").on_hover_text("Ctrl+Shift+S").clicked() {
                     self.execute(AppCommand::SaveAs);
                 }
+                if ui.button("另存为 UTF-8…").clicked() {
+                    self.execute(AppCommand::SaveAsUtf8);
+                }
                 let can_undo = self
                     .session
                     .active_index()
@@ -2233,6 +2252,7 @@ impl RuporaApp {
             ("打开工作区", AppCommand::OpenFolder),
             ("保存", AppCommand::Save),
             ("另存为", AppCommand::SaveAs),
+            ("另存为 UTF-8…", AppCommand::SaveAsUtf8),
             ("撤销", AppCommand::Undo),
             ("重做", AppCommand::Redo),
             ("导出 HTML", AppCommand::ExportHtml),

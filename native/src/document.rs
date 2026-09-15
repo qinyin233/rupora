@@ -590,6 +590,14 @@ impl Document {
     }
 
     pub fn save(&mut self, overwrite_external: bool) -> Result<(), String> {
+        self.save_with_encoding(overwrite_external, self.encoding.clone())
+    }
+
+    fn save_with_encoding(
+        &mut self,
+        overwrite_external: bool,
+        encoding: TextEncoding,
+    ) -> Result<(), String> {
         let path = self
             .path
             .as_ref()
@@ -601,17 +609,32 @@ impl Document {
             ));
         }
         let content = self.line_ending.apply(&self.content);
-        let bytes = encode_text(&content, &self.encoding)?;
+        let bytes = encode_text(&content, &encoding)?;
         ensure_document_size(bytes.len())?;
         write_atomically(path, &bytes, true)?;
         self.file_fingerprint = Some(fingerprint_from_bytes(path, &bytes));
         self.saved_content.clone_from(&self.content);
         self.dirty = false;
         self.typing_group_open = false;
+        if self.encoding != encoding {
+            self.encoding = encoding;
+            self.advance_revision();
+        }
         Ok(())
     }
 
     pub fn save_as(&mut self, path: PathBuf, overwrite_existing: bool) -> Result<(), String> {
+        self.save_as_with_encoding(path, overwrite_existing, self.encoding.clone())
+    }
+
+    /// Save using an explicitly selected encoding. The document adopts the
+    /// target path and encoding only after the atomic write succeeds.
+    pub fn save_as_with_encoding(
+        &mut self,
+        path: PathBuf,
+        overwrite_existing: bool,
+        encoding: TextEncoding,
+    ) -> Result<(), String> {
         if path.exists() && !overwrite_existing {
             return Err(format!("目标文件已存在：{}", path.display()));
         }
@@ -621,17 +644,18 @@ impl Document {
             .as_deref()
             .is_some_and(|current| absolute_path_identity(current) == absolute_path_identity(&path))
         {
-            return self.save(true);
+            return self.save_with_encoding(overwrite_existing, encoding);
         }
 
         let new_lock = DocumentLock::acquire(&path)?;
         let content = self.line_ending.apply(&self.content);
-        let bytes = encode_text(&content, &self.encoding)?;
+        let bytes = encode_text(&content, &encoding)?;
         ensure_document_size(bytes.len())?;
         write_atomically(&path, &bytes, overwrite_existing)?;
 
         self.path = Some(path.clone());
         self.lock = Some(new_lock);
+        self.encoding = encoding;
         self.file_fingerprint = Some(fingerprint_from_bytes(&path, &bytes));
         self.saved_content.clone_from(&self.content);
         self.dirty = false;
@@ -1042,7 +1066,7 @@ fn encode_text(text: &str, encoding: &TextEncoding) -> Result<Vec<u8>, String> {
             let (bytes, _, had_errors) = encoding.encode(text);
             if had_errors {
                 Err(format!(
-                    "内容包含无法用 {} 表示的字符；请另存为 UTF-8",
+                    "内容包含无法用 {} 表示的字符；请在更多菜单中选择“另存为 UTF-8…”",
                     encoding.name()
                 ))
             } else {
@@ -1650,6 +1674,185 @@ mod tests {
         assert!(bytes.starts_with(&[0xff, 0xfe]));
         let decoded = decode_bytes(&bytes).unwrap();
         assert!(decoded.text.contains("正文\r\n结尾\r\n"));
+    }
+
+    #[test]
+    fn save_as_utf8_recovers_unrepresentable_legacy_edits() {
+        for newline in ["\n", "\r\n", "\r"] {
+            for same_path in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let original_path = directory.path().join("legacy.md");
+                let original = format!("中文测试{newline}");
+                let original_bytes = encode_text(&original, &TextEncoding::Legacy(GBK)).unwrap();
+                fs::write(&original_path, &original_bytes).unwrap();
+                let mut document = Document::open(&original_path).unwrap();
+                assert_eq!(document.encoding, TextEncoding::Legacy(GBK));
+                document.edit(EditKind::Other, None, |text| {
+                    text.push_str("🙂\n");
+                    None
+                });
+                let before = document.snapshot();
+                let target = if same_path {
+                    original_path.clone()
+                } else {
+                    directory.path().join("utf8.md")
+                };
+                assert!(document.save(false).unwrap_err().contains("另存为 UTF-8"));
+                assert!(document.save_as(target.clone(), same_path).is_err());
+                assert_eq!(document.snapshot(), before);
+                assert!(document.dirty);
+                assert_eq!(fs::read(&original_path).unwrap(), original_bytes);
+                if !same_path {
+                    assert!(!target.exists());
+                }
+
+                document
+                    .save_as_with_encoding(target.clone(), same_path, TextEncoding::Utf8)
+                    .unwrap();
+                let expected = format!("中文测试{newline}🙂{newline}");
+                assert_eq!(fs::read(&target).unwrap(), expected.as_bytes());
+                assert_eq!(document.encoding, TextEncoding::Utf8);
+                assert_eq!(document.line_ending.apply(&document.content), expected);
+                assert_eq!(
+                    document.path,
+                    Some(canonical_document_path(&target).unwrap())
+                );
+                assert_ne!(document.snapshot_token(), before.token());
+                assert!(!document.dirty);
+                assert!(!document.has_external_changes().unwrap());
+                if !same_path {
+                    assert_eq!(fs::read(&original_path).unwrap(), original_bytes);
+                }
+
+                // Subsequent ordinary saves use UTF-8, and conversion retains history.
+                document.edit(EditKind::Other, None, |text| {
+                    text.push_str("追加😀");
+                    None
+                });
+                document.save(false).unwrap();
+                assert_eq!(
+                    fs::read_to_string(&target).unwrap(),
+                    format!("{expected}追加😀")
+                );
+                document.undo().unwrap();
+                assert_eq!(document.content, "中文测试\n🙂\n");
+                document.undo().unwrap();
+                assert_eq!(document.content, "中文测试\n");
+                assert!(document.dirty);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_save_as_keeps_legacy_encoding() {
+        let directory = tempfile::tempdir().unwrap();
+        let original_path = directory.path().join("legacy.md");
+        let encoding = TextEncoding::Legacy(GBK);
+        fs::write(
+            &original_path,
+            encode_text("中文测试\r\n", &encoding).unwrap(),
+        )
+        .unwrap();
+        let mut document = Document::open(&original_path).unwrap();
+        document.edit(EditKind::Other, None, |text| {
+            text.push_str("追加\n");
+            None
+        });
+        let target = directory.path().join("copy.md");
+        document.save_as(target.clone(), false).unwrap();
+        assert_eq!(document.encoding, encoding);
+        assert_eq!(
+            fs::read(target).unwrap(),
+            encode_text("中文测试\r\n追加\r\n", &encoding).unwrap()
+        );
+    }
+
+    #[test]
+    fn failed_save_as_utf8_keeps_file_encoding_path_and_history() {
+        for same_path in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let original_path = directory.path().join("legacy.md");
+            let encoding = TextEncoding::Legacy(GBK);
+            let original_bytes = encode_text("中文测试\r\n", &encoding).unwrap();
+            fs::write(&original_path, &original_bytes).unwrap();
+            let mut document = Document::open(&original_path).unwrap();
+            document.edit(EditKind::Other, None, |text| {
+                text.push('🙂');
+                None
+            });
+            let target = if same_path {
+                original_path.clone()
+            } else {
+                let target = directory.path().join("existing.md");
+                fs::write(&target, "existing target").unwrap();
+                target
+            };
+            let target_before = fs::read(&target).unwrap();
+            let snapshot = document.snapshot();
+            let saved_content = document.saved_content.clone();
+            let fingerprint = document.file_fingerprint.clone();
+            assert!(
+                document
+                    .save_as_with_encoding(target.clone(), false, TextEncoding::Utf8)
+                    .is_err()
+            );
+            FAIL_BEFORE_ATOMIC_PERSIST.with(|failure| failure.set(true));
+            assert!(
+                document
+                    .save_as_with_encoding(target.clone(), true, TextEncoding::Utf8)
+                    .unwrap_err()
+                    .contains("测试注入")
+            );
+            assert_eq!(document.snapshot(), snapshot);
+            assert_eq!(document.encoding, encoding);
+            assert_eq!(document.line_ending, LineEnding::CrLf);
+            assert_eq!(document.saved_content, saved_content);
+            assert_eq!(document.file_fingerprint, fingerprint);
+            assert!(document.dirty);
+            assert_eq!(fs::read(&target).unwrap(), target_before);
+            assert_eq!(fs::read(&original_path).unwrap(), original_bytes);
+            assert!(
+                Document::open(&original_path).is_err(),
+                "original file stays locked"
+            );
+            if !same_path {
+                assert!(
+                    Document::open(&target).is_ok(),
+                    "failed target lock is released"
+                );
+            }
+            document.undo().unwrap();
+            assert_eq!(document.content, "中文测试\n");
+            assert!(!document.dirty);
+        }
+    }
+
+    #[test]
+    fn save_as_utf8_does_not_overwrite_a_concurrent_creator() {
+        let directory = tempfile::tempdir().unwrap();
+        let original_path = directory.path().join("legacy.md");
+        fs::write(
+            &original_path,
+            encode_text("中文测试", &TextEncoding::Legacy(GBK)).unwrap(),
+        )
+        .unwrap();
+        let mut document = Document::open(&original_path).unwrap();
+        document.edit(EditKind::Other, None, |text| {
+            text.push('🙂');
+            None
+        });
+        let snapshot = document.snapshot();
+        let target = directory.path().join("concurrent.md");
+        CREATE_TARGET_BEFORE_ATOMIC_PERSIST.with(|create| create.set(true));
+        assert!(
+            document
+                .save_as_with_encoding(target.clone(), false, TextEncoding::Utf8)
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "concurrent creator");
+        assert_eq!(document.snapshot(), snapshot);
+        assert_eq!(document.encoding, TextEncoding::Legacy(GBK));
+        assert!(document.dirty);
     }
 
     #[test]
