@@ -106,6 +106,28 @@ pub(super) fn hybrid_page_cursor(
             .start
 }
 
+pub(super) fn hybrid_document_edge(
+    source: &str,
+    blocks: &[markdown::MarkdownBlock],
+    end: bool,
+) -> usize {
+    let block = if end { blocks.last() } else { blocks.first() };
+    if let Some(block) = block {
+        let text = &source[block.range.clone()];
+        if is_fenced_code_block(text) {
+            let projection = VisualProjection::from_markdown(text);
+            let at = if end {
+                projection.text().chars().count()
+            } else {
+                0
+            };
+            return source[..block.range.start].chars().count()
+                + projection.source_char_range(text, at..at).start;
+        }
+    }
+    if end { source.chars().count() } else { 0 }
+}
+
 pub(super) fn block_for_char_index<'a>(
     source: &str,
     blocks: &'a [markdown::MarkdownBlock],

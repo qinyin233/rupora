@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn document_edge_navigation_types_inside_fenced_code() {
+    for fence in ["```rust", "~~~text"] {
+        let closer = &fence[..3];
+        for nav in [Key::Home, Key::End] {
+            for batched in [false, true] {
+                for body in ["中文🙂", ""] {
+                    let source = format!("{fence}\n{body}\n{closer}");
+                    let directory = tempfile::tempdir().unwrap();
+                    let mut app = app_at(directory.path(), &source, 0..0);
+                    let ctx = Context::default();
+                    install_fonts(&ctx);
+                    frame(&mut app, &ctx, true, vec![]);
+                    let events = vec![key(nav, command()), egui::Event::Text("新".into())];
+                    if batched {
+                        frame(&mut app, &ctx, true, events);
+                    } else {
+                        for event in events {
+                            frame(&mut app, &ctx, true, vec![event]);
+                        }
+                    }
+                    let expected = if nav == Key::Home {
+                        format!("{fence}\n新{body}\n{closer}")
+                    } else {
+                        format!("{fence}\n{body}新\n{closer}")
+                    };
+                    assert_eq!(
+                        app.session[0].content, expected,
+                        "nav={nav:?}, batched={batched}"
+                    );
+                    let expected_cursor = fence.chars().count()
+                        + 2
+                        + if nav == Key::End {
+                            body.chars().count()
+                        } else {
+                            0
+                        };
+                    assert_eq!(app.active_selection(0), expected_cursor..expected_cursor);
+                    app.undo_active();
+                    assert_eq!(app.session[0].content, source);
+                    app.redo_active();
+                    assert_eq!(app.session[0].content, expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn partial_inline_delete_and_batched_backspace_keep_markup_and_history() {
     for (source, selection, events, expected) in [
         (

@@ -276,7 +276,9 @@ impl EditorSurface {
                     options.dark,
                 ))
             } else if modifiers.command && matches!(key, Key::Home | Key::End) {
-                Some(if key == Key::Home {
+                Some(if !modifiers.shift {
+                    hybrid_document_edge(source, &blocks, key == Key::End)
+                } else if key == Key::Home {
                     0
                 } else {
                     source.chars().count()
