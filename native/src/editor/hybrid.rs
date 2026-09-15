@@ -2,6 +2,56 @@
 use super::*;
 
 impl EditorSurface {
+    fn finish_leading_ime_cancel(&mut self, ui: &mut Ui, document: &Document) {
+        let Some(editor_id) = self.editor_widget_id else {
+            return;
+        };
+        if !self
+            .hybrid_ime_session
+            .as_ref()
+            .is_some_and(|session| session.document_id == document.id())
+            || ui.memory(|memory| memory.focused()) != Some(editor_id)
+        {
+            return;
+        }
+        let cancel = ui.input(|input| {
+            for (index, event) in input.events.iter().enumerate() {
+                match event {
+                    egui::Event::Ime(
+                        egui::ImeEvent::Preedit { text, .. } | egui::ImeEvent::Commit(text),
+                    ) if text.is_empty() => return Some(index),
+                    egui::Event::Ime(egui::ImeEvent::Preedit { .. })
+                    | egui::Event::Key {
+                        key: Key::Escape, ..
+                    } => {}
+                    egui::Event::Text(_)
+                    | egui::Event::Paste(_)
+                    | egui::Event::Cut
+                    | egui::Event::Copy
+                    | egui::Event::Ime(egui::ImeEvent::Commit(_))
+                    | egui::Event::Key { pressed: true, .. }
+                    | egui::Event::PointerButton { pressed: true, .. } => return None,
+                    _ => {}
+                }
+            }
+            None
+        });
+        let Some(cancel) = cancel else {
+            return;
+        };
+        // Restore the document buffer before processing subsequent input. IME
+        // replacement text (including a replaced selection) is only provisional.
+        self.hybrid_ime_session = None;
+        egui::text_edit::TextEditState::default().store(ui.ctx(), editor_id);
+        if let Some(cursor) = self.editor_cursor {
+            let start = cursor_range_to_char_range(cursor).start;
+            self.queue_editor_selection(start..start);
+        }
+        ui.input_mut(|input| {
+            input.events.drain(..=cancel);
+        });
+    }
+
     fn apply_hybrid_cross_selection_input(
         &mut self,
         ui: &mut Ui,
@@ -327,6 +377,7 @@ impl EditorSurface {
         effects: &mut EditorOutput,
     ) {
         normalize_editor_input_line_endings(ui);
+        self.finish_leading_ime_cancel(ui, document);
         self.prepare_hybrid_navigation(ui, document, options);
         if has_leading_select_all(ui, self.editor_widget_id) {
             let blocks = document.blocks().to_vec();

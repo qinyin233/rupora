@@ -1,6 +1,65 @@
 use super::*;
 
 #[test]
+fn ime_cancel_preserves_following_input_and_history() {
+    for empty_preedit in [false, true] {
+        for batched in [false, true] {
+            for selection in [1..1, 1..3] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = app_at(directory.path(), "A中文B", selection.clone());
+                let ctx = Context::default();
+                frame(&mut app, &ctx, true, vec![]);
+                frame(
+                    &mut app,
+                    &ctx,
+                    true,
+                    vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "ni".into(),
+                        active_range_chars: Some(0..2),
+                    })],
+                );
+                assert_eq!(app.session[0].content, "A中文B");
+                let cancel = if empty_preedit {
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: String::new(),
+                        active_range_chars: None,
+                    })
+                } else {
+                    egui::Event::Ime(egui::ImeEvent::Commit(String::new()))
+                };
+                let events = vec![
+                    cancel,
+                    egui::Event::Text("🙂".into()),
+                    key(Key::Enter, egui::Modifiers::NONE),
+                    egui::Event::Text("新".into()),
+                ];
+                if batched {
+                    frame(&mut app, &ctx, true, events);
+                } else {
+                    for event in events {
+                        frame(&mut app, &ctx, true, vec![event]);
+                    }
+                }
+                let expected = "A🙂\n\n新中文B";
+                assert_eq!(
+                    app.session[0].content, expected,
+                    "batched={batched}, selection={selection:?}"
+                );
+                assert_eq!(app.active_selection(0), 5..5);
+                while app.session[0].can_undo() {
+                    app.undo_active();
+                }
+                assert_eq!(app.session[0].content, "A中文B");
+                while app.session[0].can_redo() {
+                    app.redo_active();
+                }
+                assert_eq!(app.session[0].content, expected);
+            }
+        }
+    }
+}
+
+#[test]
 fn full_audit_chaotic_input_history_restores_unicode_and_markdown_exactly() {
     for original in [
         "FIRST 中文🙂\n\nTAIL",
