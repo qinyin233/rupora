@@ -1,6 +1,62 @@
 use super::*;
 
 #[test]
+fn indented_code_enter_preserves_literal_text_and_undo() {
+    for indent in ["    ", "\t", "      "] {
+        for shift in [false, true] {
+            for batched in [false, true] {
+                let source = format!("前文\n\n{indent}中文🙂XYZ\n{indent}**literal**\n\n后文");
+                let at = 4 + indent.chars().count() + 2;
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = app_at(directory.path(), &source, at..at);
+                let ctx = Context::default();
+                install_fonts(&ctx);
+                frame(&mut app, &ctx, true, vec![]);
+                let events = vec![
+                    key(
+                        Key::Enter,
+                        egui::Modifiers {
+                            shift,
+                            ..Default::default()
+                        },
+                    ),
+                    egui::Event::Text("新".into()),
+                ];
+                if batched {
+                    frame(&mut app, &ctx, true, events);
+                } else {
+                    for event in events {
+                        frame(&mut app, &ctx, true, vec![event]);
+                    }
+                }
+                let expected =
+                    format!("前文\n\n{indent}中文\n{indent}新🙂XYZ\n{indent}**literal**\n\n后文");
+                assert_eq!(
+                    app.session[0].content, expected,
+                    "indent={indent:?}, shift={shift}, batched={batched}"
+                );
+                let caret = at + 2 + indent.chars().count();
+                assert_eq!(app.active_selection(0), caret..caret);
+                assert_eq!(
+                    markdown::render_html_fragment(&expected)
+                        .matches("<pre><code>")
+                        .count(),
+                    1
+                );
+                while app.session[0].can_undo() {
+                    app.undo_active();
+                }
+                assert_eq!(app.session[0].content, source);
+                while app.session[0].can_redo() {
+                    app.redo_active();
+                }
+                assert_eq!(app.session[0].content, expected);
+            }
+        }
+    }
+}
+
+#[test]
 fn document_edge_navigation_types_inside_fenced_code() {
     for fence in ["```rust", "~~~text"] {
         let closer = &fence[..3];

@@ -976,6 +976,29 @@ pub fn complete_visual_enter(
     }
 }
 
+pub(crate) fn complete_indented_code_on_enter(
+    original: &str,
+    source: &mut String,
+    selection: Range<usize>,
+) -> Option<Range<usize>> {
+    if !matches!(
+        Parser::new_ext(original, parser_options()).next(),
+        Some(Event::Start(Tag::CodeBlock(CodeBlockKind::Indented)))
+    ) {
+        return None;
+    }
+    let cursor = char_to_byte(source, selection.end);
+    let newline = newline_start_before_cursor(source, cursor)?;
+    let line_start = source[..newline].rfind(['\r', '\n']).map_or(0, |at| at + 1);
+    let indent = source[line_start..newline]
+        .chars()
+        .take_while(|c| matches!(c, ' ' | '\t'))
+        .collect::<String>();
+    source.insert_str(cursor, &indent);
+    let added = indent.chars().count();
+    Some(selection.start + added..selection.end + added)
+}
+
 pub fn complete_fenced_code_on_enter(
     source: &mut String,
     selection: Range<usize>,

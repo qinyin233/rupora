@@ -9,8 +9,9 @@ use crate::{
     rendering::*,
     wysiwyg::{
         VisualProjection, complete_bare_fenced_code_after_typing, complete_fenced_code_on_enter,
-        complete_visual_enter, consume_paired_fenced_code_closer, fenced_code_content,
-        fenced_code_language, move_across_hidden_inline_code_boundary, paragraph_after_fenced_code,
+        complete_indented_code_on_enter, complete_visual_enter, consume_paired_fenced_code_closer,
+        fenced_code_content, fenced_code_language, move_across_hidden_inline_code_boundary,
+        paragraph_after_fenced_code,
     },
 };
 use eframe::egui::{

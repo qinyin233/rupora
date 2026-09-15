@@ -191,7 +191,13 @@ impl EditorSurface {
             return false;
         };
         if enter {
-            if !shift
+            if let Some(selection) = complete_indented_code_on_enter(
+                original,
+                &mut update.source,
+                update.selection.clone(),
+            ) {
+                update.selection = selection;
+            } else if !shift
                 && let Some(selection) =
                     complete_fenced_code_on_enter(&mut update.source, update.selection.clone())
             {
@@ -1066,7 +1072,9 @@ impl EditorSurface {
                                                     )
                                                 {
                                                     if focused && input_action.enter {
-                                                        if !input_action.shift
+                                                        if let Some(selection) = complete_indented_code_on_enter(&original_block, &mut update.source, update.selection.clone()) {
+                                                            update.selection = selection;
+                                                        } else if !input_action.shift
                                                             && let Some(selection) =
                                                                 complete_fenced_code_on_enter(
                                                                     &mut update.source,
