@@ -1034,6 +1034,51 @@ pub fn complete_fenced_code_on_enter(
     Some(selection)
 }
 
+pub(crate) fn complete_setext_heading_on_enter(
+    original: &str,
+    source: &mut String,
+    selection: Range<usize>,
+) -> Option<Range<usize>> {
+    let (Event::Start(Tag::Heading { .. }), heading) = Parser::new_ext(original, parser_options())
+        .into_offset_iter()
+        .next()?
+    else {
+        return None;
+    };
+    let end = original[..heading.end].trim_end_matches(['\r', '\n']).len();
+    let underline_start = original[..end].rfind(['\r', '\n'])? + 1;
+    let underline = &original[underline_start..end];
+    let marker = underline.trim();
+    if underline_start <= heading.start
+        || marker.is_empty()
+        || !(marker.bytes().all(|byte| byte == b'-') || marker.bytes().all(|byte| byte == b'='))
+    {
+        return None;
+    }
+    let separator = line_break_before_byte(original, underline_start)?;
+    let tail = &original[separator.start..];
+    // Only relocate an unchanged underline after an edit in the heading body.
+    if !source.ends_with(tail) {
+        return None;
+    }
+    let selection = complete_visual_enter(source, selection, false);
+    let cursor = char_to_byte(source, selection.end);
+    let Some(split) = source[..cursor].rfind("\n\n") else {
+        return Some(selection);
+    };
+    let old_underline = source.len() - tail.len();
+    if split >= old_underline || source[..split].trim().is_empty() {
+        return Some(selection);
+    }
+    // Inline spans have now been closed/reopened around the paragraph break.
+    // Keep the original underline with the preceding heading, not its tail.
+    source.replace_range(old_underline..old_underline + end - separator.start, "");
+    let suffix = format!("\n{underline}");
+    source.insert_str(split, &suffix);
+    let added = suffix.chars().count();
+    Some(selection.start + added..selection.end + added)
+}
+
 /// Turns a freshly typed bare fence into an immediately editable code block.
 ///
 /// A visual editor cannot leave the cursor on Markdown's hidden info-string

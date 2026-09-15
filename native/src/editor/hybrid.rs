@@ -6,10 +6,10 @@ impl EditorSurface {
         let Some(editor_id) = self.editor_widget_id else {
             return;
         };
-        if !self
+        if self
             .hybrid_ime_session
             .as_ref()
-            .is_some_and(|session| session.document_id == document.id())
+            .is_none_or(|session| session.document_id != document.id())
             || ui.memory(|memory| memory.focused()) != Some(editor_id)
         {
             return;
@@ -196,6 +196,14 @@ impl EditorSurface {
                 &mut update.source,
                 update.selection.clone(),
             ) {
+                update.selection = selection;
+            } else if !shift
+                && let Some(selection) = complete_setext_heading_on_enter(
+                    original,
+                    &mut update.source,
+                    update.selection.clone(),
+                )
+            {
                 update.selection = selection;
             } else if !shift
                 && let Some(selection) =
@@ -1073,6 +1081,8 @@ impl EditorSurface {
                                                 {
                                                     if focused && input_action.enter {
                                                         if let Some(selection) = complete_indented_code_on_enter(&original_block, &mut update.source, update.selection.clone()) {
+                                                            update.selection = selection;
+                                                        } else if !input_action.shift && let Some(selection) = complete_setext_heading_on_enter(&original_block, &mut update.source, update.selection.clone()) {
                                                             update.selection = selection;
                                                         } else if !input_action.shift
                                                             && let Some(selection) =

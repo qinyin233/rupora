@@ -1,6 +1,63 @@
 use super::*;
 
 #[test]
+fn setext_heading_enter_keeps_heading_level_and_history() {
+    for underline in ["---", "===", "   ----  "] {
+        for (body, cursor, expected_body) in [
+            ("中文🙂", 3, "中文🙂"),
+            ("中文🙂后文", 3, "中文🙂"),
+            ("**中文**", 3, "**中**"),
+            ("甲\n中文🙂", 5, "甲\n中文🙂"),
+        ] {
+            for batched in [false, true] {
+                let source = format!("{body}\n{underline}\n\n后段");
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = app_at(directory.path(), &source, cursor..cursor);
+                let ctx = Context::default();
+                install_fonts(&ctx);
+                frame(&mut app, &ctx, true, vec![]);
+                let events = vec![
+                    key(Key::Enter, egui::Modifiers::NONE),
+                    egui::Event::Text("新".into()),
+                ];
+                if batched {
+                    frame(&mut app, &ctx, true, events);
+                } else {
+                    for event in events {
+                        frame(&mut app, &ctx, true, vec![event]);
+                    }
+                }
+                let html = markdown::render_html_fragment(&app.session[0].content);
+                let heading_html =
+                    markdown::render_html_fragment(&format!("{expected_body}\n{underline}"));
+                assert!(
+                    html.starts_with(&heading_html),
+                    "source={source:?}, actual={:?}, html={html:?}",
+                    app.session[0].content
+                );
+                assert!(html.contains("新"));
+                assert!(html.ends_with("<p>后段</p>\n"));
+                assert!(!html.contains("<hr>"));
+                let before_cursor =
+                    char_to_byte(&app.session[0].content, app.active_selection(0).start);
+                assert!(app.session[0].content[..before_cursor].ends_with('新'));
+                while app.session[0].can_undo() {
+                    app.undo_active();
+                }
+                assert_eq!(app.session[0].content, source);
+                while app.session[0].can_redo() {
+                    app.redo_active();
+                }
+                assert!(
+                    markdown::render_html_fragment(&app.session[0].content)
+                        .starts_with(&heading_html)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn indented_code_enter_preserves_literal_text_and_undo() {
     for indent in ["    ", "\t", "      "] {
         for shift in [false, true] {
