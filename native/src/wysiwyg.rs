@@ -48,6 +48,13 @@ struct AtomicVisualRange {
 struct InlineWrapper {
     visual: Range<usize>,
     source: Range<usize>,
+    content: Range<usize>,
+}
+
+struct PendingInlineWrapper {
+    visual_start: usize,
+    source_start: usize,
+    content: Option<Range<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,6 +270,9 @@ impl VisualProjection {
                     }
                 }
                 Event::End(tag) => {
+                    if tag == TagEnd::Image {
+                        builder.record_inline_content(range.clone());
+                    }
                     if matches!(
                         tag,
                         TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link
@@ -483,8 +493,13 @@ impl VisualProjection {
         }
 
         let mut output = source.to_owned();
-        output.replace_range(source_start..source_end, replacement);
-        let delta = replacement.len() as isize - (source_end - source_start) as isize;
+        let retained = self.retained_inline_syntax(&change.old, source_start..source_end);
+        let mut inserted = replacement.to_owned();
+        for range in &retained {
+            inserted.push_str(&source[range.clone()]);
+        }
+        output.replace_range(source_start..source_end, &inserted);
+        let delta = inserted.len() as isize - (source_end - source_start) as isize;
         let mut start_byte = self.edited_source_byte(
             edited,
             selection.start,
@@ -501,6 +516,16 @@ impl VisualProjection {
             source_end,
             delta,
         );
+        if !retained.is_empty() {
+            // Keep the insertion caret before the retained closing/opening
+            // syntax, rather than counting hidden markers as inserted text.
+            if selection.start == change.new.end {
+                start_byte = source_start + replacement.len();
+            }
+            if selection.end == change.new.end {
+                end_byte = source_start + replacement.len();
+            }
+        }
         let repair_bytes = self.repair_inline_flanking_boundaries(
             source,
             edited,
@@ -528,6 +553,35 @@ impl VisualProjection {
             selection: output[..start_byte].chars().count()..output[..end_byte].chars().count(),
             source: output,
         })
+    }
+
+    fn retained_inline_syntax(
+        &self,
+        changed: &Range<usize>,
+        removed: Range<usize>,
+    ) -> Vec<Range<usize>> {
+        let mut ranges = Vec::new();
+        for wrapper in &self.inline_wrappers {
+            let syntax = if wrapper.visual.start < changed.start
+                && changed.start < wrapper.visual.end
+                && wrapper.visual.end <= changed.end
+            {
+                wrapper.content.end..wrapper.source.end
+            } else if changed.start <= wrapper.visual.start
+                && wrapper.visual.start < changed.end
+                && changed.end < wrapper.visual.end
+            {
+                wrapper.source.start..wrapper.content.start
+            } else {
+                continue;
+            };
+            let intersection = syntax.start.max(removed.start)..syntax.end.min(removed.end);
+            if !intersection.is_empty() {
+                ranges.push(intersection);
+            }
+        }
+        ranges.sort_by_key(|range| range.start);
+        ranges
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1276,7 +1330,7 @@ struct ProjectionBuilder {
     source_boundaries: Vec<usize>,
     runs: Vec<VisualRun>,
     atomic_ranges: Vec<AtomicVisualRange>,
-    inline_wrapper_stack: Vec<(usize, usize)>,
+    inline_wrapper_stack: Vec<PendingInlineWrapper>,
     inline_wrappers: Vec<InlineWrapper>,
 }
 
@@ -1401,8 +1455,22 @@ impl ProjectionBuilder {
     }
 
     fn begin_inline_wrapper(&mut self, source_start: usize) {
-        self.inline_wrapper_stack
-            .push((self.char_count(), source_start));
+        self.inline_wrapper_stack.push(PendingInlineWrapper {
+            visual_start: self.char_count(),
+            source_start,
+            content: None,
+        });
+    }
+
+    fn record_inline_content(&mut self, range: Range<usize>) {
+        if let Some(wrapper) = self.inline_wrapper_stack.last_mut() {
+            if let Some(content) = &mut wrapper.content {
+                content.start = content.start.min(range.start);
+                content.end = content.end.max(range.end);
+            } else {
+                wrapper.content = Some(range);
+            }
+        }
     }
 
     fn append_source_line_breaks_until(
@@ -1438,14 +1506,24 @@ impl ProjectionBuilder {
     }
 
     fn end_inline_wrapper(&mut self, source_end: usize) {
-        let Some((visual_start, source_start)) = self.inline_wrapper_stack.pop() else {
+        let Some(PendingInlineWrapper {
+            visual_start,
+            source_start,
+            content,
+        }) = self.inline_wrapper_stack.pop()
+        else {
             return;
         };
+        self.record_inline_content(source_start..source_end);
         let visual_end = self.char_count();
-        if visual_start < visual_end && source_start < source_end {
+        if visual_start < visual_end
+            && source_start < source_end
+            && let Some(content) = content
+        {
             self.inline_wrappers.push(InlineWrapper {
                 visual: visual_start..visual_end,
                 source: source_start..source_end,
+                content,
             });
         }
     }
@@ -1564,6 +1642,7 @@ impl ProjectionBuilder {
         range: Range<usize>,
         style: VisualStyle,
     ) {
+        self.record_inline_content(range.clone());
         if rendered.is_empty() {
             return;
         }
@@ -1750,6 +1829,7 @@ impl ProjectionBuilder {
         source_range: Range<usize>,
         style: VisualStyle,
     ) {
+        self.record_inline_content(source_range.clone());
         if rendered.is_empty() {
             self.set_current_boundary(source_range.end);
             return;
@@ -2224,6 +2304,65 @@ fn shift_index(index: usize, delta: isize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_inline_deletions_preserve_hidden_syntax_on_both_sides() {
+        for (source, selected, expected) in [
+            ("**中文🙂** XYZ", 2..4, "**中文**XYZ"),
+            ("X**中🙂文**YZ", 0..2, "**🙂文**YZ"),
+            ("*中文🙂* XYZ", 2..4, "*中文*XYZ"),
+            ("~~中文🙂~~ XYZ", 2..4, "~~中文~~XYZ"),
+            ("`中文🙂`XYZ", 2..4, "`中文`YZ"),
+            ("[中文🙂](foo.md)XYZ", 2..4, "[中文](foo.md)YZ"),
+            ("X[中文🙂](foo.md)YZ", 0..2, "[文🙂](foo.md)YZ"),
+            ("**甲*乙丙***尾", 2..4, "**甲*乙***"),
+            ("**甲*乙丙***尾", 1..4, "**甲**"),
+            ("前**甲*乙丙***", 0..3, "***丙***"),
+            ("**甲乙***丙丁*", 1..3, "**甲***丁*"),
+        ] {
+            let projection = VisualProjection::from_markdown(source);
+            let mut text = projection.text().to_owned();
+            text.replace_range(
+                char_to_byte(&text, selected.start)..char_to_byte(&text, selected.end),
+                "",
+            );
+            let edit = projection
+                .apply_edit(source, &text, selected.start..selected.start)
+                .unwrap();
+            assert_eq!(
+                edit.source, expected,
+                "source={source:?}, projection={projection:?}, edited={text:?}"
+            );
+            assert_eq!(VisualProjection::from_markdown(&edit.source).text(), text);
+        }
+    }
+
+    #[test]
+    fn crossing_inline_replacements_keep_visible_text_and_caret() {
+        for (source, selected) in [
+            ("**甲乙**丙丁", 1..3),
+            ("前[甲乙](foo.md)后", 0..2),
+            ("**甲*乙丙***尾", 2..4),
+            ("甲`乙丙`丁", 0..2),
+        ] {
+            let projection = VisualProjection::from_markdown(source);
+            let mut text = projection.text().to_owned();
+            text.replace_range(
+                char_to_byte(&text, selected.start)..char_to_byte(&text, selected.end),
+                "新🙂文",
+            );
+            let cursor = selected.start + 3;
+            let edit = projection
+                .apply_edit(source, &text, cursor..cursor)
+                .unwrap();
+            let reparsed = VisualProjection::from_markdown(&edit.source);
+            assert_eq!(reparsed.text(), text, "source={source:?}, edit={edit:?}");
+            assert_eq!(
+                reparsed.visual_char_range(&edit.source, edit.selection),
+                cursor..cursor
+            );
+        }
+    }
 
     #[test]
     fn code_body_does_not_hide_literal_empty_format_markers_at_the_caret() {

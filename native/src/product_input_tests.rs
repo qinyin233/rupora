@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn partial_inline_delete_and_batched_backspace_keep_markup_and_history() {
+    for (source, selection, events, expected) in [
+        (
+            "**中文🙂** XYZ",
+            4..8,
+            vec![key(Key::Backspace, egui::Modifiers::NONE)],
+            "**中文**XYZ",
+        ),
+        (
+            "[中文🙂](foo.md)XYZ",
+            14..14,
+            vec![
+                key(Key::Backspace, egui::Modifiers::NONE),
+                key(Key::Backspace, egui::Modifiers::NONE),
+            ],
+            "[中文](foo.md)YZ",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_at(directory.path(), source, selection);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        frame(&mut app, &ctx, true, vec![]);
+        frame(&mut app, &ctx, true, events);
+        assert_eq!(app.session[0].content, expected);
+        app.undo_active();
+        assert_eq!(app.session[0].content, source);
+        app.redo_active();
+        assert_eq!(app.session[0].content, expected);
+    }
+}
+
+#[test]
 fn ime_cancel_preserves_following_input_and_history() {
     for empty_preedit in [false, true] {
         for batched in [false, true] {
