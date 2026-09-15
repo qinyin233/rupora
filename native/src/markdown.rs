@@ -619,9 +619,19 @@ fn block_ranges(source: &str) -> Vec<Range<usize>> {
     for (event, range) in Parser::new_ext(body, parser_options()).into_offset_iter() {
         let range = range.start + body_start..range.end + body_start;
         match event {
-            Event::Start(_) => {
+            Event::Start(tag) => {
                 if depth == 0 {
-                    block_start = Some(range.start);
+                    // The parser starts indented code after its first line's
+                    // indentation. Keep that syntax when the block is parsed
+                    // independently by the preview and hybrid editor.
+                    let start = if matches!(tag, Tag::CodeBlock(CodeBlockKind::Indented)) {
+                        source[..range.start]
+                            .rfind(['\r', '\n'])
+                            .map_or(body_start, |offset| offset + 1)
+                    } else {
+                        range.start
+                    };
+                    block_start = Some(start);
                 }
                 depth += 1;
             }
@@ -1564,6 +1574,28 @@ fn is_local_link(destination: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indented_code_block_ranges_preserve_standalone_parsing() {
+        for prefix in ["", "前文\n\n", "---\ntitle: test\n---\n\n"] {
+            for indent in ["    ", "\t", "  \t", "     "] {
+                for newline in ["\n", "\r\n"] {
+                    let code = format!("{indent}**中文🙂**{newline}{indent}[x](secret.md)");
+                    let source = format!("{prefix}{code}{newline}{newline}后文");
+                    let blocks = blocks(&source);
+                    let block = blocks
+                        .iter()
+                        .find(|block| source[block.range.clone()].contains("**中文🙂**"))
+                        .unwrap();
+                    assert_eq!(&source[block.range.clone()], code, "source={source:?}");
+                    assert_eq!(
+                        render_html_fragment(&source[block.range.clone()]),
+                        render_html_fragment(&code)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn full_audit_toc_markers_inside_raw_html_remain_literal() {

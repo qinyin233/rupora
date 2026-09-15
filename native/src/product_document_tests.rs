@@ -87,6 +87,72 @@ fn product_painted_text(output: &egui::FullOutput) -> String {
 }
 
 #[test]
+fn product_document_indented_code_stays_literal_in_both_reading_canvases() {
+    for hybrid in [false, true] {
+        for active_code in [false, true] {
+            for indent in ["    ", "\t"] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = product_app(directory.path());
+                app.new_document();
+                let source = format!("前文\n\n{indent}**中文🙂**\n{indent}[x](secret.md)\n\n后文");
+                app.session[0].content = source.clone();
+                app.session[0].update_after_edit();
+                if active_code {
+                    let caret = source[..source.find("中文").unwrap()].chars().count();
+                    app.queue_editor_selection(caret..caret);
+                }
+                let context = Context::default();
+                install_fonts(&context);
+                let output = context.run_ui(egui::RawInput::default(), |ui| {
+                    if hybrid {
+                        app.hybrid_pane(ui, 0);
+                    } else {
+                        app.preview_pane(ui, 0, None);
+                    }
+                });
+                let painted = product_painted_text(&output);
+                assert!(
+                    painted.contains("**中文🙂**"),
+                    "hybrid={hybrid}, active={active_code}: {painted:?}"
+                );
+                assert!(
+                    painted.contains("[x](secret.md)"),
+                    "hybrid={hybrid}, active={active_code}: {painted:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn product_document_indented_code_unicode_edit_and_undo_preserve_source() {
+    for indent in ["    ", "\t"] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = product_app(directory.path());
+        app.new_document();
+        let source = format!("前文\n\n{indent}**中文🙂**\n{indent}[x](secret.md)\n\n后文");
+        app.session[0].content = source.clone();
+        app.session[0].update_after_edit();
+        let start = source[..source.find("中文🙂").unwrap()].chars().count();
+        app.queue_editor_selection(start..start + 3);
+        let context = Context::default();
+        install_fonts(&context);
+        product_frame(&mut app, &context, true, vec![]);
+        product_frame(
+            &mut app,
+            &context,
+            true,
+            vec![egui::Event::Text("替换😀".to_owned())],
+        );
+        assert_eq!(app.session[0].content, source.replace("中文🙂", "替换😀"));
+        app.undo_active();
+        assert_eq!(app.session[0].content, source);
+        app.redo_active();
+        assert_eq!(app.session[0].content, source.replace("中文🙂", "替换😀"));
+    }
+}
+
+#[test]
 fn product_document_tab_selection_undo_redo_and_save_are_isolated() {
     for hybrid in [false, true] {
         let directory = tempfile::tempdir().unwrap();
