@@ -426,7 +426,8 @@ fn wysiwyg_text_edit_keeps_source_cursor_when_markers_become_hidden() {
             modifiers: Modifiers::NONE,
         }],
     );
-    update.selection = complete_visual_enter(&mut update.source, update.selection, false);
+    update.selection =
+        crate::wysiwyg::complete_visual_enter(&mut update.source, update.selection, false);
     assert_eq!(update.source, "# ATX 标题\n\n");
     update = type_frame(&context, id, &update.source, update.selection, "下一行");
     assert_eq!(update.source, "# ATX 标题\n\n下一行");

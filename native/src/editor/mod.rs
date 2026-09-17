@@ -2,16 +2,15 @@
 //! External effects are returned to the shell after document edits have committed.
 use crate::{
     document::{Document, EditKind},
-    editing::{self, MarkdownCommand, char_to_byte},
+    editing::{self, MarkdownCommand, char_to_byte, line_break_before},
     editor_buffer::{TrackingTextBuffer, set_accessible_label},
     markdown::{self, BlockId},
     presentation::*,
     rendering::*,
     wysiwyg::{
-        VisualProjection, complete_bare_fenced_code_after_typing, complete_fenced_code_on_enter,
-        complete_indented_code_on_enter, complete_setext_heading_on_enter, complete_visual_enter,
+        VisualProjection, complete_bare_fenced_code_after_typing, complete_block_enter,
         consume_paired_fenced_code_closer, fenced_code_content, fenced_code_language,
-        move_across_hidden_inline_code_boundary, paragraph_after_fenced_code,
+        is_fenced_code_block, move_across_hidden_inline_code_boundary, paragraph_after_fenced_code,
     },
 };
 use eframe::egui::{

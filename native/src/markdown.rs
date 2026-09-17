@@ -5,9 +5,7 @@ use std::{
     path::Path,
 };
 
-use pulldown_cmark::{
-    CodeBlockKind, CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd, html,
-};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd, html};
 use sha2::{Digest as _, Sha256};
 
 const MAX_MATH_BYTES: usize = 16 * 1024;
@@ -245,8 +243,23 @@ pub fn parser_options() -> Options {
 }
 
 pub fn analyze(source: &str) -> MarkdownAnalysis {
+    MarkdownAnalysis {
+        headings: parse_headings(source)
+            .into_iter()
+            .map(|(heading, _)| heading)
+            .collect(),
+        characters: source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .count(),
+        words: source.split_whitespace().count(),
+        lines: source.bytes().filter(|byte| *byte == b'\n').count() + 1,
+    }
+}
+
+fn parse_headings(source: &str) -> Vec<(Heading, Option<String>)> {
     let mut headings = Vec::new();
-    let mut current_heading: Option<(HeadingLevel, usize, String)> = None;
+    let mut current_heading: Option<(Heading, Option<String>)> = None;
     let mut line_scan_offset = 0usize;
     let (body, mut line_at_scan_offset) = parse_front_matter(source).map_or((source, 1), |front| {
         (
@@ -261,14 +274,21 @@ pub fn analyze(source: &str) -> MarkdownAnalysis {
 
     for (event, range) in Parser::new_ext(body, parser_options()).into_offset_iter() {
         match event {
-            Event::Start(Tag::Heading { level, .. }) => {
+            Event::Start(Tag::Heading { level, id, .. }) => {
                 debug_assert!(range.start >= line_scan_offset);
                 line_at_scan_offset += body.as_bytes()[line_scan_offset..range.start]
                     .iter()
                     .filter(|byte| **byte == b'\n')
                     .count();
                 line_scan_offset = range.start;
-                current_heading = Some((level, line_at_scan_offset, String::new()));
+                current_heading = Some((
+                    Heading {
+                        level: level as u8,
+                        line: line_at_scan_offset,
+                        text: String::new(),
+                    },
+                    id.map(CowStr::into_string),
+                ));
             }
             Event::Text(text)
             | Event::Code(text)
@@ -276,62 +296,37 @@ pub fn analyze(source: &str) -> MarkdownAnalysis {
             | Event::DisplayMath(text)
                 if current_heading.is_some() =>
             {
-                if let Some((_, _, heading_text)) = current_heading.as_mut() {
-                    heading_text.push_str(&text);
+                if let Some((heading, _)) = current_heading.as_mut() {
+                    heading.text.push_str(&text);
                 }
             }
             Event::SoftBreak | Event::HardBreak if current_heading.is_some() => {
-                if let Some((_, _, heading_text)) = current_heading.as_mut() {
-                    heading_text.push(' ');
+                if let Some((heading, _)) = current_heading.as_mut() {
+                    heading.text.push(' ');
                 }
             }
             Event::End(TagEnd::Heading(_)) => {
-                if let Some((level, line, text)) = current_heading.take() {
-                    headings.push(Heading {
-                        level: heading_level(level),
-                        text,
-                        line,
-                    });
+                if let Some(heading) = current_heading.take() {
+                    headings.push(heading);
                 }
             }
             _ => {}
         }
     }
 
-    MarkdownAnalysis {
-        headings,
-        characters: source
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .count(),
-        words: source.split_whitespace().count(),
-        lines: if source.is_empty() {
-            1
-        } else {
-            source.bytes().filter(|byte| *byte == b'\n').count() + 1
-        },
-    }
+    headings
 }
 
 pub fn heading_anchors(source: &str) -> Vec<HeadingAnchor> {
     let mut occurrences = HashMap::<String, usize>::new();
-    let headings = analyze(source).headings;
-    let body = parse_front_matter(source).map_or(source, |front| &source[front.body_start..]);
-    let explicit_ids = Parser::new_ext(body, parser_options())
-        .filter_map(|event| match event {
-            Event::Start(Tag::Heading { id, .. }) => Some(id.map(CowStr::into_string)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let reserved = explicit_ids
+    let headings = parse_headings(source);
+    let reserved = headings
         .iter()
-        .flatten()
-        .cloned()
+        .filter_map(|(_, id)| id.clone())
         .collect::<HashSet<_>>();
     let mut used = HashSet::new();
     headings
         .into_iter()
-        .zip(explicit_ids)
         .map(|(heading, explicit_id)| {
             let base = explicit_id
                 .clone()
@@ -414,10 +409,6 @@ pub fn mermaid_blocks(source: &str) -> Vec<MermaidBlock> {
     blocks
 }
 
-pub fn prepare_preview_markdown(source: &str) -> String {
-    expand_front_matter_and_toc(source)
-}
-
 pub fn front_matter_preview_markdown(front_matter: &FrontMatter) -> String {
     let mut output = String::from("> **文档元数据**\n");
     for (key, value) in &front_matter.fields {
@@ -488,23 +479,6 @@ pub fn render_html_fragment(source: &str) -> String {
     restore_generated_html(&output, &token_prefix, &generated)
 }
 
-pub fn local_link_destinations(source: &str) -> Vec<String> {
-    let mut destinations = Parser::new_ext(source, parser_options())
-        .filter_map(|event| match event {
-            Event::Start(Tag::Link { dest_url, .. }) => Some(dest_url.into_string()),
-            _ => None,
-        })
-        .filter(|destination| is_local_link(destination))
-        .collect::<Vec<_>>();
-    destinations.sort();
-    destinations.dedup();
-    destinations
-}
-
-pub fn link_destination_at(source: &str, source_byte: usize) -> Option<String> {
-    link_destination_with_references(source, source_byte, &Default::default())
-}
-
 pub fn link_destination_with_references(
     source: &str,
     source_byte: usize,
@@ -532,10 +506,6 @@ pub fn toggle_task_marker_at(source: &str, source_byte: usize) -> Option<String>
     Some(output)
 }
 
-pub fn is_local_link_destination(destination: &str) -> bool {
-    is_local_link(destination)
-}
-
 pub fn local_image_destinations(source: &str) -> Vec<String> {
     let mut destinations = Parser::new_ext(source, parser_options())
         .filter_map(|event| match event {
@@ -550,7 +520,7 @@ pub fn local_image_destinations(source: &str) -> Vec<String> {
 }
 
 fn is_local_image_destination(destination: &str) -> bool {
-    if is_local_link(destination) {
+    if is_local_link_destination(destination) {
         return true;
     }
     let path = destination.split(['?', '#']).next().unwrap_or_default();
@@ -560,26 +530,6 @@ fn is_local_image_destination(destination: &str) -> bool {
         && bytes[1] == b':'
         && matches!(bytes[2], b'/' | b'\\');
     Path::new(path).is_absolute() || windows_absolute
-}
-
-pub fn synchronize_task_markers(source: &str, rendered_markdown: &str) -> Option<String> {
-    let source_markers = task_markers(source);
-    let rendered_states = task_markers(rendered_markdown)
-        .into_iter()
-        .map(|(_, checked)| checked)
-        .collect::<Vec<_>>();
-    if source_markers.len() != rendered_states.len() {
-        return None;
-    }
-    let mut output = source.to_owned();
-    let mut changed = false;
-    for ((range, before), after) in source_markers.into_iter().zip(rendered_states).rev() {
-        if before != after {
-            output.replace_range(range, if after { "[x]" } else { "[ ]" });
-            changed = true;
-        }
-    }
-    changed.then_some(output)
 }
 
 pub fn blocks(source: &str) -> Vec<MarkdownBlock> {
@@ -1046,7 +996,7 @@ fn similarity_score(left: &str, right: &str) -> usize {
     prefix + suffix
 }
 
-fn expand_front_matter_and_toc(source: &str) -> String {
+pub fn prepare_preview_markdown(source: &str) -> String {
     let (front_matter, body) = if let Some(front_matter) = parse_front_matter(source) {
         let body = &source[front_matter.body_start..];
         (Some(front_matter), body)
@@ -1227,7 +1177,7 @@ fn yaml_value_text(value: &serde_yaml_ng::Value) -> String {
 }
 
 fn render_html_with_generated(source: &str, dark: bool) -> (String, String, Vec<String>) {
-    let expanded = expand_front_matter_and_toc(source);
+    let expanded = prepare_preview_markdown(source);
     let anchors = heading_anchors(&expanded);
     let mut heading_index = 0usize;
     let token_prefix = generated_html_token_prefix(&expanded);
@@ -1541,17 +1491,6 @@ fn sanitize_user_html(html: &str) -> String {
     builder.clean(html).to_string()
 }
 
-fn heading_level(level: HeadingLevel) -> u8 {
-    match level {
-        HeadingLevel::H1 => 1,
-        HeadingLevel::H2 => 2,
-        HeadingLevel::H3 => 3,
-        HeadingLevel::H4 => 4,
-        HeadingLevel::H5 => 5,
-        HeadingLevel::H6 => 6,
-    }
-}
-
 fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1559,7 +1498,7 @@ fn escape_html(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn is_local_link(destination: &str) -> bool {
+pub fn is_local_link_destination(destination: &str) -> bool {
     let bytes = destination.as_bytes();
     let windows_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
     if destination.is_empty() || destination.starts_with(['#', '/', '\\']) || windows_drive {
@@ -1743,16 +1682,6 @@ mod tests {
     }
 
     #[test]
-    fn synchronizes_preview_task_changes_back_to_the_source() {
-        let source = "- [ ] first\n- [x] second\n";
-        let rendered = "> metadata\n\n- [x] first\n- [ ] second\n";
-        assert_eq!(
-            synchronize_task_markers(source, rendered).unwrap(),
-            "- [x] first\n- [ ] second\n"
-        );
-    }
-
-    #[test]
     fn parses_yaml_front_matter_and_hides_it_from_the_document_body() {
         let source = "---\ntitle: Native Rust\ntags: [editor, markdown]\n---\n# Body\n";
         let front_matter = parse_front_matter(source).unwrap();
@@ -1822,14 +1751,14 @@ mod tests {
     #[test]
     fn toc_expansion_uses_parsed_code_block_ranges() {
         let source = "    ```\n    [TOC]\n\n[TOC]\n\n# Real heading\n";
-        let expanded = expand_front_matter_and_toc(source);
+        let expanded = prepare_preview_markdown(source);
 
         assert!(expanded.starts_with("    ```\n    [TOC]\n"));
         assert_eq!(expanded.matches("[TOC]").count(), 1);
         assert_eq!(expanded.matches("[Real heading](#real-heading)").count(), 1);
 
         let fenced = "```text\n[TOC]\n```\n\n[TOC]\n\n# Outside\n";
-        let expanded = expand_front_matter_and_toc(fenced);
+        let expanded = prepare_preview_markdown(fenced);
         assert!(expanded.starts_with("```text\n[TOC]\n```"));
         assert_eq!(expanded.matches("[TOC]").count(), 1);
         assert!(expanded.contains("[Outside](#outside)"));
@@ -1855,7 +1784,7 @@ mod tests {
         for index in 0..1_024 {
             source.push_str(&format!("# Repeated table heading number {index}\n\n"));
         }
-        let expanded = expand_front_matter_and_toc(&source);
+        let expanded = prepare_preview_markdown(&source);
         assert!(expanded.contains(TOC_LIMIT_MARKDOWN.trim()));
         assert!(
             expanded.len()
@@ -1973,15 +1902,20 @@ mod tests {
     }
 
     #[test]
-    fn collects_only_relative_document_links() {
-        let links = local_link_destinations(
-            "[local](notes/today.md) [anchor](#part) [web](https://example.com) \
-             [mail](mailto:test@example.com) [local anchor](other.md#section)",
-        );
-        assert_eq!(links, vec!["notes/today.md", "other.md#section"]);
-        assert!(!is_local_link(r"C:\notes\a.md"));
-        assert!(!is_local_link(r"\\server\share\a.md"));
-        assert!(!is_local_link("/absolute/a.md"));
+    fn recognizes_only_relative_document_links() {
+        for destination in ["notes/today.md", "other.md#section"] {
+            assert!(is_local_link_destination(destination));
+        }
+        for destination in [
+            "#part",
+            "https://example.com",
+            "mailto:test@example.com",
+            r"C:\notes\a.md",
+            r"\\server\share\a.md",
+            "/absolute/a.md",
+        ] {
+            assert!(!is_local_link_destination(destination));
+        }
     }
 
     #[test]
@@ -1989,10 +1923,10 @@ mod tests {
         let link = "before [文档](notes/today.md) after";
         let inside = link.find("文档").unwrap();
         assert_eq!(
-            link_destination_at(link, inside).as_deref(),
+            link_destination_with_references(link, inside, &Default::default()).as_deref(),
             Some("notes/today.md")
         );
-        assert!(link_destination_at(link, 0).is_none());
+        assert!(link_destination_with_references(link, 0, &Default::default()).is_none());
 
         let tasks = "- [ ] first\n- [x] second";
         let first = tasks.find("[ ]").unwrap() + 1;

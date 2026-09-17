@@ -33,7 +33,7 @@ use crate::{
         visual_text_format,
     },
     table,
-    wysiwyg::{VisualProjection, fenced_code_language},
+    wysiwyg::{VisualProjection, fenced_code_language, is_fenced_code_block},
 };
 
 mod prepared;
@@ -138,22 +138,6 @@ impl RenderCache {
             },
         );
     }
-}
-
-pub(crate) fn is_fenced_code_block(source: &str) -> bool {
-    let first_line = source.lines().next().unwrap_or_default();
-    let indentation = first_line.bytes().take_while(|byte| *byte == b' ').count();
-    if indentation > 3 || first_line.as_bytes().get(indentation) == Some(&b'\t') {
-        return false;
-    }
-    let marker = &first_line[indentation..];
-    if marker.starts_with("~~~") {
-        return true;
-    }
-    let backticks = marker.bytes().take_while(|byte| *byte == b'`').count();
-    // CommonMark forbids backticks in a backtick fence's info string.
-    // A same-line triple-backtick code span therefore remains a paragraph.
-    backticks >= 3 && !marker[backticks..].contains('`')
 }
 
 pub(crate) fn wysiwyg_layout(
@@ -1361,6 +1345,10 @@ mod tests {
         assert!(is_fenced_code_block("   ~~~\ncode\n   ~~~"));
         assert!(!is_fenced_code_block("    ```\nnot a fence"));
         assert!(!is_fenced_code_block("\t```\nnot a fence"));
+        assert!(!is_fenced_code_block("```inline code```"));
+        assert!(!is_fenced_code_block("```lang`name\ncode"));
+        assert!(!is_fenced_code_block("``\ncode"));
+        assert!(is_fenced_code_block("~~~lang`name\r\n中文🙂"));
     }
 
     #[test]

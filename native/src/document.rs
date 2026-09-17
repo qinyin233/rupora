@@ -555,29 +555,21 @@ impl Document {
             .clone()
             .ok_or_else(|| "未命名文档没有外部版本".to_owned())?;
         let external = Self::open_unlocked(path)?;
-        let before = self.content.clone();
-        let merged = merge::three_way_merge(&self.saved_content, &self.content, &external.content);
-
-        self.content = merged.content;
-        self.saved_content = external.content;
-        self.file_fingerprint = external.file_fingerprint;
-        self.encoding = external.encoding;
-        self.line_ending = external.line_ending;
-        if !self.record_edit(before, None, None, EditKind::Other) {
-            self.update_after_edit();
-        }
-        Ok(merged.conflicts)
+        Ok(self.merge_external_document(external))
     }
 
     pub fn relink_external(&mut self, path: PathBuf) -> Result<usize, String> {
         let path = canonical_document_path(&path)?;
         let new_lock = DocumentLock::acquire(&path)?;
         let external = Self::open_unlocked(&path)?;
-        let before = self.content.clone();
-        let merged = merge::three_way_merge(&self.saved_content, &self.content, &external.content);
-
         self.path = Some(path);
         self.lock = Some(new_lock);
+        Ok(self.merge_external_document(external))
+    }
+
+    fn merge_external_document(&mut self, external: Self) -> usize {
+        let before = self.content.clone();
+        let merged = merge::three_way_merge(&self.saved_content, &self.content, &external.content);
         self.content = merged.content;
         self.saved_content = external.content;
         self.file_fingerprint = external.file_fingerprint;
@@ -586,7 +578,7 @@ impl Document {
         if !self.record_edit(before, None, None, EditKind::Other) {
             self.update_after_edit();
         }
-        Ok(merged.conflicts)
+        merged.conflicts
     }
 
     pub fn save(&mut self, overwrite_external: bool) -> Result<(), String> {

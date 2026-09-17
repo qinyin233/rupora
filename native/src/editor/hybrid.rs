@@ -191,29 +191,8 @@ impl EditorSurface {
             return false;
         };
         if enter {
-            if let Some(selection) = complete_indented_code_on_enter(
-                original,
-                &mut update.source,
-                update.selection.clone(),
-            ) {
-                update.selection = selection;
-            } else if !shift
-                && let Some(selection) = complete_setext_heading_on_enter(
-                    original,
-                    &mut update.source,
-                    update.selection.clone(),
-                )
-            {
-                update.selection = selection;
-            } else if !shift
-                && let Some(selection) =
-                    complete_fenced_code_on_enter(&mut update.source, update.selection.clone())
-            {
-                update.selection = selection;
-            } else if !is_fenced_code_block(original) {
-                update.selection =
-                    complete_visual_enter(&mut update.source, update.selection, shift);
-            }
+            update.selection =
+                complete_block_enter(original, &mut update.source, update.selection, shift);
         } else if let Some(selection) = consume_paired_fenced_code_closer(
             &mut update.source,
             update.selection.clone(),
@@ -1080,26 +1059,12 @@ impl EditorSurface {
                                                     )
                                                 {
                                                     if focused && input_action.enter {
-                                                        if let Some(selection) = complete_indented_code_on_enter(&original_block, &mut update.source, update.selection.clone()) {
-                                                            update.selection = selection;
-                                                        } else if !input_action.shift && let Some(selection) = complete_setext_heading_on_enter(&original_block, &mut update.source, update.selection.clone()) {
-                                                            update.selection = selection;
-                                                        } else if !input_action.shift
-                                                            && let Some(selection) =
-                                                                complete_fenced_code_on_enter(
-                                                                    &mut update.source,
-                                                                    update.selection.clone(),
-                                                                )
-                                                        {
-                                                            update.selection = selection;
-                                                        } else if !block_is_code {
-                                                            update.selection =
-                                                                complete_visual_enter(
-                                                                    &mut update.source,
-                                                                    update.selection,
-                                                                    input_action.shift,
-                                                                );
-                                                        }
+                                                        update.selection = complete_block_enter(
+                                                            &original_block,
+                                                            &mut update.source,
+                                                            update.selection,
+                                                            input_action.shift,
+                                                        );
                                                     }
                                                     if let Some(selection) =
                                                         consume_paired_fenced_code_closer(

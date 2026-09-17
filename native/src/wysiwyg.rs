@@ -1,8 +1,8 @@
-use crate::editing::char_to_byte;
+use crate::editing::{char_to_byte, line_break_before};
 
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 
 use crate::markdown::parser_options;
 
@@ -179,7 +179,7 @@ impl VisualProjection {
                     }
                     block_depth += 1;
                     match tag {
-                        Tag::Heading { level, .. } => format.heading = heading_level(level),
+                        Tag::Heading { level, .. } => format.heading = level as u8,
                         Tag::BlockQuote(_) => format.quote += 1,
                         Tag::CodeBlock(CodeBlockKind::Fenced(_)) => {
                             format.code += 1;
@@ -976,7 +976,29 @@ pub fn complete_visual_enter(
     }
 }
 
-pub(crate) fn complete_indented_code_on_enter(
+/// Applies the same block semantics to batched input and widget input.
+pub(crate) fn complete_block_enter(
+    original: &str,
+    source: &mut String,
+    selection: Range<usize>,
+    shift: bool,
+) -> Range<usize> {
+    if let Some(next) = complete_indented_code_on_enter(original, source, selection.clone()) {
+        next
+    } else if !shift
+        && let Some(next) = complete_setext_heading_on_enter(original, source, selection.clone())
+    {
+        next
+    } else if !shift && let Some(next) = complete_fenced_code_on_enter(source, selection.clone()) {
+        next
+    } else if is_fenced_code_block(original) {
+        selection
+    } else {
+        complete_visual_enter(source, selection, shift)
+    }
+}
+
+fn complete_indented_code_on_enter(
     original: &str,
     source: &mut String,
     selection: Range<usize>,
@@ -988,7 +1010,7 @@ pub(crate) fn complete_indented_code_on_enter(
         return None;
     }
     let cursor = char_to_byte(source, selection.end);
-    let newline = newline_start_before_cursor(source, cursor)?;
+    let newline = line_break_before(source, cursor)?.start;
     let line_start = source[..newline].rfind(['\r', '\n']).map_or(0, |at| at + 1);
     let indent = source[line_start..newline]
         .chars()
@@ -1011,7 +1033,7 @@ pub fn complete_fenced_code_on_enter(
         return None;
     }
     let before = source.get(..cursor_byte)?;
-    let newline_start = newline_start_before_cursor(source, cursor_byte)?;
+    let newline_start = line_break_before(source, cursor_byte)?.start;
     let line_start = before[..newline_start]
         .rfind(['\n', '\r'])
         .map_or(0, |index| index + 1);
@@ -1034,7 +1056,7 @@ pub fn complete_fenced_code_on_enter(
     Some(selection)
 }
 
-pub(crate) fn complete_setext_heading_on_enter(
+fn complete_setext_heading_on_enter(
     original: &str,
     source: &mut String,
     selection: Range<usize>,
@@ -1055,7 +1077,7 @@ pub(crate) fn complete_setext_heading_on_enter(
     {
         return None;
     }
-    let separator = line_break_before_byte(original, underline_start)?;
+    let separator = line_break_before(original, underline_start)?;
     let tail = &original[separator.start..];
     // Only relocate an unchanged underline after an edit in the heading body.
     if !source.ends_with(tail) {
@@ -1129,7 +1151,7 @@ pub fn consume_paired_fenced_code_closer(
     let duplicate_start = source[..duplicate_end]
         .rfind(['\n', '\r'])
         .map_or(0, |index| index + 1);
-    let duplicate_break = line_break_before_byte(source, duplicate_start)?;
+    let duplicate_break = line_break_before(source, duplicate_start)?;
     let typed_end = duplicate_break.start;
     let typed_start = source[..typed_end]
         .rfind(['\n', '\r'])
@@ -1207,6 +1229,11 @@ pub fn fenced_code_language(source: &str) -> Option<&str> {
     (!info.is_empty()).then_some(info)
 }
 
+pub(crate) fn is_fenced_code_block(source: &str) -> bool {
+    parse_fence_line(source.lines().next().unwrap_or_default())
+        .is_some_and(|(_, _, length, _)| length >= 3)
+}
+
 /// Returns only the editable body of a complete fenced code block.
 ///
 /// The opening/closing markers and the structural line break immediately
@@ -1230,7 +1257,7 @@ pub fn fenced_code_content(source: &str) -> Option<&str> {
             && info.is_empty()
         {
             let content_end = if line_start > body_start {
-                line_break_before_byte(source, line_start)
+                line_break_before(source, line_start)
                     .filter(|line_break| line_break.start >= body_start)
                     .map_or(line_start, |line_break| line_break.start)
             } else {
@@ -1279,9 +1306,10 @@ pub fn move_across_hidden_inline_code_boundary(
 
 fn ensure_hard_break_before_cursor(source: &mut String, cursor: usize) -> usize {
     let cursor_byte = char_to_byte(source, cursor);
-    let Some(newline_start) = newline_start_before_cursor(source, cursor_byte) else {
+    let Some(newline) = line_break_before(source, cursor_byte) else {
         return 0;
     };
+    let newline_start = newline.start;
     if source[..newline_start].ends_with('\\') {
         return 0;
     }
@@ -1307,34 +1335,13 @@ fn ensure_hard_break_before_cursor(source: &mut String, cursor: usize) -> usize 
 
 fn has_hard_break_before_cursor(source: &str, cursor: usize) -> bool {
     let cursor_byte = char_to_byte(source, cursor);
-    let Some(newline_start) = newline_start_before_cursor(source, cursor_byte) else {
+    let Some(newline) = line_break_before(source, cursor_byte) else {
         return false;
     };
+    let newline_start = newline.start;
     let line_start = source[..newline_start].rfind('\n').map_or(0, |at| at + 1);
     !source[line_start..newline_start].trim().is_empty()
         && (source[..newline_start].ends_with("  ") || source[..newline_start].ends_with('\\'))
-}
-
-fn newline_start_before_cursor(source: &str, cursor_byte: usize) -> Option<usize> {
-    let before = source.get(..cursor_byte)?;
-    if before.ends_with("\r\n") {
-        Some(cursor_byte - 2)
-    } else if before.ends_with(['\n', '\r']) {
-        Some(cursor_byte - 1)
-    } else {
-        None
-    }
-}
-
-fn line_break_before_byte(source: &str, byte_index: usize) -> Option<Range<usize>> {
-    let before = source.get(..byte_index)?;
-    if before.ends_with("\r\n") {
-        Some(byte_index - 2..byte_index)
-    } else if before.ends_with(['\n', '\r']) {
-        Some(byte_index - 1..byte_index)
-    } else {
-        None
-    }
 }
 
 fn parse_fence_line(line: &str) -> Option<(&str, char, usize, &str)> {
@@ -2330,17 +2337,6 @@ fn marker_style(format: FormatState) -> VisualStyle {
     let mut style = format.visual();
     style.marker = true;
     style
-}
-
-fn heading_level(level: HeadingLevel) -> u8 {
-    match level {
-        HeadingLevel::H1 => 1,
-        HeadingLevel::H2 => 2,
-        HeadingLevel::H3 => 3,
-        HeadingLevel::H4 => 4,
-        HeadingLevel::H5 => 5,
-        HeadingLevel::H6 => 6,
-    }
 }
 
 fn push_run(runs: &mut Vec<VisualRun>, range: Range<usize>, style: VisualStyle) {

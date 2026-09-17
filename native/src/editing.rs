@@ -843,6 +843,18 @@ pub(crate) fn char_to_byte(text: &str, char_index: usize) -> usize {
         .map_or(text.len(), |(byte_index, _)| byte_index)
 }
 
+/// Finds the complete line break ending at a UTF-8 byte boundary.
+pub(crate) fn line_break_before(source: &str, byte_index: usize) -> Option<Range<usize>> {
+    let before = source.get(..byte_index)?;
+    if before.ends_with("\r\n") {
+        Some(byte_index - 2..byte_index)
+    } else if before.ends_with(['\n', '\r']) {
+        Some(byte_index - 1..byte_index)
+    } else {
+        None
+    }
+}
+
 fn byte_range_to_char_range(text: &str, range: Range<usize>) -> Range<usize> {
     text[..range.start].chars().count()..text[..range.end].chars().count()
 }
@@ -850,6 +862,19 @@ fn byte_range_to_char_range(text: &str, range: Range<usize>) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_break_boundaries_preserve_unicode_and_all_supported_newlines() {
+        for newline in ["\n", "\r", "\r\n"] {
+            let source = format!("中文🙂{newline}后文");
+            let start = "中文🙂".len();
+            let end = start + newline.len();
+            assert_eq!(line_break_before(&source, end), Some(start..end));
+            for invalid in [0, 1, start, end + 1, source.len(), source.len() + 1] {
+                assert_eq!(line_break_before(&source, invalid), None);
+            }
+        }
+    }
 
     #[test]
     fn inline_code_command_preserves_backticks_spaces_and_can_be_toggled_off() {

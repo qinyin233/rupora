@@ -190,11 +190,7 @@ impl RuporaApp {
         if !startup_files.is_empty() {
             app.open_paths(startup_files);
         } else {
-            let recovered_active = app
-                .session
-                .active_index()
-                .and_then(|index| app.session.documents().get(index))
-                .map(Document::id);
+            let recovered_active = app.session.active_id();
             let session_files = app
                 .session
                 .restorable_files(app.state.session_files.iter().cloned());
@@ -210,11 +206,7 @@ impl RuporaApp {
                 {
                     app.activate_document(index);
                 } else if let Some(recovered_active) = recovered_active
-                    && let Some(index) = app
-                        .session
-                        .documents()
-                        .iter()
-                        .position(|document| document.id() == recovered_active)
+                    && let Some(index) = app.session.index_of(recovered_active)
                 {
                     app.activate_document(index);
                 }
@@ -965,11 +957,11 @@ impl RuporaApp {
             self.status = "已有扩展服务正在运行".to_owned();
             return;
         }
-        let Some(document) = self.session.active_index() else {
+        let Some(document) = self.session.active() else {
             self.status = "没有可交给扩展的活动文档".to_owned();
             return;
         };
-        let request = self.session[document].snapshot();
+        let request = document.snapshot();
         self.status = match self.background.start_extension(service_index, request) {
             Ok(name) => format!("正在运行扩展“{name}”…"),
             Err(error) => error,
@@ -1739,10 +1731,7 @@ impl RuporaApp {
 
     fn top_bar(&mut self, root: &mut Ui) {
         let palette = app_palette(self.state.dark);
-        let document = self
-            .session
-            .active_index()
-            .map(|index| &self.session[index]);
+        let document = self.session.active();
         let title = document
             .map(Document::title)
             .unwrap_or_else(|| "RUPORA".to_owned());
@@ -1886,11 +1875,7 @@ impl RuporaApp {
                 if ui.button("另存为 UTF-8…").clicked() {
                     self.execute(AppCommand::SaveAsUtf8);
                 }
-                let can_undo = self
-                    .session
-                    .active_index()
-                    .and_then(|index| self.session.documents().get(index))
-                    .is_some_and(Document::can_undo);
+                let can_undo = self.session.active().is_some_and(Document::can_undo);
                 if ui
                     .add_enabled(can_undo, Button::new("撤销"))
                     .on_hover_text("Ctrl+Z")
@@ -1898,11 +1883,7 @@ impl RuporaApp {
                 {
                     self.execute(AppCommand::Undo);
                 }
-                let can_redo = self
-                    .session
-                    .active_index()
-                    .and_then(|index| self.session.documents().get(index))
-                    .is_some_and(Document::can_redo);
+                let can_redo = self.session.active().is_some_and(Document::can_redo);
                 if ui
                     .add_enabled(can_redo, Button::new("重做"))
                     .on_hover_text("Ctrl+Shift+Z / Ctrl+Y")
@@ -1937,7 +1918,7 @@ impl RuporaApp {
                             if ui
                                 .add_enabled(
                                     !self.background.extension_running()
-                                        && self.session.active_index().is_some(),
+                                        && self.session.active_id().is_some(),
                                     Button::new(name),
                                 )
                                 .clicked()
@@ -2052,8 +2033,8 @@ impl RuporaApp {
                         }
                         let anchors = self
                             .session
-                            .active_index()
-                            .map(|index| markdown::heading_anchors(&self.session[index].content))
+                            .active()
+                            .map(|document| markdown::heading_anchors(&document.content))
                             .unwrap_or_default();
                         ui.menu_button("交叉引用", |ui| {
                             Self::compact_menu_contents(ui, "references-menu-scroll", |ui| {
@@ -2443,7 +2424,7 @@ impl RuporaApp {
                         );
                         ui.add_space(8.0);
                         for (index, document) in self.session.documents().iter().enumerate() {
-                            let selected = self.session.active_index() == Some(index);
+                            let selected = self.session.active_id() == Some(document.id());
                             let row = egui::Frame::new()
                                 .fill(if selected {
                                     palette.surface
@@ -2588,8 +2569,8 @@ impl RuporaApp {
                             });
                             let active_path = self
                                 .session
-                                .active_index()
-                                .and_then(|index| self.session[index].path.as_deref());
+                                .active()
+                                .and_then(|document| document.path.as_deref());
                             open_path = workspace_entries_ui(ui, &workspace.entries, active_path);
                         } else if app_action_button(
                             ui,
@@ -2664,8 +2645,7 @@ impl RuporaApp {
         }
         let headings = self
             .session
-            .active_index()
-            .and_then(|index| self.session.documents().get(index))
+            .active()
             .map(|document| document.analysis.headings.clone())
             .unwrap_or_default();
 
@@ -2993,8 +2973,7 @@ impl RuporaApp {
     fn status_bar(&mut self, root: &mut Ui) {
         let document_info = self
             .session
-            .active_index()
-            .and_then(|index| self.session.documents().get(index))
+            .active()
             .map(|document| {
                 format!(
                     "{} 字符 · {} 词 · {} 行 · {} · {}",
@@ -3157,8 +3136,7 @@ impl eframe::App for RuporaApp {
             .collect();
         self.state.active_session_file = self
             .session
-            .active_index()
-            .and_then(|index| self.session.documents().get(index))
+            .active()
             .and_then(|document| document.path.clone());
         eframe::set_value(storage, APP_STATE_KEY, &self.state);
         eframe::set_value(storage, UI_EXPERIENCE_KEY, &CURRENT_UI_EXPERIENCE);

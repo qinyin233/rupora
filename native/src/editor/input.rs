@@ -259,17 +259,6 @@ pub(super) fn source_selection_after_visual_input(
     projection.source_char_range(source, visual_selection)
 }
 
-pub(super) fn line_break_before(source: &str, byte_index: usize) -> Option<std::ops::Range<usize>> {
-    let before = source.get(..byte_index)?;
-    if before.ends_with("\r\n") {
-        Some(byte_index - 2..byte_index)
-    } else if before.ends_with(['\n', '\r']) {
-        Some(byte_index - 1..byte_index)
-    } else {
-        None
-    }
-}
-
 pub(super) fn boundary_backspace_edit(
     source: &str,
     edit_range: std::ops::Range<usize>,
