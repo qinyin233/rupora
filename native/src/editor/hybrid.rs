@@ -246,6 +246,15 @@ impl EditorSurface {
             else {
                 break;
             };
+            if matches!(
+                key,
+                Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown
+            ) {
+                // A newly focused TextEdit has not installed its focus filter
+                // yet. Keep raw arrow navigation from also focusing a nearby
+                // control (such as the code-copy button) after this frame.
+                ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+            }
             let Some(cursor) = self.pending_editor_cursor.or(self.editor_cursor) else {
                 break;
             };
@@ -339,7 +348,100 @@ impl EditorSurface {
                 });
                 continue;
             }
-            let Some(target) = target else {
+            let next = if let Some(target) = target {
+                if modifiers.shift {
+                    CCursorRange {
+                        primary: CCursor::new(target),
+                        secondary: cursor.secondary,
+                        h_pos: None,
+                    }
+                } else {
+                    CCursorRange::one(CCursor::new(target))
+                }
+            } else if !cross
+                && self.hybrid_ime_session.is_none()
+                && matches!(
+                    key,
+                    Key::ArrowLeft
+                        | Key::ArrowRight
+                        | Key::ArrowUp
+                        | Key::ArrowDown
+                        | Key::Home
+                        | Key::End
+                )
+                && ui.input(|input| {
+                    input.events[event_index + 1..].iter().any(|event| {
+                        matches!(
+                            event,
+                            egui::Event::Key {
+                                key: Key::Enter,
+                                pressed: true,
+                                ..
+                            }
+                        )
+                    })
+                })
+            {
+                // A following Enter must see this navigation's source cursor
+                // before widgets consume the batch. Reuse TextEdit's movement
+                // rules with the same projection and content width.
+                let text = &source[block.range.clone()];
+                let start = source[..block.range.start].chars().count();
+                let local = cursor_range_saturating_sub(cursor, start);
+                let local_selection = cursor_range_to_char_range(local);
+                let projection = VisualProjection::from_markdown_with_context(
+                    text,
+                    Some(local_selection.clone()),
+                    references,
+                );
+                let palette = app_palette(options.dark);
+                let width = (document_page_layout(ui.available_width(), ui.available_height())
+                    .content_width
+                    - hybrid_editor_frame(text, palette).total_margin().sum().x)
+                    .max(0.0);
+                let galley = if is_fenced_code_block(text) {
+                    syntax_highlighted_code_layout(
+                        ui,
+                        projection.text(),
+                        width,
+                        palette,
+                        fenced_code_language(text),
+                    )
+                } else {
+                    wysiwyg_layout(ui, projection.text(), &projection, width, palette, true)
+                };
+                let visual_selection = projection.visual_char_range(text, local_selection.clone());
+                let mut visual = cursor_range_with_direction(visual_selection.clone(), local);
+                visual.primary.prefer_next_row = local.primary.prefer_next_row;
+                visual.secondary.prefer_next_row = local.secondary.prefer_next_row;
+                visual.h_pos = local.h_pos;
+                visual.on_key_press(ui.ctx().os(), &galley, &modifiers, key);
+                let source_selection = modifiers
+                    .is_none()
+                    .then(|| {
+                        move_across_hidden_inline_code_boundary(
+                            text,
+                            local_selection.clone(),
+                            key == Key::ArrowLeft,
+                            key == Key::ArrowRight,
+                        )
+                    })
+                    .flatten()
+                    .unwrap_or_else(|| {
+                        source_selection_after_visual_input(
+                            &projection,
+                            text,
+                            Some(&local_selection),
+                            Some(&visual_selection),
+                            cursor_range_to_char_range(visual),
+                        )
+                    });
+                let mut next = cursor_range_with_direction(source_selection, visual);
+                next.primary.prefer_next_row = visual.primary.prefer_next_row;
+                next.secondary.prefer_next_row = visual.secondary.prefer_next_row;
+                next.h_pos = visual.h_pos;
+                cursor_range_add(next, start)
+            } else {
                 break;
             };
             ui.input_mut(|input| {
@@ -349,18 +451,7 @@ impl EditorSurface {
             // The arrow has moved the document caret; do not also focus a
             // neighboring preview when the new editor is first created.
             ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
-            let next = if modifiers.shift {
-                CCursorRange {
-                    primary: CCursor::new(target),
-                    secondary: cursor.secondary,
-                    h_pos: None,
-                }
-            } else {
-                CCursorRange::one(CCursor::new(target))
-            };
-            self.queue_editor_selection(cursor_range_to_char_range(next));
-            self.editor_cursor = Some(next);
-            self.pending_editor_cursor = Some(next);
+            self.select_cursor(next);
         }
     }
 
@@ -622,27 +713,7 @@ impl EditorSurface {
                                             let code_language =
                                                 fenced_code_language(&original_block)
                                                     .map(str::to_owned);
-                                            let block_is_table =
-                                                is_native_table_block(&original_block);
-                                            let block_is_quote =
-                                                is_native_quote_block(&original_block);
-                                            let frame = if block_is_code {
-                                                code_block_frame(palette)
-                                            } else if block_is_table {
-                                                egui::Frame::new()
-                                                    .fill(palette.code_bg.gamma_multiply(0.38))
-                                                    .stroke(Stroke::new(1.0, palette.border))
-                                                    .corner_radius(8)
-                                                    .inner_margin(Margin::symmetric(14, 9))
-                                            } else if block_is_quote {
-                                                egui::Frame::new()
-                                                    .fill(palette.accent_soft.gamma_multiply(0.42))
-                                                    .stroke(Stroke::new(1.0, palette.border))
-                                                    .corner_radius(6)
-                                                    .inner_margin(Margin::symmetric(14, 9))
-                                            } else {
-                                                egui::Frame::new()
-                                            };
+                                            let frame = hybrid_editor_frame(&original_block, palette);
                                             let mut pending_scroll_rect = None;
                                             if !block_is_code {
                                                 ui.add_space(6.0);
@@ -1509,5 +1580,25 @@ impl EditorSurface {
         }
         self.hybrid_ime_session = ime_session;
         self.finish_history_action(document, effects);
+    }
+}
+
+fn hybrid_editor_frame(source: &str, palette: AppPalette) -> egui::Frame {
+    if is_fenced_code_block(source) {
+        code_block_frame(palette)
+    } else if is_native_table_block(source) {
+        egui::Frame::new()
+            .fill(palette.code_bg.gamma_multiply(0.38))
+            .stroke(Stroke::new(1.0, palette.border))
+            .corner_radius(8)
+            .inner_margin(Margin::symmetric(14, 9))
+    } else if is_native_quote_block(source) {
+        egui::Frame::new()
+            .fill(palette.accent_soft.gamma_multiply(0.42))
+            .stroke(Stroke::new(1.0, palette.border))
+            .corner_radius(6)
+            .inner_margin(Margin::symmetric(14, 9))
+    } else {
+        egui::Frame::new()
     }
 }

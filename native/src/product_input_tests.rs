@@ -1,6 +1,148 @@
 use super::*;
 
 #[test]
+fn navigation_then_enter_in_one_frame_matches_separate_frames() {
+    let mut failures = Vec::new();
+    for (source, cursor) in [
+        ("- 中文🙂后文", 5),
+        ("正文🙂后文", 4),
+        ("1. 中文🙂后文", 6),
+        ("`中文🙂`", 4),
+        ("`中文🙂`", 5),
+    ] {
+        for navigation in [Key::ArrowLeft, Key::ArrowRight, Key::Home] {
+            let events = vec![
+                key(navigation, egui::Modifiers::NONE),
+                key(Key::Enter, egui::Modifiers::NONE),
+                egui::Event::Text("新".into()),
+            ];
+            let directory = tempfile::tempdir().unwrap();
+            let mut separate = app_at(directory.path(), source, cursor..cursor);
+            let separate_ctx = Context::default();
+            frame(&mut separate, &separate_ctx, true, vec![]);
+            for event in &events {
+                frame(&mut separate, &separate_ctx, true, vec![event.clone()]);
+            }
+            let mut batched = app_at(directory.path(), source, cursor..cursor);
+            let batched_ctx = Context::default();
+            frame(&mut batched, &batched_ctx, true, vec![]);
+            frame(&mut batched, &batched_ctx, true, events);
+            if separate.session[0].content != batched.session[0].content {
+                failures.push(format!(
+                    "source={source:?} key={navigation:?} separate={:?} batched={:?}",
+                    separate.session[0].content, batched.session[0].content
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn code_block_arrow_navigation_retains_new_editor_focus() {
+    for body in ["中文🙂后文", "first row\n中文🙂后文\nlast row"] {
+        for selection_length in [0, 2] {
+            let source = format!("```rust\n{body}\n```");
+            let at = source[..source.find("中文").unwrap()].chars().count() + 2;
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_at(directory.path(), &source, at..at + selection_length);
+            let ctx = Context::default();
+            frame(&mut app, &ctx, true, vec![]);
+            let editor = app.editor_surface.widget_id().unwrap();
+            frame(
+                &mut app,
+                &ctx,
+                true,
+                vec![key(Key::ArrowUp, egui::Modifiers::NONE)],
+            );
+            assert_eq!(
+                ctx.memory(|memory| memory.focused()),
+                Some(editor),
+                "body={body:?} selection_length={selection_length}"
+            );
+            frame(&mut app, &ctx, true, vec![egui::Event::Text("新".into())]);
+            assert!(app.session[0].content.contains('新'));
+            app.undo_active();
+            assert_eq!(app.session[0].content, source);
+        }
+    }
+}
+
+#[test]
+fn navigation_then_enter_preserves_selection_direction_and_history() {
+    let shift = egui::Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    for source in [
+        "- 中文🙂后文 e\u{301}尾".to_owned(),
+        "> 中文🙂后文 e\u{301}尾".to_owned(),
+        "```rust\nfirst row\n中文🙂后文 e\u{301}尾\nlast row\n```".to_owned(),
+        format!("{}中文🙂后文", "wrapped words ".repeat(18)),
+    ] {
+        let at = source[..source.find("中文").unwrap()].chars().count() + 2;
+        for reverse in [false, true] {
+            for navigation in [
+                vec![key(Key::ArrowLeft, shift), key(Key::ArrowLeft, shift)],
+                vec![key(Key::ArrowRight, shift), key(Key::ArrowLeft, shift)],
+                vec![key(Key::Home, shift)],
+                vec![key(Key::End, egui::Modifiers::NONE)],
+                vec![key(Key::ArrowUp, egui::Modifiers::NONE)],
+                vec![key(Key::ArrowDown, egui::Modifiers::NONE)],
+            ] {
+                let mut events = navigation.clone();
+                events.push(key(Key::Enter, egui::Modifiers::NONE));
+                events.push(egui::Event::Text("新🙂".into()));
+                let directory = tempfile::tempdir().unwrap();
+                let mut outcomes = Vec::new();
+                for batched in [false, true] {
+                    let mut app = app_at(directory.path(), &source, at..at + 2);
+                    if reverse {
+                        app.editor_surface.select_cursor(egui::text::CCursorRange {
+                            primary: CCursor::new(at),
+                            secondary: CCursor::new(at + 2),
+                            h_pos: None,
+                        });
+                    }
+                    let ctx = Context::default();
+                    frame(&mut app, &ctx, true, vec![]);
+                    if batched {
+                        frame(&mut app, &ctx, true, events.clone());
+                    } else {
+                        for event in &events {
+                            frame(&mut app, &ctx, true, vec![event.clone()]);
+                        }
+                    }
+                    let edited = app.session[0].content.clone();
+                    let selection = app.active_selection(0);
+                    assert!(
+                        edited.contains("新🙂"),
+                        "source={source:?} reverse={reverse} navigation={navigation:?} batched={batched} actual={edited:?}"
+                    );
+                    let mut undo_count = 0;
+                    while app.session[0].can_undo() {
+                        app.undo_active();
+                        undo_count += 1;
+                        assert!(undo_count <= 8);
+                    }
+                    assert_eq!(app.session[0].content, source);
+                    for _ in 0..undo_count {
+                        app.redo_active();
+                    }
+                    assert_eq!(app.session[0].content, edited);
+                    assert_eq!(app.active_selection(0), selection);
+                    outcomes.push((edited, selection));
+                }
+                assert_eq!(
+                    outcomes[0], outcomes[1],
+                    "source={source:?} reverse={reverse} navigation={navigation:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn setext_heading_enter_keeps_heading_level_and_history() {
     for underline in ["---", "===", "   ----  "] {
         for (body, cursor, expected_body) in [
