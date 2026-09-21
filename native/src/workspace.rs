@@ -72,6 +72,9 @@ fn scan_directory(
             *truncated = true;
             break;
         }
+        // Bound filesystem work, including entries that will not be shown.
+        // Charge directories before recursion so ancestors cannot exceed it.
+        *count += 1;
         let Ok(entry) = result else {
             continue;
         };
@@ -91,7 +94,6 @@ fn scan_directory(
             let children =
                 scan_child_directory(&path, depth + 1, count, truncated, skipped_directories);
             if !children.is_empty() {
-                *count += 1;
                 entries.push(WorkspaceEntry {
                     name,
                     path,
@@ -100,7 +102,6 @@ fn scan_directory(
                 });
             }
         } else if metadata.is_file() && is_markdown_path(&path) {
-            *count += 1;
             entries.push(WorkspaceEntry {
                 name,
                 path,
@@ -207,5 +208,87 @@ mod tests {
         );
         assert!(entries.is_empty());
         assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn unsupported_files_and_empty_directories_consume_the_scan_budget() {
+        for empty_directories in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            for index in 0..3 {
+                let path = directory.path().join(format!("entry-{index}.png"));
+                if empty_directories {
+                    fs::create_dir(path).unwrap();
+                } else {
+                    fs::write(path, "image").unwrap();
+                }
+            }
+            let mut count = MAX_ENTRIES - 2;
+            let mut truncated = false;
+            let mut skipped = 0;
+            let entries = scan_directory(
+                directory.path(),
+                0,
+                &mut count,
+                &mut truncated,
+                &mut skipped,
+            )
+            .unwrap();
+            assert!(entries.is_empty());
+            assert_eq!(count, MAX_ENTRIES);
+            assert!(truncated);
+            assert_eq!(skipped, 0);
+        }
+    }
+
+    #[test]
+    fn a_subtree_without_markdown_consumes_the_shared_scan_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let images = directory.path().join("images");
+        fs::create_dir(&images).unwrap();
+        for index in 0..3 {
+            fs::write(images.join(format!("image-{index}.png")), "image").unwrap();
+        }
+        let mut count = MAX_ENTRIES - 3;
+        let mut truncated = false;
+        let mut skipped = 0;
+        let entries = scan_directory(
+            directory.path(),
+            0,
+            &mut count,
+            &mut truncated,
+            &mut skipped,
+        )
+        .unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(count, MAX_ENTRIES);
+        assert!(truncated);
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn ancestors_do_not_exceed_the_scan_budget_after_the_last_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let notes = directory.path().join("notes");
+        fs::create_dir(&notes).unwrap();
+        fs::write(notes.join("last.md"), "# last").unwrap();
+        for remaining in [1, 2] {
+            let mut count = MAX_ENTRIES - remaining;
+            let mut truncated = false;
+            let mut skipped = 0;
+            let entries = scan_directory(
+                directory.path(),
+                0,
+                &mut count,
+                &mut truncated,
+                &mut skipped,
+            )
+            .unwrap();
+            assert_eq!(count, MAX_ENTRIES);
+            assert_eq!(truncated, remaining == 1);
+            assert_eq!(entries.len(), usize::from(remaining == 2));
+            if remaining == 2 {
+                assert_eq!(entries[0].children[0].name, "last.md");
+            }
+        }
     }
 }
