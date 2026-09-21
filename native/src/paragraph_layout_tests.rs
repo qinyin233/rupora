@@ -120,6 +120,13 @@ fn paragraph_click_keeps_text_and_following_block_positions() {
         "# FIRST heading".into(),
         "> FIRST quote".into(),
         "- FIRST item\n- Second item".into(),
+        "    FIRST code\n    continuation".into(),
+        "```\nFIRST code\ncontinuation\n```".into(),
+        "~~~rust\nFIRST code\ncontinuation\n~~~".into(),
+        "FIRST line\r\nsoft continuation.".into(),
+        "| FIRST | Column |\n| --- | --- |\n| Cell | Cell |".into(),
+        "- FIRST item\n  - Nested item\n- Final item".into(),
+        "> FIRST line\n>\n> Next paragraph".into(),
     ] {
         for breaks in [2, 3, 4] {
             let directory = tempfile::tempdir().unwrap();

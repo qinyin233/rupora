@@ -1584,6 +1584,49 @@ mod tests {
     }
 
     #[test]
+    fn rendered_unicode_glyphs_map_back_to_their_source_after_wrapping() {
+        let context = Context::default();
+        install_fonts(&context);
+        for source in [
+            "before `中文🙂abc` after",
+            "# Header 中文🙂 xyz",
+            "> Quote 中文🙂 xyz",
+            "- List 中文🙂 xyz",
+            "```rust\nlet 中文🙂xyz = 1;\n```",
+            "normal words words words words 中文🙂xyz end",
+        ] {
+            let _ = context.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_width(150.0);
+                let preview = show_native_block_preview(
+                    ui,
+                    source,
+                    Path::new("."),
+                    false,
+                    &mut HashMap::new(),
+                    app_palette(false),
+                );
+                let NativePointerMapping::Text(text) = &preview.mapping else {
+                    panic!("expected text projection");
+                };
+                let at = text.projection.text().find("🙂").unwrap();
+                let visual = text.projection.text()[..at].chars().count() + 1;
+                let position = text.galley_pos
+                    + text
+                        .galley
+                        .pos_from_cursor(CCursor::new(visual))
+                        .center()
+                        .to_vec2();
+                let expected = source.find("🙂").unwrap() + "🙂".len();
+                assert_eq!(
+                    text.source_byte_at_position(source, position),
+                    expected,
+                    "{source}"
+                );
+            });
+        }
+    }
+
+    #[test]
     fn native_task_checkbox_hit_maps_to_the_source_marker() {
         use egui::RawInput;
 

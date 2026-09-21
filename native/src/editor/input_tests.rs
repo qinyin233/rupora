@@ -4,6 +4,63 @@ use super::*;
 use eframe::egui::Context;
 
 #[test]
+fn cross_block_ime_commit_keeps_following_text_and_history() {
+    let source = "甲🙂首段\n\n乙尾段";
+    let context = Context::default();
+    let mut document = Document::untitled(1);
+    document.content = source.to_owned();
+    document.update_after_edit();
+    let mut editor = EditorSurface::default();
+    editor.queue_editor_selection(1..7);
+    let frame = |editor: &mut EditorSurface, document: &mut Document, events| {
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                editor.show(
+                    ui,
+                    document,
+                    EditorOptions {
+                        mode: ViewMode::Hybrid,
+                        dark: false,
+                        base_path: Path::new("."),
+                    },
+                );
+            },
+        );
+    };
+    frame(&mut editor, &mut document, vec![]);
+    frame(
+        &mut editor,
+        &mut document,
+        vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "xin".into(),
+            active_range_chars: Some(0..3),
+        })],
+    );
+    assert_eq!(document.content, source, "preedit must remain provisional");
+    frame(
+        &mut editor,
+        &mut document,
+        vec![
+            egui::Event::Ime(egui::ImeEvent::Commit("新".into())),
+            egui::Event::Text("!".into()),
+        ],
+    );
+    assert_eq!(document.content, "甲新!尾段");
+    while document.can_undo() {
+        document.undo();
+    }
+    assert_eq!(document.content, source);
+}
+
+#[test]
 fn calculates_safe_split_scroll_ratios() {
     assert_eq!(
         scroll_ratio(PaneScroll {
