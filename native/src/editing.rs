@@ -762,7 +762,7 @@ fn toggle_code_block(text: &mut String, selection: Range<usize>) -> Range<usize>
             }
             let body_start = syntax.start + opening_end + 1;
             let body_end = if closing_start > body_start {
-                closing_start - 1
+                line_break_before(text, closing_start)?.start
             } else {
                 body_start
             };
@@ -1326,6 +1326,30 @@ mod tests {
                 ),
                 "the selected Markdown must remain a valid link label: {source:?}",
             );
+        }
+    }
+
+    #[test]
+    fn code_block_removal_preserves_unicode_body_for_each_line_ending() {
+        for newline in ["\n", "\r\n"] {
+            for fence in ["```rust", "~~~text"] {
+                for body in [
+                    String::new(),
+                    "中文🙂".to_owned(),
+                    format!("中文🙂{newline}第二行"),
+                ] {
+                    let closer = &fence[..3];
+                    let mut source = format!("{fence}{newline}{body}{newline}{closer}");
+                    let start = fence.chars().count() + newline.len();
+                    let selected = apply_markdown_command(
+                        &mut source,
+                        start..start + body.chars().count(),
+                        MarkdownCommand::CodeBlock,
+                    );
+                    assert_eq!(source, body, "newline={newline:?} fence={fence}");
+                    assert_eq!(selected, 0..body.chars().count());
+                }
+            }
         }
     }
 
