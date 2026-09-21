@@ -1,6 +1,104 @@
 use rupora::wysiwyg::VisualProjection;
 
 #[test]
+fn long_backslash_runs_keep_escape_pairs_editable() {
+    for count in [1, 2, 3, 31, 32, 32_768] {
+        let source = format!("前 {}* 后", "\\".repeat(count));
+        let projection = VisualProjection::from_markdown(&source);
+        assert_eq!(
+            projection.text(),
+            format!("前 {}* 后", "\\".repeat(count / 2))
+        );
+        let punctuation = 2 + count / 2;
+        assert_eq!(
+            projection.source_char_range(&source, punctuation..punctuation + 1),
+            2 + count - count % 2..3 + count
+        );
+        let edited = format!("前 {} 后", "\\".repeat(count / 2));
+        let update = projection
+            .apply_edit(&source, &edited, punctuation..punctuation)
+            .unwrap();
+        assert_eq!(
+            update.source,
+            format!("前 {} 后", "\\".repeat(count - count % 2))
+        );
+        if count >= 2 {
+            assert_eq!(projection.source_char_range(&source, 2..3), 2..4);
+        }
+    }
+}
+
+#[test]
+fn replacing_escaped_punctuation_does_not_leave_an_escape_behind() {
+    for punctuation in (b'!'..=b'~')
+        .filter(u8::is_ascii_punctuation)
+        .map(char::from)
+    {
+        let source = format!("前 \\{punctuation} 后");
+        let projection = VisualProjection::from_markdown(&source);
+        assert_eq!(projection.text(), format!("前 {punctuation} 后"));
+        for replacement in ["", "新🙂"] {
+            let edited = format!("前 {replacement} 后");
+            let cursor = 2 + replacement.chars().count();
+            let update = projection
+                .apply_edit(&source, &edited, cursor..cursor)
+                .unwrap();
+            assert_eq!(update.source, edited, "source={source:?}");
+            assert_eq!(
+                VisualProjection::from_markdown(&update.source).text(),
+                edited
+            );
+        }
+    }
+}
+
+#[test]
+fn multiline_hidden_link_destinations_do_not_insert_visual_blank_lines() {
+    for (source, expected) in [
+        ("[中文](\nnotes.md\n)**后文**", "中文后文"),
+        ("[中文](notes.md\n\"多行标题\")*后文*", "中文后文"),
+        ("![图](\nimage.png\n)**后文**", "▧ 图后文"),
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        assert_eq!(projection.text(), expected, "source={source:?}");
+        let edited = expected.replace("后文", "新🙂");
+        let cursor = edited.chars().count();
+        let update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+        assert_eq!(update.source, source.replace("后文", "新🙂"));
+        assert_eq!(
+            VisualProjection::from_markdown(&update.source).text(),
+            edited
+        );
+    }
+}
+
+#[test]
+fn deleting_a_whole_image_removes_its_hidden_destination() {
+    for image in [
+        "![中文🙂](assets/image.png \"标题\")",
+        "![**中文🙂**](assets/image.png)",
+        "[![中文🙂](assets/image.png)](notes.md)",
+    ] {
+        let source = format!("前 {image} 后");
+        let projection = VisualProjection::from_markdown(&source);
+        assert_eq!(projection.text(), "前 ▧ 中文🙂 后");
+        let update = projection.apply_edit(&source, "前  后", 2..2).unwrap();
+        assert_eq!(update.source, "前  后");
+
+        let update = projection
+            .apply_edit(&source, "前 ▧ 中新🙂 后", 6..6)
+            .unwrap();
+        assert_eq!(update.source, source.replace("中文🙂", "中新🙂"));
+        assert_eq!(
+            VisualProjection::from_markdown(&update.source).text(),
+            "前 ▧ 中新🙂 后"
+        );
+    }
+}
+
+#[test]
 fn scheduled_fuzz_projection_crash_d39e1582() {
     // Exact input reported by Native Rust CI run 34099943888.
     let data = b".+\n  =+\n   $       b";

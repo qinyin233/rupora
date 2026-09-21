@@ -243,6 +243,7 @@ impl VisualProjection {
                             format.link += 1;
                         }
                         Tag::Image { .. } => {
+                            builder.begin_inline_wrapper(range.start);
                             format.link += 1;
                             let marker_end = source[range.clone()]
                                 .find('[')
@@ -270,14 +271,21 @@ impl VisualProjection {
                     }
                 }
                 Event::End(tag) => {
-                    if tag == TagEnd::Image {
-                        builder.record_inline_content(range.clone());
-                    }
                     if matches!(
                         tag,
-                        TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link
+                        TagEnd::Emphasis
+                            | TagEnd::Strong
+                            | TagEnd::Strikethrough
+                            | TagEnd::Link
+                            | TagEnd::Image
                     ) {
                         builder.end_inline_wrapper(range.end);
+                    }
+                    if matches!(tag, TagEnd::Link | TagEnd::Image) {
+                        // A destination or title may contain newlines. They
+                        // are hidden link syntax, not blank rows before the
+                        // next visible inline or block element.
+                        builder.set_current_boundary(range.end);
                     }
                     match tag {
                         TagEnd::Paragraph
@@ -1744,12 +1752,34 @@ impl ProjectionBuilder {
     fn append_text_with_footnote_references(
         &mut self,
         source: &str,
-        rendered: &str,
-        range: Range<usize>,
+        mut rendered: &str,
+        mut range: Range<usize>,
         style: VisualStyle,
         references: &[Range<usize>],
         source_selection: Option<&Range<usize>>,
     ) {
+        // The parser omits a backslash escape from the Text event's range.
+        // Map it with its punctuation so replacement cannot leave a stray
+        // escape behind or let that escape consume the newly inserted text.
+        // Already mapped backslashes belong to preceding escape pairs; only
+        // an unconsumed byte in the gap can escape the current punctuation.
+        if rendered
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_punctuation)
+            && source[range.clone()].starts_with(&rendered[..1])
+            && range.start > self.source_boundaries.last().copied().unwrap_or_default()
+            && source.as_bytes().get(range.start - 1) == Some(&b'\\')
+        {
+            self.append_transformed(
+                source,
+                &rendered[..1],
+                range.start - 1..range.start + 1,
+                style,
+            );
+            range.start += 1;
+            rendered = &rendered[1..];
+        }
         let first = references.partition_point(|reference| reference.end <= range.start);
         let count = references[first..].partition_point(|reference| reference.start < range.end);
         let overlapping = &references[first..first + count];
