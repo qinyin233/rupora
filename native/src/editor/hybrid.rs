@@ -117,7 +117,7 @@ impl EditorSurface {
 
     /// Apply structural input before constructing block widgets, so each Enter
     /// reparses its new paragraphs before the next event in the same frame.
-    fn apply_leading_hybrid_enter(
+    fn apply_leading_hybrid_edit(
         &mut self,
         ui: &mut Ui,
         document: &mut Document,
@@ -127,32 +127,32 @@ impl EditorSurface {
             return false;
         }
         let event = ui.input(|input| input.events[event_index].clone());
-        let (text, enter, shift) = match event {
+        let enter_follows = ui.input(|input| {
+            input.events[event_index + 1..].iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: Key::Enter,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+        });
+        match &event {
             egui::Event::Key {
                 key: Key::Enter,
                 modifiers,
                 ..
-            } if !modifiers.ctrl && !modifiers.alt && !modifiers.mac_cmd => {
-                ("\n".to_owned(), true, modifiers.shift)
-            }
-            egui::Event::Text(text) | egui::Event::Paste(text)
-                if ui.input(|input| {
-                    input.events[event_index + 1..].iter().any(|event| {
-                        matches!(
-                            event,
-                            egui::Event::Key {
-                                key: Key::Enter,
-                                pressed: true,
-                                ..
-                            }
-                        )
-                    })
-                }) =>
-            {
-                (text, false, false)
-            }
+            } if !modifiers.ctrl && !modifiers.alt && !modifiers.mac_cmd => {}
+            egui::Event::Text(_) | egui::Event::Paste(_) if enter_follows => {}
+            egui::Event::Key {
+                key: Key::Backspace | Key::Delete,
+                modifiers,
+                ..
+            } if enter_follows && modifiers.is_none() => {}
             _ => return false,
-        };
+        }
         let Some(cursor) = self.pending_editor_cursor.or(self.editor_cursor) else {
             return false;
         };
@@ -168,31 +168,137 @@ impl EditorSurface {
         let block_start = before[..block.range.start].chars().count();
         let local =
             selected.start.saturating_sub(block_start)..selected.end.saturating_sub(block_start);
+        if let egui::Event::Key {
+            key: key @ (Key::Backspace | Key::Delete),
+            ..
+        } = &event
+            && (fenced_boundary_delete_cursor(
+                &before,
+                &blocks,
+                block_index,
+                local.clone(),
+                *key == Key::Backspace,
+                *key == Key::Delete,
+            )
+            .is_some()
+                || selected.is_empty()
+                    && paragraph_boundary_delete_range(
+                        &before,
+                        &blocks,
+                        block_index,
+                        selected.start,
+                        *key,
+                    )
+                    .is_some())
+        {
+            // Keep the existing cross-block deletion rules ahead of local edits.
+            return false;
+        }
         let projection = VisualProjection::from_markdown_with_context(
             original,
             Some(local.clone()),
             document.references(),
         );
-        let visual_selection = projection.visual_char_range(original, local);
+        let visual_selection = projection.visual_char_range(original, local.clone());
         let mut visual = projection.text().to_owned();
-        let paired = (!enter)
-            .then(|| editing::apply_smart_pair(&mut visual, visual_selection.clone(), &text))
-            .flatten();
-        let selection = paired.unwrap_or_else(|| {
-            visual.replace_range(
-                char_to_byte(&visual, visual_selection.start)
-                    ..char_to_byte(&visual, visual_selection.end),
-                &text,
-            );
-            let at = visual_selection.start + text.chars().count();
-            at..at
+        let paired = if let egui::Event::Text(text) = &event {
+            editing::apply_smart_pair(&mut visual, visual_selection.clone(), text)
+        } else {
+            None
+        };
+        let linked = if let egui::Event::Paste(text) = &event
+            && !visual_selection.is_empty()
+            && !selection_intersects_code(&before, &selected)
+        {
+            let mut source = original.to_owned();
+            editing::paste_url_as_markdown_link(
+                &mut source,
+                projection.source_char_range(original, visual_selection.clone()),
+                text.trim(),
+            )
+            .map(|selection| crate::wysiwyg::VisualSourceEdit { source, selection })
+        } else {
+            None
+        };
+        let kind = if paired.is_some() || linked.is_some() {
+            EditKind::Other
+        } else {
+            EditKind::Typing
+        };
+        let selection = paired.clone().unwrap_or_else(|| {
+            if let egui::Event::Key {
+                key: key @ (Key::Backspace | Key::Delete),
+                ..
+            } = &event
+            {
+                use egui::TextBuffer as _;
+                let at = if !visual_selection.is_empty() {
+                    visual.delete_selected(&CCursorRange::two(
+                        CCursor::new(visual_selection.start),
+                        CCursor::new(visual_selection.end),
+                    ))
+                } else if *key == Key::Backspace {
+                    visual.delete_previous_char(CCursor::new(visual_selection.start))
+                } else {
+                    visual.delete_next_char(CCursor::new(visual_selection.start))
+                };
+                at.index.0..at.index.0
+            } else {
+                let text = match &event {
+                    egui::Event::Text(text) | egui::Event::Paste(text) => text.as_str(),
+                    _ => "\n",
+                };
+                visual.replace_range(
+                    char_to_byte(&visual, visual_selection.start)
+                        ..char_to_byte(&visual, visual_selection.end),
+                    text,
+                );
+                let at = visual_selection.start + text.chars().count();
+                at..at
+            }
         });
-        let Some(mut update) = projection.apply_edit(original, &visual, selection) else {
+        let Some(mut update) = linked
+            .or_else(|| projection.apply_edit(original, &visual, selection.clone()))
+            .or_else(|| {
+                // An empty/identical paste or a skipped smart closer can move
+                // the caret without changing the source text.
+                // A no-op deletion at the document edge also must leave the
+                // following Enter available. Empty code deletion is structural
+                // and stays with its existing widget handler.
+                (!matches!(
+                    event,
+                    egui::Event::Key {
+                        key: Key::Backspace | Key::Delete,
+                        ..
+                    }
+                ) || !is_fenced_code_block(original)
+                    || !projection.text().trim().is_empty())
+                .then(|| crate::wysiwyg::VisualSourceEdit {
+                    source: original.to_owned(),
+                    selection: source_selection_after_visual_input(
+                        &projection,
+                        original,
+                        Some(&local),
+                        Some(&visual_selection),
+                        selection,
+                    ),
+                })
+            })
+        else {
             return false;
         };
-        if enter {
-            update.selection =
-                complete_block_enter(original, &mut update.source, update.selection, shift);
+        if let egui::Event::Key {
+            key: Key::Enter,
+            modifiers,
+            ..
+        } = &event
+        {
+            update.selection = complete_block_enter(
+                original,
+                &mut update.source,
+                update.selection,
+                modifiers.shift,
+            );
         } else if let Some(selection) = consume_paired_fenced_code_closer(
             &mut update.source,
             update.selection.clone(),
@@ -216,7 +322,7 @@ impl EditorSurface {
         document
             .content
             .replace_range(block.range.clone(), &update.source);
-        document.record_edit(before, Some(selected), Some(next.clone()), EditKind::Typing);
+        document.record_edit(before, Some(selected), Some(next.clone()), kind);
         self.queue_editor_selection(next);
         ui.input_mut(|input| {
             input.events.remove(event_index);
@@ -238,7 +344,7 @@ impl EditorSurface {
             let Some(event_index) = leading_editor_event(ui, self.editor_widget_id) else {
                 break;
             };
-            if self.apply_leading_hybrid_enter(ui, document, event_index) {
+            if self.apply_leading_hybrid_edit(ui, document, event_index) {
                 continue;
             }
             let Some(egui::Event::Key { key, modifiers, .. }) =
@@ -1579,7 +1685,7 @@ impl EditorSurface {
             self.queue_editor_selection(char_start..char_start);
         }
         self.hybrid_ime_session = ime_session;
-        self.finish_history_action(document, effects);
+        self.finish_deferred_command(document, effects);
     }
 }
 

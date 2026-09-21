@@ -120,7 +120,7 @@ pub(crate) struct EditorSurface {
     editor_cursor: Option<CCursorRange>,
     pending_editor_cursor: Option<CCursorRange>,
     editor_widget_id: Option<egui::Id>,
-    deferred_history_action: Option<bool>,
+    deferred_command: Option<ContextCommand>,
     document_views: HashMap<u64, DocumentViewState>,
     hybrid_active: Option<(u64, BlockId)>,
     hybrid_ime_session: Option<HybridImeSession>,
@@ -167,7 +167,14 @@ impl EditorSurface {
         self.pending_editor_cursor = Some(cursor);
     }
     pub(crate) fn defer_history(&mut self, redo: bool) {
-        self.deferred_history_action = Some(redo);
+        self.deferred_command = Some(if redo {
+            ContextCommand::Redo
+        } else {
+            ContextCommand::Undo
+        });
+    }
+    pub(crate) fn defer_format(&mut self, command: MarkdownCommand) {
+        self.deferred_command = Some(ContextCommand::Format(command));
     }
     pub(crate) fn change_mode(&mut self, mode: ViewMode) {
         self.pending_editor_cursor = self.editor_cursor;
@@ -213,7 +220,7 @@ impl EditorSurface {
     pub(crate) fn bind_document(&mut self, document: Option<&Document>, fallback: EditorBookmark) {
         self.invalidate_content();
         self.editor_widget_id = None;
-        self.deferred_history_action = None;
+        self.deferred_command = None;
         self.editor_cursor = None;
         self.pending_editor_cursor = None;
         self.split_scroll_ratio = 0.0;
@@ -291,9 +298,9 @@ impl EditorSurface {
         }
         if redo { "已重做" } else { "已撤销" }
     }
-    fn finish_history_action(&mut self, document: &mut Document, output: &mut EditorOutput) {
-        if let Some(redo) = self.deferred_history_action.take() {
-            output.notice = self.apply_history(document, redo).to_owned();
+    fn finish_deferred_command(&mut self, document: &mut Document, output: &mut EditorOutput) {
+        if let Some(command) = self.deferred_command.take() {
+            self.apply_context_command(document, command, output);
         }
     }
     pub(crate) fn show(

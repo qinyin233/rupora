@@ -44,6 +44,529 @@ fn code_and_following_paragraph_rects(
 }
 use super::*;
 
+fn shortcut_editor_frame(
+    app: &mut RuporaApp,
+    ctx: &Context,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            let mut frame = Frame::_new_kittest();
+            eframe::App::logic(app, ctx, &mut frame);
+            eframe::App::ui(app, ui, &mut frame);
+        },
+    )
+}
+
+fn command_key(key: Key) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    }
+}
+
+#[test]
+fn middle_format_shortcut_keeps_input_order_in_the_same_context_run() {
+    let mut failures = Vec::new();
+    for mode in [ViewMode::Edit, ViewMode::Hybrid, ViewMode::Split] {
+        for (key, expected, caret) in [
+            (Key::B, "A中**文**B", 5),
+            (Key::I, "A中*文*B", 4),
+            (Key::K, "A中[文](https://)B", 4),
+        ] {
+            for prefix in [
+                egui::Event::Text("中".into()),
+                egui::Event::Paste("中".into()),
+                egui::Event::Ime(egui::ImeEvent::Commit("中".into())),
+            ] {
+                for batched in [false, true] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let mut app = isolated_app(directory.path());
+                    app.new_document();
+                    app.state.view_mode = mode;
+                    app.session[0].content = "AB".into();
+                    app.session[0].update_after_edit();
+                    app.queue_editor_selection(1..1);
+                    let ctx = Context::default();
+                    install_fonts(&ctx);
+                    shortcut_editor_frame(&mut app, &ctx, vec![]);
+                    let events = vec![
+                        prefix.clone(),
+                        command_key(key),
+                        egui::Event::Text("文".into()),
+                    ];
+                    if batched {
+                        let output = shortcut_editor_frame(&mut app, &ctx, events);
+                        assert_eq!(output.platform_output.num_completed_passes, 2);
+                        assert!(app.ordered_input_pass.is_none());
+                    } else {
+                        for event in events {
+                            shortcut_editor_frame(&mut app, &ctx, vec![event]);
+                        }
+                    }
+                    let actual = (&app.session[0].content, app.active_selection(0));
+                    if actual != (&expected.to_owned(), caret..caret) {
+                        failures.push(format!("mode={mode:?} key={key:?} prefix={prefix:?} batched={batched} actual={actual:?} expected={expected:?}/{caret}"));
+                    }
+                    let edited = app.session[0].content.clone();
+                    let selection = app.active_selection(0);
+                    let mut undos = 0;
+                    while app.session[0].can_undo() {
+                        app.undo_active();
+                        undos += 1;
+                        assert!(undos <= 6);
+                    }
+                    assert_eq!(app.session[0].content, "AB");
+                    for _ in 0..undos {
+                        app.redo_active();
+                    }
+                    assert_eq!(app.session[0].content, edited);
+                    assert_eq!(app.active_selection(0), selection);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn middle_format_shortcut_does_not_buffer_input_when_an_extra_pass_is_unavailable() {
+    for mode in [ViewMode::Edit, ViewMode::Hybrid, ViewMode::Split] {
+        for multiple_commands in [false, true] {
+            let mut outcomes = Vec::new();
+            for max_passes in [1, 2] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = isolated_app(directory.path());
+                app.new_document();
+                app.state.view_mode = mode;
+                app.session[0].content = "AB".into();
+                app.session[0].update_after_edit();
+                app.queue_editor_selection(1..1);
+                let ctx = Context::default();
+                ctx.options_mut(|options| options.max_passes = max_passes.try_into().unwrap());
+                install_fonts(&ctx);
+                shortcut_editor_frame(&mut app, &ctx, vec![]);
+                let mut events = vec![
+                    egui::Event::Text("中".into()),
+                    command_key(Key::B),
+                    egui::Event::Text("文".into()),
+                ];
+                if multiple_commands {
+                    events.extend([command_key(Key::I), egui::Event::Text("尾".into())]);
+                }
+                shortcut_editor_frame(&mut app, &ctx, events);
+                assert!(app.ordered_input_pass.is_none());
+                for character in if multiple_commands {
+                    "中文尾"
+                } else {
+                    "中文"
+                }
+                .chars()
+                {
+                    assert_eq!(app.session[0].content.matches(character).count(), 1);
+                }
+                let source = app.session[0].content.clone();
+                shortcut_editor_frame(&mut app, &ctx, vec![]);
+                assert_eq!(app.session[0].content, source, "no next-frame replay");
+                outcomes.push(source);
+            }
+            if multiple_commands {
+                assert_eq!(
+                    outcomes[0], outcomes[1],
+                    "multiple commands retain the existing route"
+                );
+            } else {
+                assert_eq!(outcomes[0], "A**中文**B");
+                assert_eq!(outcomes[1], "A中**文**B");
+            }
+        }
+    }
+}
+
+#[test]
+fn middle_format_shortcut_preserves_commit_and_following_ime_composition() {
+    for mode in [ViewMode::Edit, ViewMode::Hybrid, ViewMode::Split] {
+        for cancel in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = isolated_app(directory.path());
+            app.new_document();
+            app.state.view_mode = mode;
+            app.session[0].content = "AB".into();
+            app.session[0].update_after_edit();
+            app.queue_editor_selection(1..1);
+            let ctx = Context::default();
+            install_fonts(&ctx);
+            shortcut_editor_frame(&mut app, &ctx, vec![]);
+            shortcut_editor_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "ni".into(),
+                    active_range_chars: Some(0..2),
+                })],
+            );
+            shortcut_editor_frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::Ime(egui::ImeEvent::Commit("中".into())),
+                    command_key(Key::B),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "wen".into(),
+                        active_range_chars: Some(0..3),
+                    }),
+                ],
+            );
+            assert!(app.ordered_input_pass.is_none());
+            shortcut_editor_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Ime(egui::ImeEvent::Commit(
+                    if cancel { "" } else { "文" }.into(),
+                ))],
+            );
+            assert_eq!(
+                app.session[0].content,
+                if cancel { "A中****B" } else { "A中**文**B" }
+            );
+        }
+    }
+}
+
+#[test]
+fn middle_format_shortcut_finishes_on_its_original_document() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = isolated_app(directory.path());
+    app.new_document();
+    app.session[0].content = "AB".into();
+    app.session[0].update_after_edit();
+    app.new_document();
+    app.session[1].content = "KEEP".into();
+    app.session[1].update_after_edit();
+    app.activate_document(0);
+    app.queue_editor_selection(1..1);
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    shortcut_editor_frame(&mut app, &ctx, vec![]);
+    let _ = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 800.0),
+            )),
+            events: vec![
+                egui::Event::Text("中".into()),
+                command_key(Key::B),
+                egui::Event::Text("文".into()),
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            let mut frame = Frame::_new_kittest();
+            eframe::App::logic(&mut app, &ctx, &mut frame);
+            eframe::App::ui(&mut app, ui, &mut frame);
+            if ctx.current_pass_index() == 0 {
+                assert!(app.ordered_input_pass.is_some());
+                // Even an unexpected internal view change cannot redirect text.
+                app.activate_document(1);
+                app.close_document(0);
+                app.last_recovery_write = Instant::now() - Duration::from_secs(60);
+            }
+        },
+    );
+    assert!(app.ordered_input_pass.is_none());
+    assert_eq!(app.session[0].content, "A中**文**B");
+    assert_eq!(app.session[1].content, "KEEP");
+    assert_eq!(app.session.active_index(), Some(0));
+    assert_eq!(app.active_selection(0), 5..5);
+    assert!(
+        app.last_recovery_write.elapsed() >= Duration::from_secs(60),
+        "supplemental logic must not run recovery/background work"
+    );
+}
+
+#[test]
+fn trailing_format_shortcut_without_editor_focus_uses_immediate_route() {
+    for mode in [ViewMode::Edit, ViewMode::Hybrid, ViewMode::Preview] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.state.view_mode = ViewMode::Edit;
+        app.session[0].content = "AB".into();
+        app.session[0].update_after_edit();
+        app.queue_editor_selection(1..1);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        shortcut_editor_frame(&mut app, &ctx, vec![]);
+        app.state.view_mode = mode;
+        ctx.memory_mut(|memory| memory.surrender_focus(app.editor_surface.widget_id().unwrap()));
+        shortcut_editor_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Text("中".into()), command_key(Key::B)],
+        );
+        assert_ne!(app.state.view_mode, ViewMode::Preview);
+        assert_eq!(app.session[0].content, "A**中**B", "mode={mode:?}");
+        shortcut_editor_frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.session[0].content, "A**中**B",
+            "no deferred command remains"
+        );
+    }
+}
+
+#[test]
+fn middle_format_shortcut_keeps_window_and_pointer_events_on_the_original_route() {
+    for scenario in [
+        "popup",
+        "find",
+        "pointer",
+        "drag",
+        "touch",
+        "window-focus",
+        "drop",
+        "close",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.session[0].content = "AB".into();
+        app.session[0].update_after_edit();
+        app.queue_editor_selection(1..1);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        shortcut_editor_frame(&mut app, &ctx, vec![]);
+        let mut input = egui::RawInput {
+            events: vec![
+                egui::Event::Text("中".into()),
+                command_key(Key::B),
+                egui::Event::Text("文".into()),
+            ],
+            ..Default::default()
+        };
+        match scenario {
+            "popup" => egui::Popup::open_id(&ctx, egui::Id::new("existing-menu")),
+            "find" => app.find_open = true,
+            "pointer" => input
+                .events
+                .push(egui::Event::PointerMoved(egui::pos2(900.0, 700.0))),
+            "drag" => input.events.push(egui::Event::PointerButton {
+                pos: egui::pos2(900.0, 700.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }),
+            "touch" => input.events.push(egui::Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(1),
+                phase: egui::TouchPhase::Start,
+                pos: egui::pos2(900.0, 700.0),
+                force: None,
+            }),
+            "window-focus" => input.events.push(egui::Event::WindowFocused(false)),
+            "drop" => input.dropped_files.push(egui::DroppedFile {
+                path: Some(directory.path().join("drop.md")),
+                ..Default::default()
+            }),
+            "close" => input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .events
+                .push(egui::ViewportEvent::Close),
+            _ => unreachable!(),
+        }
+        let output = ctx.run_ui(input, |_| {
+            app.handle_shortcuts(&ctx);
+            assert!(app.ordered_input_pass.is_none(), "scenario={scenario}");
+            let text_events = ctx.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, egui::Event::Text(_)))
+                    .count()
+            });
+            assert_eq!(
+                text_events, 2,
+                "both text events must remain available: {scenario}"
+            );
+        });
+        assert!(
+            !output
+                .platform_output
+                .request_discard_reasons
+                .iter()
+                .any(|cause| cause.reason.contains("format shortcut"))
+        );
+    }
+}
+
+#[test]
+fn trailing_format_does_not_replace_another_app_shortcut() {
+    for new_document_position in [0, 1] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.session[0].content = "AB".into();
+        app.session[0].update_after_edit();
+        let mut events = vec![egui::Event::Text("中".into())];
+        events.insert(
+            new_document_position,
+            egui::Event::Key {
+                key: Key::N,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            },
+        );
+        events.push(egui::Event::Key {
+            key: Key::B,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        let ctx = Context::default();
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |_| {
+                app.handle_shortcuts(&ctx);
+            },
+        );
+        assert_eq!(
+            app.session.documents().len(),
+            2,
+            "earlier New command must retain its existing priority"
+        );
+        assert_eq!(app.session[0].content, "AB");
+    }
+}
+
+#[test]
+fn trailing_format_shortcuts_preserve_preceding_input_order() {
+    fn draw(app: &mut RuporaApp, ctx: &Context, hybrid: bool, events: Vec<egui::Event>) {
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.handle_shortcuts(ctx);
+                if hybrid {
+                    app.hybrid_pane(ui, 0);
+                } else {
+                    app.edit_pane(ui, 0, None);
+                }
+            },
+        );
+    }
+    let mut failures = Vec::new();
+    for hybrid in [false, true] {
+        for (key, wrapper) in [(Key::B, "****"), (Key::I, "**"), (Key::K, "[](https://)")] {
+            for custom_binding in [false, true] {
+                for prefix in [
+                    egui::Event::Text("中".into()),
+                    egui::Event::Paste("中".into()),
+                    egui::Event::Ime(egui::ImeEvent::Commit("中".into())),
+                    egui::Event::Key {
+                        key: Key::ArrowRight,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ] {
+                    let expected = if matches!(prefix, egui::Event::Key { .. }) {
+                        format!("AB{wrapper}")
+                    } else {
+                        format!("A中{wrapper}B")
+                    };
+                    let mut outcomes = Vec::new();
+                    for batched in [false, true] {
+                        let directory = tempfile::tempdir().unwrap();
+                        let mut app = isolated_app(directory.path());
+                        app.new_document();
+                        app.session[0].content = "AB".into();
+                        app.session[0].update_after_edit();
+                        app.queue_editor_selection(1..1);
+                        if custom_binding {
+                            app.state.key_bindings.bold = "Ctrl+Shift+B".into();
+                            app.state.key_bindings.italic = "Ctrl+Shift+I".into();
+                            app.state.key_bindings.link = "Ctrl+Shift+K".into();
+                        }
+                        let ctx = Context::default();
+                        install_fonts(&ctx);
+                        draw(&mut app, &ctx, hybrid, vec![]);
+                        let events = vec![
+                            prefix.clone(),
+                            egui::Event::Key {
+                                key,
+                                physical_key: Some(key),
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers {
+                                    ctrl: true,
+                                    command: true,
+                                    shift: custom_binding,
+                                    ..Default::default()
+                                },
+                            },
+                        ];
+                        if batched {
+                            draw(&mut app, &ctx, hybrid, events);
+                        } else {
+                            for event in events {
+                                draw(&mut app, &ctx, hybrid, vec![event]);
+                            }
+                        }
+                        if app.session[0].content != expected {
+                            failures.push(format!("hybrid={hybrid} key={key:?} custom_binding={custom_binding} prefix={prefix:?} batched={batched} expected={expected:?} actual={:?}", app.session[0].content));
+                        }
+                        let edited = app.session[0].content.clone();
+                        let selection = app.active_selection(0);
+                        let mut undo_count = 0;
+                        while app.session[0].can_undo() {
+                            app.undo_active();
+                            undo_count += 1;
+                            assert!(undo_count < 8);
+                        }
+                        assert_eq!(app.session[0].content, "AB");
+                        for _ in 0..undo_count {
+                            app.redo_active();
+                        }
+                        assert_eq!(app.session[0].content, edited);
+                        assert_eq!(app.active_selection(0), selection);
+                        outcomes.push((edited, selection));
+                    }
+                    if outcomes[0] != outcomes[1] {
+                        failures.push(format!("hybrid={hybrid} key={key:?} prefix={prefix:?} separate={:?} batched={:?}", outcomes[0], outcomes[1]));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn document_canvases_keep_text_inside_narrow_panes_without_changing_source() {
     fn check(shape: &egui::Shape, clip: egui::Rect, mode: ViewMode, width: f32) {

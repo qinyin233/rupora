@@ -210,7 +210,7 @@ impl EditorSurface {
         if let Some(command) = context_command {
             self.apply_context_command(document, command, effects);
         }
-        self.finish_history_action(document, effects);
+        self.finish_deferred_command(document, effects);
         PaneScroll {
             offset: output.state.offset.y,
             maximum: (output.content_size.y - output.inner_rect.height()).max(0.0),

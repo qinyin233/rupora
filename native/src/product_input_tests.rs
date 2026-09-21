@@ -1,6 +1,141 @@
 use super::*;
 
 #[test]
+fn replacing_image_alt_and_adjacent_format_in_one_frame_keeps_valid_markup() {
+    let source = "![**甲**](a)*乙*";
+    let directory = tempfile::tempdir().unwrap();
+    let end = source.chars().count();
+    let mut app = app_at(directory.path(), source, end..end);
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    frame(&mut app, &ctx, true, vec![]);
+    frame(
+        &mut app,
+        &ctx,
+        true,
+        vec![
+            key(Key::ArrowLeft, egui::Modifiers::SHIFT),
+            key(Key::ArrowLeft, egui::Modifiers::SHIFT),
+            egui::Event::Text("新".into()),
+        ],
+    );
+    assert_eq!(
+        markdown::render_html_fragment(&app.session[0].content),
+        "<p><img src=\"a\" alt=\"新\"></p>\n",
+        "{}",
+        app.session[0].content,
+    );
+    app.undo_active();
+    assert_eq!(app.session[0].content, source);
+}
+
+#[test]
+fn leading_edits_before_enter_keep_their_input_semantics_and_history() {
+    let cases = [
+        (
+            "中文🙂",
+            3..3,
+            key(Key::Delete, egui::Modifiers::NONE),
+            "中文🙂\n\n新",
+        ),
+        (
+            "中文🙂",
+            0..0,
+            key(Key::Backspace, egui::Modifiers::NONE),
+            "\n\n新中文🙂",
+        ),
+        (
+            "中文🙂",
+            3..3,
+            egui::Event::Paste(String::new()),
+            "中文🙂\n\n新",
+        ),
+        (
+            "```\n中文\n```",
+            4..6,
+            egui::Event::Paste("https://example.com".into()),
+            "```\nhttps://example.com\n新\n```",
+        ),
+        (
+            "中文🙂",
+            3..3,
+            egui::Event::Paste("(".into()),
+            "中文🙂(\n\n新",
+        ),
+        (
+            "中文🙂",
+            3..3,
+            egui::Event::Text("(".into()),
+            "中文🙂(\n\n新)",
+        ),
+        ("()", 1..1, egui::Event::Text(")".into()), "()\n\n新"),
+        (
+            "中文🙂后文",
+            0..3,
+            egui::Event::Paste("https://example.com".into()),
+            "[中文🙂](https://example.com)\n\n新后文",
+        ),
+        (
+            "- 中文🙂后文",
+            5..5,
+            key(Key::Backspace, egui::Modifiers::NONE),
+            "- 中文\n- 新后文",
+        ),
+        (
+            "- 中文🙂后文",
+            5..5,
+            key(Key::Delete, egui::Modifiers::NONE),
+            "- 中文🙂\n- 新文",
+        ),
+        (
+            "- 中文🙂后文",
+            2..5,
+            key(Key::Backspace, egui::Modifiers::NONE),
+            "\n新后文",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (source, selection, first, expected) in cases {
+        for batched in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_at(directory.path(), source, selection.clone());
+            let ctx = Context::default();
+            frame(&mut app, &ctx, true, vec![]);
+            let events = vec![
+                first.clone(),
+                key(Key::Enter, egui::Modifiers::NONE),
+                egui::Event::Text("新".into()),
+            ];
+            if batched {
+                frame(&mut app, &ctx, true, events);
+            } else {
+                for event in events {
+                    frame(&mut app, &ctx, true, vec![event]);
+                }
+            }
+            if app.session[0].content != expected {
+                failures.push(format!("source={source:?} selection={selection:?} first={first:?} batched={batched} expected={expected:?} actual={:?}", app.session[0].content));
+            }
+            let edited = app.session[0].content.clone();
+            let cursor = app.active_selection(0);
+            let mut undos = 0;
+            while app.session[0].can_undo() {
+                app.undo_active();
+                undos += 1;
+                assert!(undos < 8);
+            }
+            assert_eq!(app.session[0].content, source);
+            for _ in 0..undos {
+                app.redo_active();
+            }
+            assert_eq!(app.session[0].content, edited);
+            assert_eq!(app.active_selection(0), cursor);
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn navigation_then_enter_in_one_frame_matches_separate_frames() {
     let mut failures = Vec::new();
     for (source, cursor) in [
