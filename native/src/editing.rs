@@ -21,9 +21,9 @@ pub fn apply_markdown_command(
 ) -> Range<usize> {
     let selection = clamp_char_range(text, selection);
     match command {
-        MarkdownCommand::Bold => toggle_wrap(text, selection, "**", "**"),
-        MarkdownCommand::Italic => toggle_wrap(text, selection, "*", "*"),
-        MarkdownCommand::Strikethrough => toggle_wrap(text, selection, "~~", "~~"),
+        MarkdownCommand::Bold => toggle_emphasis(text, selection, "**"),
+        MarkdownCommand::Italic => toggle_emphasis(text, selection, "*"),
+        MarkdownCommand::Strikethrough => toggle_emphasis(text, selection, "~~"),
         MarkdownCommand::InlineCode => toggle_inline_code(text, selection),
         MarkdownCommand::Link => insert_link(text, selection),
         MarkdownCommand::Heading(level) => {
@@ -344,6 +344,270 @@ fn collect_byte_matches(text: &str, query: &str, match_case: bool) -> Vec<Range<
             }
         })
         .collect()
+}
+
+fn toggle_emphasis(text: &mut String, selection: Range<usize>, marker: &str) -> Range<usize> {
+    if selection.is_empty() {
+        return toggle_wrap(text, selection, marker, marker);
+    }
+    if let Some(next) = toggle_paragraph_emphasis(text, selection.clone(), marker) {
+        return next;
+    }
+    let selected = &text[char_to_byte(text, selection.start)..char_to_byte(text, selection.end)];
+    let trimmed = selected.trim();
+    if trimmed.is_empty() {
+        return selection;
+    }
+    // Emphasis delimiters touching whitespace remain literal Markdown. Keep
+    // that whitespace intact and select only the text receiving the format.
+    let leading = selected.chars().take_while(|ch| ch.is_whitespace()).count();
+    let start = selection.start + leading;
+    let end = start + trimmed.chars().count();
+    let start_byte = char_to_byte(text, start);
+    let end_byte = char_to_byte(text, end);
+    let surrounded = start_byte >= marker.len()
+        && text.get(start_byte - marker.len()..start_byte) == Some(marker)
+        && text.get(end_byte..end_byte + marker.len()) == Some(marker);
+    if marker == "*"
+        && surrounded
+        && pulldown_cmark::Parser::new_ext(text, crate::markdown::parser_options())
+            .into_offset_iter()
+            .fold((false, false), |(strong, emphasis), (event, range)| {
+                if range.start < start_byte && end_byte < range.end {
+                    match event {
+                        pulldown_cmark::Event::Start(pulldown_cmark::Tag::Strong)
+                            if range.start + 2 == start_byte && end_byte + 2 == range.end =>
+                        {
+                            (true, emphasis)
+                        }
+                        pulldown_cmark::Event::Start(pulldown_cmark::Tag::Emphasis) => {
+                            (strong, true)
+                        }
+                        _ => (strong, emphasis),
+                    }
+                } else {
+                    (strong, emphasis)
+                }
+            })
+            == (true, false)
+    {
+        // One star beside the selection may belong to a strong delimiter.
+        // Adding italic must not remove half of the existing bold syntax.
+        text.insert_str(end_byte, marker);
+        text.insert_str(start_byte, marker);
+        return start + marker.len()..end + marker.len();
+    }
+    toggle_wrap(text, start..end, marker, marker)
+}
+
+fn toggle_paragraph_emphasis(
+    text: &mut String,
+    selection: Range<usize>,
+    marker: &str,
+) -> Option<Range<usize>> {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+    let selected = char_to_byte(text, selection.start)..char_to_byte(text, selection.end);
+    if !text[selected.clone()].contains(['\r', '\n']) {
+        return None;
+    }
+    struct Wrapper {
+        range: Range<usize>,
+        delimiter_len: usize,
+        requested: bool,
+    }
+    let mut paragraphs = Vec::new();
+    let mut paragraph = None;
+    for (event, range) in
+        Parser::new_ext(text, crate::markdown::parser_options()).into_offset_iter()
+    {
+        match event {
+            Event::Start(Tag::Paragraph) => {
+                paragraph = (range.start < selected.end && selected.start < range.end).then(|| {
+                    paragraphs.push((range, Vec::<Wrapper>::new(), Vec::new()));
+                    paragraphs.len() - 1
+                });
+            }
+            Event::End(TagEnd::Paragraph) => paragraph = None,
+            Event::Start(tag @ (Tag::Strong | Tag::Emphasis | Tag::Strikethrough)) => {
+                if let Some(index) = paragraph {
+                    let delimiter_len = match tag {
+                        Tag::Strong => 2,
+                        Tag::Strikethrough if text[range.clone()].starts_with("~~") => 2,
+                        _ => 1,
+                    };
+                    let requested = matches!(
+                        (marker, tag),
+                        ("**", Tag::Strong) | ("*", Tag::Emphasis) | ("~~", Tag::Strikethrough)
+                    );
+                    paragraphs[index].1.push(Wrapper {
+                        range,
+                        delimiter_len,
+                        requested,
+                    });
+                }
+            }
+            Event::Code(_)
+            | Event::InlineHtml(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_) => {
+                if let Some(index) = paragraph {
+                    paragraphs[index].2.push(range);
+                }
+            }
+            _ => {}
+        }
+    }
+    if paragraphs.len() < 2 {
+        // Wrapping across a block boundary can change how the next toggle
+        // parses the document. Only use the single-span path inside one
+        // paragraph; keep unsupported mixed-block selections unchanged.
+        let body = &text[selected.clone()];
+        let start = selected.start + body.len() - body.trim_start().len();
+        let end = start + body.trim().len();
+        return if paragraphs
+            .first()
+            .is_some_and(|(paragraph, _, _)| paragraph.start <= start && end <= paragraph.end)
+        {
+            None
+        } else {
+            Some(selection)
+        };
+    }
+    let mut ranges = Vec::new();
+    for (mut scope, wrappers, literals) in paragraphs {
+        let body = &text[scope.clone()];
+        scope.start += body.len() - body.trim_start().len();
+        scope.end = scope.start + body.trim().len();
+        if scope.start >= selected.end || selected.start >= scope.end {
+            continue;
+        }
+        let mut range = scope.start.max(selected.start)..scope.end.min(selected.end);
+        let body = &text[range.clone()];
+        range.start += body.len() - body.trim_start().len();
+        range.end = range.start + body.trim().len();
+        if range.is_empty() {
+            continue;
+        }
+        // A delimiter inserted inside code, math or an HTML tag is literal,
+        // so it cannot apply emphasis or be recognized on the next toggle.
+        // Keep that paragraph intact when the selection cuts such a token.
+        if literals.iter().any(|literal| {
+            (literal.start < range.start && range.start < literal.end)
+                || (literal.start < range.end && range.end < literal.end)
+        }) {
+            continue;
+        }
+        // Work inside existing whole-paragraph emphasis. This preserves outer
+        // formats and avoids interpreting one '*' from '**' as italic syntax.
+        for wrapper in &wrappers {
+            if wrapper.range.start <= range.start && range.end <= wrapper.range.end {
+                range.start = range.start.max(wrapper.range.start + wrapper.delimiter_len);
+                range.end = range.end.min(wrapper.range.end - wrapper.delimiter_len);
+            }
+        }
+        if !range.is_empty() {
+            let formatted = wrappers.iter().any(|wrapper| {
+                wrapper.requested
+                    && wrapper.range.start <= range.start
+                    && range.end <= wrapper.range.end
+            });
+            ranges.push((range, formatted));
+        }
+    }
+    if ranges.is_empty() {
+        return Some(selection);
+    }
+    // Build once so formatting many paragraphs does not repeatedly shift or
+    // scan the full document. Positions returned to the editor are characters.
+    let mut output = String::with_capacity(text.len() + ranges.len() * marker.len() * 2);
+    let mut read = 0;
+    let mut written_chars = 0;
+    let mut result = None;
+    let mut changed_bodies = Vec::new();
+    let mut added_wrappers = Vec::new();
+    for (range, formatted) in ranges {
+        let remove = formatted
+            && range.start >= marker.len()
+            && text.get(range.start - marker.len()..range.start) == Some(marker)
+            && text.get(range.end..range.end + marker.len()) == Some(marker);
+        let start = range.start - if remove { marker.len() } else { 0 };
+        let end = range.end + if remove { marker.len() } else { 0 };
+        let gap = &text[read..start];
+        output.push_str(gap);
+        written_chars += gap.chars().count();
+        let wrapper_start = output.len();
+        if !remove {
+            output.push_str(marker);
+            written_chars += marker.len();
+        }
+        let first = result.get_or_insert(written_chars..written_chars);
+        let body_start = output.len();
+        let body = &text[range];
+        output.push_str(body);
+        changed_bodies.push(body_start..output.len());
+        written_chars += body.chars().count();
+        first.end = written_chars;
+        if !remove {
+            output.push_str(marker);
+            written_chars += marker.len();
+            added_wrappers.push(wrapper_start..output.len());
+        }
+        read = end;
+    }
+    output.push_str(&text[read..]);
+    // Escapes, partial links and delimiter-only paragraphs can turn new
+    // markers into literal text or change the block type. Commit only an
+    // emphasis edit that the parser can render and subsequently toggle.
+    let mut output_paragraphs = Vec::new();
+    let mut output_wrappers = std::collections::HashSet::new();
+    for (event, range) in
+        Parser::new_ext(&output, crate::markdown::parser_options()).into_offset_iter()
+    {
+        match event {
+            Event::Start(Tag::Paragraph) => output_paragraphs.push(range),
+            Event::Start(tag)
+                if matches!(
+                    (marker, &tag),
+                    ("**", Tag::Strong) | ("*", Tag::Emphasis) | ("~~", Tag::Strikethrough)
+                ) =>
+            {
+                output_wrappers.insert(emphasis_delimiter_key(&output, range, marker));
+            }
+            _ => {}
+        }
+    }
+    if changed_bodies.iter().any(|body| {
+        let index = output_paragraphs.partition_point(|paragraph| paragraph.end <= body.start);
+        !output_paragraphs
+            .get(index)
+            .is_some_and(|paragraph| paragraph.start <= body.start && body.end <= paragraph.end)
+    }) || added_wrappers
+        .into_iter()
+        .any(|wrapper| !output_wrappers.contains(&emphasis_delimiter_key(&output, wrapper, marker)))
+    {
+        return Some(selection);
+    }
+    *text = output;
+    result
+}
+
+fn emphasis_delimiter_key(
+    text: &str,
+    mut range: Range<usize>,
+    marker: &str,
+) -> (Range<usize>, usize) {
+    // Nested *** syntax can assign the outer stars to either format. Accept
+    // symmetric nesting, but not an unmatched literal prefix/suffix of stars.
+    let center = range.start + range.end;
+    let delimiter = marker.as_bytes()[0];
+    while range.start > 0 && text.as_bytes()[range.start - 1] == delimiter {
+        range.start -= 1;
+    }
+    while text.as_bytes().get(range.end) == Some(&delimiter) {
+        range.end += 1;
+    }
+    (range, center)
 }
 
 fn toggle_wrap(
@@ -1131,6 +1395,169 @@ mod tests {
         let selection = apply_markdown_command(&mut text, selection, MarkdownCommand::Bold);
         assert_eq!(text, "你好 world");
         assert_eq!(selection, 0..2);
+    }
+
+    #[test]
+    fn emphasis_commands_format_each_selected_paragraph_and_toggle_back() {
+        for (command, marker, tag) in [
+            (MarkdownCommand::Bold, "**", "strong"),
+            (MarkdownCommand::Italic, "*", "em"),
+            (MarkdownCommand::Strikethrough, "~~", "del"),
+        ] {
+            for (source, selection, expected) in [
+                (
+                    "中🙂\n\n文",
+                    0..5,
+                    format!("{marker}中🙂{marker}\n\n{marker}文{marker}"),
+                ),
+                (
+                    "甲乙\n\n丙丁",
+                    1..5,
+                    format!("甲{marker}乙{marker}\n\n{marker}丙{marker}丁"),
+                ),
+                (
+                    "> 中文\n>\n> 后文",
+                    0..12,
+                    format!("> {marker}中文{marker}\n>\n> {marker}后文{marker}"),
+                ),
+                (
+                    "- 中文\n\n- 后文",
+                    0..10,
+                    format!("- {marker}中文{marker}\n\n- {marker}后文{marker}"),
+                ),
+                (
+                    "`中文`\n\n后文",
+                    0..8,
+                    format!("{marker}`中文`{marker}\n\n{marker}后文{marker}"),
+                ),
+            ] {
+                let mut text = source.to_owned();
+                let next = apply_markdown_command(&mut text, selection, command);
+                assert_eq!(text, expected, "{command:?} source={source:?}");
+                let html = crate::markdown::render_html_fragment(&text);
+                assert_eq!(html.matches(&format!("<{tag}>")).count(), 2, "{html}");
+                apply_markdown_command(&mut text, next, command);
+                assert_eq!(text, source, "toggle {command:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn italic_on_bold_text_keeps_both_formats_and_toggles_back() {
+        let mut text = "**中文🙂**".to_owned();
+        let next = apply_markdown_command(&mut text, 2..5, MarkdownCommand::Italic);
+        let html = crate::markdown::render_html_fragment(&text);
+        assert!(html.contains("<strong>") && html.contains("<em>"), "{html}");
+        apply_markdown_command(&mut text, next, MarkdownCommand::Italic);
+        assert_eq!(text, "**中文🙂**");
+    }
+
+    #[test]
+    fn multi_paragraph_emphasis_preserves_nested_formatting_on_toggle() {
+        for source in [
+            "a\n\n*b*",
+            "*a*\n\nb",
+            "a\n\n*b*\n\nc",
+            "a\n\n**b**",
+            "**a**\n\nb",
+            "a\n\n~~b~~",
+            "`a`\n\nb",
+            "a\n\n`b`",
+            "`a\nb`\r\rc",
+            "a\r\rb",
+            "a\r\n\r\nb",
+            "<i>a</i>\n\nb",
+            "$a$\n\nb",
+            "a\\\n\nb",
+            "[a](b)\n\nc",
+            "a\n\n**",
+            "**# a**\n\nb",
+            "- a\n\n- b",
+            "a\n\n**b",
+        ] {
+            for command in [
+                MarkdownCommand::Bold,
+                MarkdownCommand::Italic,
+                MarkdownCommand::Strikethrough,
+            ] {
+                for start in 0..=source.chars().count() {
+                    for end in start..=source.chars().count() {
+                        let mut text = source.to_owned();
+                        let next = apply_markdown_command(&mut text, start..end, command);
+                        apply_markdown_command(&mut text, next, command);
+                        assert_eq!(text, source, "{command:?} selection={start}..{end}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emphasis_commands_keep_selection_whitespace_outside_rendered_markers() {
+        for (command, marker, tag) in [
+            (MarkdownCommand::Bold, "**", "strong"),
+            (MarkdownCommand::Italic, "*", "em"),
+            (MarkdownCommand::Strikethrough, "~~", "del"),
+        ] {
+            for (original, selection, expected, body_start, body) in [
+                (
+                    "hello world",
+                    5..11,
+                    format!("hello {marker}world{marker}"),
+                    6,
+                    "world",
+                ),
+                (
+                    "hello world ",
+                    6..12,
+                    format!("hello {marker}world{marker} "),
+                    6,
+                    "world",
+                ),
+                (
+                    "前　中🙂 后",
+                    1..5,
+                    format!("前　{marker}中🙂{marker} 后"),
+                    2,
+                    "中🙂",
+                ),
+            ] {
+                let mut source = original.to_owned();
+                let selected = apply_markdown_command(&mut source, selection, command);
+                let html = crate::markdown::render_html_fragment(&source);
+                assert!(
+                    html.contains(&format!("<{tag}>{body}</{tag}>")),
+                    "{command:?} must render the selected text: {source:?} => {html:?}",
+                );
+                assert_eq!(source, expected);
+                assert_eq!(
+                    selected,
+                    body_start + marker.len()..body_start + marker.len() + body.chars().count(),
+                );
+                let restored = apply_markdown_command(&mut source, selected, command);
+                assert_eq!(source, original);
+                assert_eq!(restored, body_start..body_start + body.chars().count());
+            }
+        }
+    }
+
+    #[test]
+    fn emphasis_commands_leave_whitespace_only_selections_unchanged() {
+        for command in [
+            MarkdownCommand::Bold,
+            MarkdownCommand::Italic,
+            MarkdownCommand::Strikethrough,
+        ] {
+            let mut source = "前　 \t后".to_owned();
+            assert_eq!(apply_markdown_command(&mut source, 1..4, command), 1..4);
+            assert_eq!(source, "前　 \t后");
+
+            let mut source = "前后".to_owned();
+            let cursor = apply_markdown_command(&mut source, 1..1, command);
+            assert!(cursor.is_empty());
+            assert_eq!(apply_markdown_command(&mut source, cursor, command), 1..1);
+            assert_eq!(source, "前后");
+        }
     }
 
     #[test]
