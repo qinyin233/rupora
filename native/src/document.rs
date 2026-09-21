@@ -814,22 +814,28 @@ fn canonical_save_target(path: &Path) -> Result<PathBuf, String> {
 
 #[cfg(windows)]
 fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    use std::{
+        ffi::OsString,
+        path::{Component, Prefix},
+    };
 
-    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
-    const UNC: &[u16] = &[b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
-    if wide.starts_with(VERBATIM) {
-        let suffix = &wide[VERBATIM.len()..];
-        if suffix.starts_with(UNC) {
-            let mut normalized = vec![b'\\' as u16, b'\\' as u16];
-            normalized.extend_from_slice(&suffix[UNC.len()..]);
-            return PathBuf::from(OsString::from_wide(&normalized));
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path;
+    };
+    let mut normalized = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut prefix = OsString::from(r"\\");
+            prefix.push(server);
+            prefix.push(r"\");
+            prefix.push(share);
+            PathBuf::from(prefix)
         }
-        return PathBuf::from(OsString::from_wide(suffix));
-    }
-    path
+        _ => return path,
+    };
+    normalized.push(components.as_path());
+    normalized
 }
 
 #[cfg(not(windows))]
@@ -873,9 +879,39 @@ fn absolute_path_identity(path: &Path) -> PathBuf {
                 .join(path)
         }
     });
-    if cfg!(windows) {
-        PathBuf::from(absolute.to_string_lossy().to_lowercase())
-    } else {
+    let absolute = normalize_windows_verbatim_path(absolute);
+    #[cfg(windows)]
+    {
+        use std::{
+            ffi::OsString,
+            os::windows::ffi::{OsStrExt as _, OsStringExt as _},
+        };
+
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn RtlUpcaseUnicodeChar(source_character: u16) -> u16;
+        }
+
+        // Windows compares filenames using a single-unit uppercase table.
+        // Unicode string casing would collapse distinct names such as İ and i̇.
+        // Preserve native surrogate units, including non-BMP characters.
+        let folded = absolute
+            .as_os_str()
+            .encode_wide()
+            .map(|unit| {
+                if (0xd800..=0xdfff).contains(&unit) {
+                    unit
+                } else {
+                    // SAFETY: this ntdll export is available since Windows 2000;
+                    // it takes and returns one WCHAR by value, with no pointers.
+                    unsafe { RtlUpcaseUnicodeChar(unit) }
+                }
+            })
+            .collect::<Vec<_>>();
+        PathBuf::from(OsString::from_wide(&folded))
+    }
+    #[cfg(not(windows))]
+    {
         absolute
     }
 }
@@ -1337,6 +1373,163 @@ impl TextPatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn normalizes_only_verbatim_disk_and_unc_prefixes() {
+        for (source, expected) in [
+            (r"\\?\C:\notes\中文.md", r"C:\notes\中文.md"),
+            (
+                r"\\?\UNC\server\share\notes\中文.md",
+                r"\\server\share\notes\中文.md",
+            ),
+            (r"C:\notes\中文.md", r"C:\notes\中文.md"),
+            (
+                r"\\?\Volume{1234}\notes\中文.md",
+                r"\\?\Volume{1234}\notes\中文.md",
+            ),
+        ] {
+            assert_eq!(
+                normalize_windows_verbatim_path(PathBuf::from(source)),
+                PathBuf::from(expected),
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saving_a_new_file_keeps_its_document_lock_after_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new.md");
+        let mut document = Document::untitled(1);
+        document.content = "draft".to_owned();
+        document.update_after_edit();
+        document.save_as(path.clone(), false).unwrap();
+
+        assert!(Document::open(&path).unwrap_err().contains("另一个 RUPORA"));
+        drop(document);
+        assert_eq!(Document::open(&path).unwrap().content, "draft");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn document_locks_share_ascii_case_aliases_before_and_after_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("note.md");
+        let alias = directory.path().join("NOTE.MD");
+        let original_lock = DocumentLock::acquire(&original).unwrap();
+        assert!(DocumentLock::acquire(&alias).is_err());
+        fs::write(&original, "saved").unwrap();
+        assert!(DocumentLock::acquire(&alias).is_err());
+        drop(original_lock);
+        let _alias_document = Document::open(&alias).unwrap();
+        assert!(Document::open(&original).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_identity_preserves_native_surrogates_and_non_expanding_case() {
+        use std::{
+            ffi::OsString,
+            os::windows::ffi::{OsStrExt as _, OsStringExt as _},
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = [b'a' as u16, 0xd800, 0xd801, 0xdc28, 0x00df, 0x0130];
+        let path = directory.path().join(OsString::from_wide(&source));
+        let identity = absolute_path_identity(&path);
+        assert_eq!(
+            identity
+                .file_name()
+                .unwrap()
+                .encode_wide()
+                .collect::<Vec<_>>(),
+            [b'A' as u16, 0xd800, 0xd801, 0xdc28, 0x00df, 0x0130]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_as_distinguishes_unicode_case_expansions() {
+        for target_exists in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let original = directory.path().join("İ.md");
+            let target = directory.path().join("i\u{307}.md");
+            fs::write(&original, "original file").unwrap();
+            if target_exists {
+                fs::write(&target, "target before save").unwrap();
+            }
+            let mut document = Document::open(&original).unwrap();
+            document.content = "saved to target".to_owned();
+            document.update_after_edit();
+
+            document.save_as(target.clone(), target_exists).unwrap();
+
+            assert_eq!(fs::read_to_string(&original).unwrap(), "original file");
+            assert_eq!(fs::read_to_string(&target).unwrap(), "saved to target");
+            assert_eq!(
+                document.path,
+                Some(canonical_document_path(&target).unwrap())
+            );
+            assert!(Document::open(&target).is_err());
+            assert!(Document::open(&original).is_ok());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn document_locks_distinguish_unicode_case_expansions() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("İ.md");
+        let target = directory.path().join("i\u{307}.md");
+        fs::write(&original, "original file").unwrap();
+        fs::write(&target, "separate file").unwrap();
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+
+        let _original_document = Document::open(&original).unwrap();
+        let target_document = Document::open(&target).unwrap();
+        assert_eq!(target_document.content, "separate file");
+        assert!(Document::open(&original).is_err());
+        assert!(Document::open(&target).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_as_distinguishes_unpaired_utf16_file_names() {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join(OsString::from_wide(&[
+            b'x' as u16,
+            0xd800,
+            b'.' as u16,
+            b'm' as u16,
+            b'd' as u16,
+        ]));
+        let target = directory.path().join(OsString::from_wide(&[
+            b'x' as u16,
+            0xd801,
+            b'.' as u16,
+            b'm' as u16,
+            b'd' as u16,
+        ]));
+        fs::write(&original, "original file").unwrap();
+        fs::write(&target, "target before save").unwrap();
+        let mut document = Document::open(&original).unwrap();
+        document.content = "saved to target".to_owned();
+        document.update_after_edit();
+
+        document.save_as(target.clone(), true).unwrap();
+
+        assert_eq!(fs::read_to_string(&original).unwrap(), "original file");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "saved to target");
+        assert_eq!(
+            document.path,
+            Some(canonical_document_path(&target).unwrap())
+        );
+        assert!(Document::open(&target).is_err());
+        assert!(Document::open(&original).is_ok());
+    }
 
     #[test]
     fn snapshot_rejects_path_changes_even_when_document_text_is_unchanged() {
