@@ -464,7 +464,23 @@ impl VisualProjection {
         visual_selection: Range<usize>,
     ) -> Option<VisualSourceEdit> {
         let selection = clamp_range(visual_selection, edited.chars().count());
-        let change = text_change_anchored_at_selection(&self.text, edited, &selection)?;
+        let mut change = text_change_anchored_at_selection(&self.text, edited, &selection)?;
+        for wrapper in &self.inline_wrappers {
+            if source[wrapper.source.clone()].starts_with("![")
+                && change.old.start <= wrapper.visual.start
+                && wrapper.visual.start < change.old.end
+                && change.old.end < wrapper.visual.end
+            {
+                // A replacement may share a suffix with the old image label.
+                // Include that suffix only when the new selection reaches it;
+                // otherwise it is still unselected image content.
+                let shared_suffix = wrapper.visual.end - change.old.end;
+                if change.new.end + shared_suffix <= selection.end {
+                    change.old.end += shared_suffix;
+                    change.new.end += shared_suffix;
+                }
+            }
+        }
         let insertion = change.old.is_empty();
         let mut source_start = self.source_boundaries[change.old.start];
         let mut source_end = if insertion {
@@ -475,6 +491,8 @@ impl VisualProjection {
         let replacement_start = char_to_byte(edited, change.new.start);
         let replacement_end = char_to_byte(edited, change.new.end);
         let replacement = &edited[replacement_start..replacement_end];
+        let mut decoded_prefix = String::new();
+        let mut decoded_suffix = String::new();
         for atomic in self
             .atomic_ranges
             .iter()
@@ -482,32 +500,84 @@ impl VisualProjection {
         {
             source_start = source_start.min(atomic.source.start);
             source_end = source_end.max(atomic.source.end);
+            let syntax = &source[atomic.source.clone()];
+            if syntax.starts_with('&') && syntax.ends_with(';') {
+                // An entity can decode to multiple characters. Replacing
+                // its syntax must retain any unselected decoded characters.
+                if atomic.visual.start < change.old.start {
+                    append_literal_inline_text(
+                        &mut decoded_prefix,
+                        &self.text[char_to_byte(&self.text, atomic.visual.start)
+                            ..char_to_byte(&self.text, change.old.start)],
+                    );
+                }
+                if change.old.end < atomic.visual.end {
+                    append_literal_inline_text(
+                        &mut decoded_suffix,
+                        &self.text[char_to_byte(&self.text, change.old.end)
+                            ..char_to_byte(&self.text, atomic.visual.end)],
+                    );
+                }
+            }
         }
         for wrapper in self.inline_wrappers.iter().filter(|wrapper| {
             change.old.start <= wrapper.visual.start && change.old.end >= wrapper.visual.end
         }) {
-            if replacement.is_empty() {
+            if replacement.is_empty()
+                || source[wrapper.source.clone()].starts_with("![")
+                || change.old.start < wrapper.visual.start
+                || wrapper.visual.end < change.old.end
+            {
+                // When the replacement crosses a fully selected inline span,
+                // remove both delimiters rather than leaving half outside the
+                // mapped text range. Exact in-span replacements keep the style.
                 source_start = source_start.min(wrapper.source.start);
                 source_end = source_end.max(wrapper.source.end);
             }
         }
+        let mut image_closers = self
+            .inline_wrappers
+            .iter()
+            .filter(|wrapper| {
+                source[wrapper.source.clone()].starts_with("![")
+                    && source_start <= wrapper.source.start
+                    && wrapper.source.start < source_end
+                    && source_end <= wrapper.content.end
+                    && wrapper.content.end < wrapper.source.end
+            })
+            .map(|wrapper| wrapper.content.end..wrapper.source.end)
+            .collect::<Vec<_>>();
         if replacement.is_empty()
             && !change.old.is_empty()
+            && image_closers.is_empty()
             && self.source_left_boundaries[change.old.start] < source_start
             && self.source_boundaries[change.old.end] > source_end
         {
             source_start = self.source_left_boundaries[change.old.start];
             source_end = self.source_boundaries[change.old.end];
+            // Hidden syntax at a visual edge can belong to an untouched
+            // adjacent span, including an image nested inside another image.
+            // Do not consume that span's closer/opener with the selected text.
+            for wrapper in &self.inline_wrappers {
+                if wrapper.visual.end <= change.old.start {
+                    source_start = source_start.max(wrapper.source.end);
+                }
+                if change.old.end <= wrapper.visual.start {
+                    source_end = source_end.min(wrapper.source.start);
+                }
+            }
         }
 
         let mut output = source.to_owned();
         let retained = self.retained_inline_syntax(&change.old, source_start..source_end);
-        let mut inserted = replacement.to_owned();
+        let mut inserted = decoded_prefix.clone();
+        inserted.push_str(replacement);
+        inserted.push_str(&decoded_suffix);
         for range in &retained {
             inserted.push_str(&source[range.clone()]);
         }
         output.replace_range(source_start..source_end, &inserted);
-        let delta = inserted.len() as isize - (source_end - source_start) as isize;
+        let mut delta = inserted.len() as isize - (source_end - source_start) as isize;
         let mut start_byte = self.edited_source_byte(
             edited,
             selection.start,
@@ -524,16 +594,46 @@ impl VisualProjection {
             source_end,
             delta,
         );
+        if !decoded_prefix.is_empty() || !decoded_suffix.is_empty() {
+            if (change.new.start..=change.new.end).contains(&selection.start) {
+                start_byte = source_start
+                    + decoded_prefix.len()
+                    + char_to_byte(replacement, selection.start - change.new.start);
+            }
+            if (change.new.start..=change.new.end).contains(&selection.end) {
+                end_byte = source_start
+                    + decoded_prefix.len()
+                    + char_to_byte(replacement, selection.end - change.new.start);
+            }
+        }
         if !retained.is_empty() {
             // Keep the insertion caret before the retained closing/opening
             // syntax, rather than counting hidden markers as inserted text.
             if selection.start == change.new.end {
-                start_byte = source_start + replacement.len();
+                start_byte = source_start + decoded_prefix.len() + replacement.len();
             }
             if selection.end == change.new.end {
-                end_byte = source_start + replacement.len();
+                end_byte = source_start + decoded_prefix.len() + replacement.len();
             }
         }
+        // Removing an image's visual marker consumes its opening `![`.
+        // Remove the matching destination too, while leaving the remaining
+        // alt source (and any nested formatting or enclosing link) intact.
+        image_closers.sort_by_key(|range| range.start);
+        let mut removed_closer_bytes = 0usize;
+        for closer in image_closers.into_iter().rev() {
+            let removed = shift_index(closer.start, delta)..shift_index(closer.end, delta);
+            output.replace_range(removed.clone(), "");
+            for position in [&mut start_byte, &mut end_byte] {
+                if *position >= removed.end {
+                    *position -= removed.len();
+                } else if *position > removed.start {
+                    *position = removed.start;
+                }
+            }
+            removed_closer_bytes += removed.len();
+        }
+        delta -= removed_closer_bytes as isize;
         let repair_bytes = self.repair_inline_flanking_boundaries(
             source,
             edited,
@@ -615,20 +715,38 @@ impl VisualProjection {
             })
             .filter(|wrapper| inline_flanking_wrapper(original_source, &wrapper.source))
             .min_by_key(|wrapper| wrapper.source.end - wrapper.source.start);
-        let Some(wrapper) = wrapper else {
+        let mut candidates = Vec::new();
+        if let Some(wrapper) = wrapper {
+            let start = wrapper.source.start;
+            let end = shift_index(wrapper.source.end, delta);
+            if output.is_char_boundary(start) && output.is_char_boundary(end) {
+                candidates.extend([vec![end], vec![start], vec![start, end]]);
+            }
+        }
+        let joins_formatted_spans = !changed_visual.is_empty()
+            && self.inline_wrappers.iter().any(|wrapper| {
+                wrapper.visual.end == changed_visual.start
+                    && inline_flanking_wrapper(original_source, &wrapper.source)
+            })
+            && self.inline_wrappers.iter().any(|wrapper| {
+                wrapper.visual.start == changed_visual.end
+                    && inline_flanking_wrapper(original_source, &wrapper.source)
+            })
+            && edited_visual.chars().count() + changed_visual.len() == self.char_count();
+        if joins_formatted_spans && output.is_char_boundary(source_start) {
+            // Deleting a span can join two previously separate delimiter runs.
+            // Keep both surrounding styles, with an invisible parsing boundary.
+            candidates.push(vec![source_start]);
+        }
+        if candidates.is_empty() {
             return Vec::new();
-        };
+        }
         if Self::from_markdown_with_context(output, None, self.references.clone()).text()
             == edited_visual
         {
             return Vec::new();
         }
-        let start = wrapper.source.start;
-        let end = shift_index(wrapper.source.end, delta);
-        if !output.is_char_boundary(start) || !output.is_char_boundary(end) {
-            return Vec::new();
-        }
-        for positions in [vec![end], vec![start], vec![start, end]] {
+        for positions in candidates {
             let mut candidate = output.clone();
             for position in positions.iter().copied().rev() {
                 candidate.insert_str(position, REPAIR);
@@ -779,6 +897,15 @@ impl VisualProjection {
             visual_index - change.new.start,
         );
         source_start + relative
+    }
+}
+
+fn append_literal_inline_text(output: &mut String, text: &str) {
+    for character in text.chars() {
+        if character.is_ascii_punctuation() {
+            output.push('\\');
+        }
+        output.push(character);
     }
 }
 
@@ -1784,7 +1911,14 @@ impl ProjectionBuilder {
         let count = references[first..].partition_point(|reference| reference.start < range.end);
         let overlapping = &references[first..first + count];
         if overlapping.is_empty() {
-            self.append_mapped(source, rendered, range, style);
+            let syntax = &source[range.clone()];
+            if syntax.starts_with('&') && syntax.ends_with(';') && syntax != rendered {
+                // Even when the decoded text occurs inside the entity name
+                // (e.g. &amp; or &fjlig;), it is not a literal source slice.
+                self.append_transformed(source, rendered, range, style);
+            } else {
+                self.append_mapped(source, rendered, range, style);
+            }
             return;
         }
 

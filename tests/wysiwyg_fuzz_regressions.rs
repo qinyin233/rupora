@@ -1,6 +1,258 @@
 use rupora::wysiwyg::VisualProjection;
 
 #[test]
+fn deleting_images_between_formatted_spans_keeps_text_and_caret() {
+    for source in [
+        "**前**![*中*](x)**后**",
+        "*前*![中](x)*后*",
+        "~~前~~![中](x)~~后~~",
+        "***前***![中](x)***后***",
+        "*外 **前**![中](x)**后** 外*",
+        "[**前**![中](x)**后**](outer)",
+        "![**前**![中](x)**后**](outer)",
+        "**前**![中](x)*后*",
+        "**前**![中](x)\n**后**",
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        let image = projection.text().find("▧ 中").unwrap();
+        let cursor = projection.text()[..image].chars().count();
+        let mut edited = projection.text().to_owned();
+        edited.replace_range(image..image + "▧ 中".len(), "");
+        let update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+        let reparsed = VisualProjection::from_markdown(&update.source);
+        assert_eq!(
+            reparsed.text(),
+            edited,
+            "source={source:?}, update={update:?}"
+        );
+        assert_eq!(
+            reparsed.visual_char_range(&update.source, update.selection),
+            cursor..cursor,
+            "source={source:?}",
+        );
+        let original_runs = projection.runs_for(projection.text());
+        let updated_runs = reparsed.runs_for(reparsed.text());
+        for character in ['前', '后'] {
+            let original_index = projection
+                .text()
+                .chars()
+                .position(|ch| ch == character)
+                .unwrap();
+            let updated_index = reparsed
+                .text()
+                .chars()
+                .position(|ch| ch == character)
+                .unwrap();
+            assert_eq!(
+                original_runs
+                    .iter()
+                    .find(|run| run.range.contains(&original_index))
+                    .map(|run| run.style),
+                updated_runs
+                    .iter()
+                    .find(|run| run.range.contains(&updated_index))
+                    .map(|run| run.style),
+                "source={source:?}, character={character}",
+            );
+        }
+    }
+}
+
+#[test]
+fn edits_across_image_alt_and_adjacent_formatting_keep_balanced_wrappers() {
+    for (source, edited, cursor, expected) in [
+        ("![**甲**](a)*乙*", "▧ 新", 3, "![新](a)"),
+        ("[![**甲**](a)](outer)*乙*", "▧ 新", 3, "[![新](a)](outer)"),
+        ("![a ![b](i) c](outer)", "▧ a ▧ b", 7, "![a ![b](i)](outer)"),
+    ] {
+        let projection = VisualProjection::from_markdown_with_selection(
+            source,
+            Some(source.chars().count()..source.chars().count()),
+        );
+        let update = projection
+            .apply_edit(source, edited, cursor..cursor)
+            .unwrap();
+        assert_eq!(update.source, expected, "source={source:?}");
+        let reparsed = VisualProjection::from_markdown(&update.source);
+        assert_eq!(reparsed.text(), edited);
+        assert_eq!(
+            reparsed.visual_char_range(&update.source, update.selection),
+            cursor..cursor,
+        );
+    }
+}
+
+#[test]
+fn removing_an_image_marker_keeps_alt_formatting_and_outer_links() {
+    for (image, unwrapped) in [
+        ("![中文🙂](image.png \"标题\")", "中文🙂"),
+        ("![**中文🙂**](image.png)", "**中文🙂**"),
+        (
+            "[![**中文🙂**](image.png)](notes.md)",
+            "[**中文🙂**](notes.md)",
+        ),
+    ] {
+        let source = format!("前 {image} 后");
+        let projection = VisualProjection::from_markdown(&source);
+        for (edited, cursor) in [
+            ("前 中文🙂 后", 2),
+            ("前 ▧中文🙂 后", 3),
+            ("前  中文🙂 后", 2),
+        ] {
+            let update = projection
+                .apply_edit(&source, edited, cursor..cursor)
+                .unwrap();
+            assert_eq!(update.source, format!("前 {unwrapped} 后"));
+            let reparsed = VisualProjection::from_markdown(&update.source);
+            assert_eq!(reparsed.text(), "前 中文🙂 后");
+            assert_eq!(
+                reparsed.visual_char_range(&update.source, update.selection),
+                2..2
+            );
+        }
+    }
+
+    for (source, edited, cursor, expected) in [
+        (
+            "前 ![**中文🙂**](image.png) 后",
+            "前 文🙂 后",
+            2,
+            "前 **文🙂** 后",
+        ),
+        (
+            "前 [![**中文🙂**](image.png)](notes.md) 后",
+            "前 新文🙂 后",
+            3,
+            "前 [新**文🙂**](notes.md) 后",
+        ),
+        ("![甲](a.png)![**乙🙂**](b.png)", "乙🙂", 0, "**乙🙂**"),
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        let update = projection
+            .apply_edit(source, edited, cursor..cursor)
+            .unwrap();
+        assert_eq!(update.source, expected);
+        let reparsed = VisualProjection::from_markdown(&update.source);
+        assert_eq!(reparsed.text(), edited);
+        assert_eq!(
+            reparsed.visual_char_range(&update.source, update.selection),
+            cursor..cursor
+        );
+    }
+}
+
+#[test]
+fn partial_entity_edits_keep_retained_punctuation_literal() {
+    for (source, edited, cursor) in [
+        ("&nvgt;", ">", 1),
+        ("&nvlt;正文", "<!--正文", 4),
+        ("**&nvlt;正文**", "<!--正文", 4),
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        let update = projection
+            .apply_edit(source, edited, cursor..cursor)
+            .unwrap();
+        let reparsed = VisualProjection::from_markdown(&update.source);
+        assert_eq!(
+            reparsed.text(),
+            edited,
+            "source={source:?}, update={update:?}"
+        );
+        assert_eq!(
+            reparsed.visual_char_range(&update.source, update.selection),
+            cursor..cursor
+        );
+    }
+}
+
+#[test]
+fn replacing_complete_images_removes_the_image_syntax_and_keeps_outer_links() {
+    for (image, expected) in [
+        ("![中文🙂](assets/image.png \"标题\")", "替换🙂"),
+        ("![**中文🙂**](assets/image.png)", "替换🙂"),
+        (
+            "[![中文🙂](assets/image.png)](notes.md)",
+            "[替换🙂](notes.md)",
+        ),
+    ] {
+        let source = format!("前 {image} 后");
+        let projection = VisualProjection::from_markdown(&source);
+        let edited = "前 替换🙂 后";
+        let update = projection.apply_edit(&source, edited, 5..5).unwrap();
+        assert_eq!(update.source, format!("前 {expected} 后"));
+        let reparsed = VisualProjection::from_markdown(&update.source);
+        assert_eq!(reparsed.text(), edited);
+        assert_eq!(
+            reparsed.visual_char_range(&update.source, update.selection),
+            5..5
+        );
+    }
+}
+
+#[test]
+fn decoded_entities_keep_their_full_source_mapping_during_replacement() {
+    for entity in [
+        "&amp;", "&#38;", "&semi;", "&#35;", "&fjlig;", "&lt;", "&quot;",
+    ] {
+        let source = format!("前 {entity} 后");
+        let projection = VisualProjection::from_markdown(&source);
+        for replacement in ["", "新🙂"] {
+            let edited = format!("前 {replacement} 后");
+            let cursor = 2 + replacement.chars().count();
+            let update = projection
+                .apply_edit(&source, &edited, cursor..cursor)
+                .unwrap();
+            assert_eq!(update.source, edited, "source={source:?}");
+            assert_eq!(update.selection, cursor..cursor);
+        }
+    }
+}
+
+#[test]
+fn partial_entity_edits_preserve_unselected_decoded_characters() {
+    for (source, edited, cursor, expected) in [
+        ("前 &fjlig; 后", "前 Xj 后", 3, "前 Xj 后"),
+        ("前 &fjlig; 后", "前 f🙂 后", 4, "前 f🙂 后"),
+        ("前 &fjlig; 后", "前 f新j 后", 4, "前 f新j 后"),
+        (
+            "前 &NotEqualTilde; 后",
+            "前 新\u{338} 后",
+            3,
+            "前 新\u{338} 后",
+        ),
+        ("前 &NotEqualTilde; 后", "前 ≂ 后", 3, "前 ≂ 后"),
+        ("\\*&fjlig;&amp;尾", "*f新&尾", 3, "\\*f新&amp;尾"),
+        (
+            "A&fjlig;&NotEqualTilde;Z",
+            "Af新\u{338}Z",
+            3,
+            "Af新\u{338}Z",
+        ),
+        ("**&fjlig;**", "新j", 1, "**新j**"),
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        let update = projection
+            .apply_edit(source, edited, cursor..cursor)
+            .unwrap();
+        assert_eq!(update.source, expected, "source={source:?}");
+        let reparsed = VisualProjection::from_markdown(&update.source);
+        assert_eq!(reparsed.text(), edited);
+        assert_eq!(
+            reparsed.visual_char_range(&update.source, update.selection),
+            cursor..cursor
+        );
+    }
+
+    let source = "前&fjlig;后";
+    let projection = VisualProjection::from_markdown(source);
+    let update = projection.apply_edit(source, "前f新🙂j后", 2..4).unwrap();
+    assert_eq!(update.source, "前f新🙂j后");
+    assert_eq!(update.selection, 2..4);
+}
+
+#[test]
 fn long_backslash_runs_keep_escape_pairs_editable() {
     for count in [1, 2, 3, 31, 32, 32_768] {
         let source = format!("前 {}* 后", "\\".repeat(count));
