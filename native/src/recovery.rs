@@ -517,15 +517,24 @@ impl RecoveryStore {
                 path.display()
             )));
         }
+        // A newer snapshot may use a different schema. Protect it before
+        // interpreting its document fields with the current format.
+        #[derive(Deserialize)]
+        struct VersionHeader {
+            version: u32,
+        }
+        let header: VersionHeader = serde_json::from_slice(&bytes).map_err(|error| {
+            RecoveryLoadError::Corrupt(format!("恢复数据格式无效 {}：{error}", path.display()))
+        })?;
+        if !(1..=RECOVERY_VERSION).contains(&header.version) {
+            return Err(RecoveryLoadError::Preserve(format!(
+                "恢复数据版本 {} 不受支持（当前版本 {}）",
+                header.version, RECOVERY_VERSION
+            )));
+        }
         let snapshot: RecoverySnapshot = serde_json::from_slice(&bytes).map_err(|error| {
             RecoveryLoadError::Corrupt(format!("恢复数据格式无效 {}：{error}", path.display()))
         })?;
-        if !(1..=RECOVERY_VERSION).contains(&snapshot.version) {
-            return Err(RecoveryLoadError::Preserve(format!(
-                "恢复数据版本 {} 不受支持（当前版本 {}）",
-                snapshot.version, RECOVERY_VERSION
-            )));
-        }
         if snapshot.documents.len() > MAX_RECOVERY_DOCUMENTS {
             return Err(RecoveryLoadError::Corrupt(format!(
                 "恢复数据包含过多文档：{}",
@@ -898,16 +907,48 @@ mod tests {
 
     #[test]
     fn preserves_future_snapshots_against_automatic_save_and_clear() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("recovery.json");
-        let original = br#"{"version":999,"documents":[]}"#;
-        fs::write(&path, original).unwrap();
-        let store = RecoveryStore::at(path.clone());
+        for original in [
+            r#"{"version":999,"documents":[]}"#,
+            r#"{"version":999,"drafts":[{"text":"future draft"}]}"#,
+            r#"{"version":999,"documents":{"draft":"future draft"}}"#,
+            r#"{"version":999,"documents":[{"content":{"text":"future draft"}}]}"#,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("recovery.json");
+            fs::write(&path, original).unwrap();
+            let store = RecoveryStore::at(path.clone());
 
-        assert!(store.load().unwrap_err().contains("不受支持"));
-        assert!(store.save(&[Document::untitled(1)]).is_err());
-        assert!(store.clear().is_err());
-        assert_eq!(fs::read(path).unwrap(), original);
+            assert!(store.load().unwrap_err().contains("不受支持"), "{original}");
+            assert!(store.save(&[Document::untitled(1)]).is_err());
+            assert!(store.clear().is_err());
+            assert_eq!(fs::read(path).unwrap(), original.as_bytes());
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn quarantines_invalid_current_snapshot_fields_after_checking_the_version() {
+        for original in [
+            r#"{"version":4,"drafts":[]}"#,
+            r#"{"version":4,"documents":{}}"#,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("recovery.json");
+            fs::write(&path, original).unwrap();
+            let store = RecoveryStore::at(path.clone());
+
+            assert!(store.load().unwrap_err().contains("隔离"));
+            assert!(!path.exists());
+            let backup = fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!(fs::read(backup.path()).unwrap(), original.as_bytes());
+            assert!(store.load().unwrap().is_empty());
+            store.save(&[Document::untitled(1)]).unwrap();
+            store.clear().unwrap();
+        }
     }
 
     #[cfg(unix)]
