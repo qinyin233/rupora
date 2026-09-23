@@ -4,6 +4,30 @@
 
 ## [Unreleased]
 
+## [2.0.0-alpha.3] - 2026-09-23
+
+### Fixed
+
+- 修复所见即所得中图片、嵌套强调和 HTML 实体在选择、替换、删除时的源码残留、内容丢失及格式损坏。
+- 修复同帧输入、粘贴、换行和单个格式快捷键的执行顺序，保留中文 IME、智能配对、列表续行及撤销重做语义。
+- 修复代码块缩进、CRLF 围栏切换、Setext 标题换行及隐藏语法边界处的光标导航。
+- 修复 Windows 路径大小写、原生 UTF-16 与父目录别名导致的文件锁和另存为路径混淆。
+- 保护未知版本的恢复文件，限制工作区扫描的全部枚举项，补全旧编码文档显式另存为 UTF-8 的失败保护。
+- 更新 rustls，修复 RUSTSEC-2026-0285 对应依赖问题。
+
+### Changed
+
+- 分离渲染所需块索引与可延迟的全文分析，优化大文档投影，并合并重复的编辑语义辅助函数。
+
+### Added
+
+- 补充中文、emoji、IME、嵌套格式、实体、输入顺序、文件锁及恢复保护的固定回归测试。
+- 记录修复后的全量源码审查、交叉复审和验证边界，详见 `docs/SOURCE-AUDIT-2026-09-21.md`。
+
+### Known limitations
+
+- 同帧多个格式快捷键及仅允许一次布局的输入批次，尚不保证与逐帧操作产生完全相同的格式结果。
+
 ## [2.0.0-alpha.2] - 2026-09-12
 
 ### Changed
@@ -76,7 +100,8 @@
 
 - 首个 Tauri 2 + Vue 3 + Vditor 版本。
 
-[Unreleased]: https://github.com/qinyin233/rupora/compare/v2.0.0-alpha.2...HEAD
+[Unreleased]: https://github.com/qinyin233/rupora/compare/v2.0.0-alpha.3...HEAD
+[2.0.0-alpha.3]: https://github.com/qinyin233/rupora/releases/tag/v2.0.0-alpha.3
 [2.0.0-alpha.2]: https://github.com/qinyin233/rupora/releases/tag/v2.0.0-alpha.2
 [2.0.0-alpha.1]: https://github.com/qinyin233/rupora/releases/tag/v2.0.0-alpha.1
 [1.1.0]: https://github.com/qinyin233/rupora/releases/tag/v1.1.0
