@@ -870,7 +870,9 @@ fn path_identity_bytes(path: &Path) -> Vec<u8> {
 }
 
 fn absolute_path_identity(path: &Path) -> PathBuf {
-    let absolute = path.canonicalize().unwrap_or_else(|_| {
+    // Resolve existing parent aliases even before the file exists so creating
+    // the document cannot change its lock identity.
+    let absolute = canonical_save_target(path).unwrap_or_else(|_| {
         if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -1373,6 +1375,21 @@ impl TextPatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_locks_resolve_parent_aliases_before_file_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("nested")).unwrap();
+        let original = directory.path().join("nested").join("..").join("note.md");
+        let alias = directory.path().join("note.md");
+        let original_lock = DocumentLock::acquire(&original).unwrap();
+        assert!(DocumentLock::acquire(&alias).is_err());
+        fs::write(&alias, "saved").unwrap();
+        assert!(DocumentLock::acquire(&original).is_err());
+        assert!(DocumentLock::acquire(&alias).is_err());
+        drop(original_lock);
+        assert_eq!(Document::open(&alias).unwrap().content, "saved");
+    }
 
     #[cfg(windows)]
     #[test]
