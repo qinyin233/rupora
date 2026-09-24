@@ -530,11 +530,19 @@ fn toggle_paragraph_emphasis(
             }
         }
         if !range.is_empty() {
-            let formatted = wrappers.iter().any(|wrapper| {
-                wrapper.requested
-                    && wrapper.range.start <= range.start
-                    && range.end <= wrapper.range.end
+            // A partial range may have a star from the outer wrapper before it
+            // and a star from a nested wrapper after it. Only remove markers
+            // when the range is the complete body of some parsed wrapper.
+            let whole_wrapper_body = wrappers.iter().any(|wrapper| {
+                wrapper.range.start + wrapper.delimiter_len == range.start
+                    && wrapper.range.end.saturating_sub(wrapper.delimiter_len) == range.end
             });
+            let formatted = whole_wrapper_body
+                && wrappers.iter().any(|wrapper| {
+                    wrapper.requested
+                        && wrapper.range.start <= range.start
+                        && range.end <= wrapper.range.end
+                });
             ranges.push((range, formatted));
         }
     }
@@ -1620,6 +1628,16 @@ mod tests {
     }
 
     #[test]
+    fn italic_partial_multiline_wrapper_preserves_nested_markers() {
+        let original = "*a\n*a**";
+        let mut source = original.to_owned();
+        let selected = apply_markdown_command(&mut source, 0..5, MarkdownCommand::Italic);
+        assert_eq!(source, original);
+        apply_markdown_command(&mut source, selected, MarkdownCommand::Italic);
+        assert_eq!(source, original);
+    }
+
+    #[test]
     fn multi_paragraph_emphasis_preserves_nested_formatting_on_toggle() {
         for source in [
             "a\n\n*b*",
@@ -1652,7 +1670,10 @@ mod tests {
                         let mut text = source.to_owned();
                         let next = apply_markdown_command(&mut text, start..end, command);
                         apply_markdown_command(&mut text, next, command);
-                        assert_eq!(text, source, "{command:?} selection={start}..{end}");
+                        assert_eq!(
+                            text, source,
+                            "{source:?} {command:?} selection={start}..{end}"
+                        );
                     }
                 }
             }
