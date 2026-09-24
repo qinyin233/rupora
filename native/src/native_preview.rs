@@ -1,8 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
+    io::Read,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, mpsc},
+    thread,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -15,6 +17,11 @@ pub(crate) const MAX_GENERATED_SVG_CACHE_ENTRIES: usize = 128;
 pub(crate) const MAX_GENERATED_SVG_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 const LOCAL_IMAGE_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+// Metadata checks stay cheap. Equal metadata gets a slower content check so
+// timestamp-preserving writes still refresh cached pixels.
+const LOCAL_IMAGE_CONTENT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const LOCAL_IMAGE_CONTENT_CHECK_BYTES_PER_SECOND: u64 = 8 * 1024 * 1024;
+const LOCAL_IMAGE_SYNCHRONOUS_HASH_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct ResolvedLocalImage {
@@ -30,6 +37,11 @@ struct ImageFileStamp {
 
 struct LocalImageEntry {
     stamp: Option<ImageFileStamp>,
+    // Outer None means the first background hash has not completed; inner
+    // None means the file could not be read.
+    content_hash: Option<Option<u64>>,
+    pending_content_hash: Option<mpsc::Receiver<Option<u64>>>,
+    content_checked_at: Instant,
     resolved: ResolvedLocalImage,
     checked_at: Instant,
     owners: HashSet<(u64, markdown::BlockId)>,
@@ -101,12 +113,61 @@ impl LocalImageStore {
                 modified: metadata.modified().ok(),
             });
         let uri = image_uri_for_path(&path);
+        let mut checked_hash = None;
         if let Some(entry) = self.entries.get_mut(&path)
             && entry.stamp == stamp
             && entry.resolved.uri == uri
         {
-            entry.checked_at = now;
-            return entry.resolved.clone();
+            if let Some(pending) = entry.pending_content_hash.as_ref() {
+                match pending.try_recv() {
+                    Ok(hash) => {
+                        entry.pending_content_hash = None;
+                        checked_hash = Some(hash);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        entry.checked_at = now;
+                        return entry.resolved.clone();
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        entry.pending_content_hash = None;
+                    }
+                }
+            }
+            let content_check_interval = if self.check_interval.is_zero() {
+                Duration::ZERO
+            } else {
+                let size_interval = stamp.as_ref().map_or(Duration::ZERO, |stamp| {
+                    Duration::from_secs(
+                        stamp
+                            .length
+                            .div_ceil(LOCAL_IMAGE_CONTENT_CHECK_BYTES_PER_SECOND),
+                    )
+                });
+                LOCAL_IMAGE_CONTENT_CHECK_INTERVAL.max(size_interval)
+            };
+            if checked_hash.is_none()
+                && now.duration_since(entry.content_checked_at) < content_check_interval
+            {
+                entry.checked_at = now;
+                return entry.resolved.clone();
+            }
+            if checked_hash.is_none() {
+                if stamp
+                    .as_ref()
+                    .is_some_and(|stamp| stamp.length > LOCAL_IMAGE_SYNCHRONOUS_HASH_BYTES)
+                {
+                    entry.pending_content_hash = spawn_local_image_content_hash(&path, ctx);
+                    entry.content_checked_at = now;
+                    entry.checked_at = now;
+                    return entry.resolved.clone();
+                }
+                checked_hash = Some(local_image_content_hash(&path));
+            }
+            if entry.content_hash == checked_hash {
+                entry.content_checked_at = now;
+                entry.checked_at = now;
+                return entry.resolved.clone();
+            }
         }
 
         if let Some(entry) = self.entries.get(&path)
@@ -129,10 +190,23 @@ impl LocalImageStore {
             .remove(&path)
             .map_or_else(HashSet::new, |entry| entry.owners);
         owners.insert(owner);
+        let (content_hash, pending_content_hash) = if let Some(hash) = checked_hash {
+            (Some(hash), None)
+        } else if stamp
+            .as_ref()
+            .is_some_and(|stamp| stamp.length > LOCAL_IMAGE_SYNCHRONOUS_HASH_BYTES)
+        {
+            (None, spawn_local_image_content_hash(&path, ctx))
+        } else {
+            (Some(local_image_content_hash(&path)), None)
+        };
         self.entries.insert(
             path,
             LocalImageEntry {
                 stamp,
+                content_hash,
+                pending_content_hash,
+                content_checked_at: now,
                 resolved: resolved.clone(),
                 checked_at: now,
                 owners,
@@ -169,6 +243,36 @@ impl LocalImageStore {
             self.forget_block(owner);
         }
     }
+}
+
+fn local_image_content_hash(path: &Path) -> Option<u64> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = DefaultHasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            return Some(hasher.finish());
+        }
+        hasher.write(&buffer[..read]);
+    }
+}
+
+fn spawn_local_image_content_hash(
+    path: &Path,
+    ctx: &Context,
+) -> Option<mpsc::Receiver<Option<u64>>> {
+    let (sender, receiver) = mpsc::channel();
+    let path = path.to_owned();
+    let ctx = ctx.clone();
+    thread::Builder::new()
+        .name("rupora-image-hash".to_owned())
+        .spawn(move || {
+            let _ = sender.send(local_image_content_hash(&path));
+            ctx.request_repaint();
+        })
+        .ok()?;
+    Some(receiver)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -511,6 +615,81 @@ mod tests {
         let after_image = load_test_image(&context, after.uri.as_ref().unwrap());
         assert_eq!(after_image.size, [2, 1]);
         assert_eq!(after_image.pixels, [egui::Color32::BLUE; 2]);
+    }
+
+    #[test]
+    fn overwriting_a_local_image_with_unchanged_metadata_refreshes_pixels() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("same-stamp.png");
+        write_test_image(&path, 1, [255, 0, 0, 255], 10);
+        let original_metadata = std::fs::metadata(&path).unwrap();
+        let context = Context::default();
+        egui_extras::install_image_loaders(&context);
+        let mut store = LocalImageStore::new(Duration::ZERO);
+        let block_id = markdown::blocks("image")[0].id;
+        let before = store.resolve(&context, (1, block_id), directory.path(), "same-stamp.png");
+        let uri = before.uri.as_ref().unwrap();
+        assert_eq!(load_test_image(&context, uri).pixels, [egui::Color32::RED]);
+
+        write_test_image(&path, 1, [0, 0, 255, 255], 10);
+        let replacement_metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(original_metadata.len(), replacement_metadata.len());
+        assert_eq!(
+            original_metadata.modified().unwrap(),
+            replacement_metadata.modified().unwrap()
+        );
+        let after = store.resolve(&context, (1, block_id), directory.path(), "same-stamp.png");
+        assert_ne!(after.revision, before.revision);
+        assert_eq!(load_test_image(&context, uri).pixels, [egui::Color32::BLUE]);
+    }
+
+    #[test]
+    fn large_local_images_check_unchanged_metadata_off_the_ui_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.png");
+        let bytes = LOCAL_IMAGE_SYNCHRONOUS_HASH_BYTES as usize + 1;
+        std::fs::write(&path, vec![b'a'; bytes]).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        file.set_modified(timestamp).unwrap();
+        let context = Context::default();
+        let mut store = LocalImageStore::new(Duration::ZERO);
+        let owner = (1, markdown::blocks("image")[0].id);
+        let first = store.resolve(&context, owner, directory.path(), "large.png");
+        assert!(store.entries[&path].pending_content_hash.is_some());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut baseline = first.clone();
+        while store.entries[&path].content_hash.is_none() {
+            assert!(Instant::now() < deadline, "initial image hash timed out");
+            baseline = store.resolve(&context, owner, directory.path(), "large.png");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_ne!(baseline.revision, first.revision);
+
+        std::fs::write(&path, vec![b'b'; bytes]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(timestamp)
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes as u64);
+        let pending = store.resolve(&context, owner, directory.path(), "large.png");
+        assert_eq!(pending.revision, baseline.revision);
+        assert!(store.entries[&path].pending_content_hash.is_some());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let refreshed = store.resolve(&context, owner, directory.path(), "large.png");
+            if refreshed.revision != baseline.revision {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement image hash timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
