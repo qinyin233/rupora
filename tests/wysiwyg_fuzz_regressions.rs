@@ -1,6 +1,21 @@
 use rupora::wysiwyg::VisualProjection;
 
 #[test]
+fn thematic_break_does_not_replay_tabs_consumed_by_its_source_range() {
+    let source = "x\n**\t*\t\t\t\t\t\t";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "x\n────────────────");
+    let positions = (0..=projection.text().chars().count())
+        .map(|point| projection.source_char_range(source, point..point).start)
+        .collect::<Vec<_>>();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] <= pair[1]),
+        "positions={positions:?}"
+    );
+    assert_eq!(positions.last().copied(), Some(source.chars().count()));
+}
+
+#[test]
 fn same_line_nested_list_markers_map_to_their_own_source_prefix() {
     let source = "* * x";
     let projection = VisualProjection::from_markdown(source);

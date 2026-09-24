@@ -22,6 +22,16 @@ fn projection_trace_replays_inline_code_backward_mapping_crash() {
 }
 
 #[test]
+fn projection_trace_replays_rule_with_tab_backward_mapping_crash() {
+    // GitHub Actions run 36048876943, libFuzzer artifact crash-b8ce384a9b1bc8057e032f000f087cc7e11bf339.
+    let input = [
+        12, 120, 10, 42, 42, 9, 42, 9, 9, 9, 9, 9, 9, 73, 43, 36, 2, 1, 2, 159, 153, 9, 42, 9, 9,
+        9, 9, 9, 9, 73, 43, 36, 2, 1, 2, 159, 153, 130,
+    ];
+    assert!(projection_fuzz::run(&input).is_some());
+}
+
+#[test]
 fn footnote_like_text_crossing_inline_code_is_rendered_once() {
     let source = "[^/`x`]";
     let projection = rupora::wysiwyg::VisualProjection::from_markdown(source);

@@ -1856,8 +1856,14 @@ impl ProjectionBuilder {
         if visible_whitespace == source_whitespace.len() {
             return;
         }
-        let unmapped_start = trailing_start + visible_whitespace;
-        self.set_current_boundary(unmapped_start);
+        // A parser event can consume leading tabs of the trailing whitespace,
+        // for example when tabs complete a thematic break. Do not replay
+        // characters that the preceding visual element already mapped.
+        let unmapped_start = (trailing_start + visible_whitespace)
+            .max(self.source_boundaries.last().copied().unwrap_or_default());
+        if unmapped_start == source.len() {
+            return;
+        }
 
         self.append_mapped(
             source,
