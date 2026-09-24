@@ -163,3 +163,23 @@ fn deleting_the_last_word_character_keeps_a_surviving_table_cell_space() {
         );
     }
 }
+
+#[test]
+fn deleting_the_only_header_cell_character_keeps_caret_in_the_empty_cell() {
+    let source = "| a | b |\n| - | - |\n| c | d |";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "a  │  b\n\nc  │  d");
+
+    let edited = "a  │  \n\nc  │  d";
+    let update = projection.apply_edit(source, edited, 6..6).unwrap();
+    assert_eq!(update.source, "| a |  |\n| - | - |\n| c | d |");
+    let active = VisualProjection::from_markdown_with_selection(
+        &update.source,
+        Some(update.selection.clone()),
+    );
+    assert_eq!(active.text(), edited);
+    assert_eq!(
+        active.visual_char_range(&update.source, update.selection),
+        6..6
+    );
+}

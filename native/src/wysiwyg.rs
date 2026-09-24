@@ -730,6 +730,26 @@ impl VisualProjection {
             }
         }
 
+        if replacement.is_empty()
+            && selection.is_empty()
+            && self
+                .runs
+                .iter()
+                .any(|run| run.style.table && !run.style.marker && run.range == change.old)
+        {
+            // The last character of a padded cell can be deleted at a source
+            // byte that becomes hidden cell padding. With a following row,
+            // that byte may then project past the row break. Anchor the caret
+            // to the requested visual boundary in the completed source.
+            let reparsed = Self::from_markdown_with_context(&output, None, self.references.clone());
+            if reparsed.text() == edited
+                && reparsed.visual_char_for_source_byte(start_byte) != selection.start
+            {
+                start_byte = reparsed.source_boundaries[selection.start];
+                end_byte = start_byte;
+            }
+        }
+
         Some(VisualSourceEdit {
             selection: output[..start_byte].chars().count()..output[..end_byte].chars().count(),
             source: output,

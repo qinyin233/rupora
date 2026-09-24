@@ -431,6 +431,38 @@ fn hybrid_deleting_table_cell_tail_keeps_the_surviving_space() {
 }
 
 #[test]
+fn hybrid_deleting_a_header_cell_keeps_the_caret_in_that_cell() {
+    let source = "| a | b |\n| - | - |\n| c | d |";
+    let directory = tempfile::tempdir().unwrap();
+    let b = source.find('b').unwrap();
+    let mut app = app_at(directory.path(), source, b..b + 1);
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    frame(&mut app, &ctx, true, vec![]);
+    frame(
+        &mut app,
+        &ctx,
+        true,
+        vec![key(Key::Backspace, egui::Modifiers::NONE)],
+    );
+    assert_eq!(app.session[0].content, "| a |  |\n| - | - |\n| c | d |");
+    let active = VisualProjection::from_markdown_with_selection(
+        &app.session[0].content,
+        Some(app.active_selection(0)),
+    );
+    assert_eq!(
+        active.visual_char_range(&app.session[0].content, app.active_selection(0)),
+        6..6
+    );
+
+    frame(&mut app, &ctx, true, vec![egui::Event::Text("X".into())]);
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "a  │  X\n\nc  │  d"
+    );
+}
+
+#[test]
 fn leading_edits_before_enter_keep_their_input_semantics_and_history() {
     let cases = [
         (
