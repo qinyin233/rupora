@@ -4,6 +4,24 @@
 
 ## [Unreleased]
 
+## [2.0.0-alpha.4] - 2026-09-25
+
+### Fixed
+
+- 按原生事件顺序交付同一批次的文字、格式命令和窗口操作，保留输入所属文档与撤销边界。
+- 修复系统输入法替换选区、失焦后的迟到预编辑、候选框位置，以及源码模式预编辑误入文档历史的问题。
+- 修复所见即所得的嵌套列表、连续制表符、独立回车、嵌套强调与删除线、脚注和行内代码边界处的视觉文本到 Markdown 源码映射。
+- 加强并发保存目标和进程中断时的文件保护，避免失败写入覆盖已有正文。
+
+### Added
+
+- 为输入法、文档保存和投影修复补充回归与 Windows 原生输入验收记录。
+- 为三个 fuzz 目标加入可审阅的合成起始语料；手动 CI 可按目标运行 30–600 秒。
+
+### Known limitations
+
+- 最终安装包与跨平台真实输入法矩阵仍在 [#6](https://github.com/qinyin233/rupora/issues/6) 验收。
+
 ## [2.0.0-alpha.3] - 2026-09-23
 
 ### Fixed
@@ -100,7 +118,8 @@
 
 - 首个 Tauri 2 + Vue 3 + Vditor 版本。
 
-[Unreleased]: https://github.com/qinyin233/rupora/compare/v2.0.0-alpha.3...HEAD
+[Unreleased]: https://github.com/qinyin233/rupora/compare/v2.0.0-alpha.4...HEAD
+[2.0.0-alpha.4]: https://github.com/qinyin233/rupora/releases/tag/v2.0.0-alpha.4
 [2.0.0-alpha.3]: https://github.com/qinyin233/rupora/releases/tag/v2.0.0-alpha.3
 [2.0.0-alpha.2]: https://github.com/qinyin233/rupora/releases/tag/v2.0.0-alpha.2
 [2.0.0-alpha.1]: https://github.com/qinyin233/rupora/releases/tag/v2.0.0-alpha.1
