@@ -9,7 +9,9 @@ use rupora::{
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 96,
-        failure_persistence: None,
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::Direct("tests/properties.proptest-regressions")
+        )),
         ..ProptestConfig::default()
     })]
 

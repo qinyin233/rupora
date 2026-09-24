@@ -36,8 +36,9 @@ use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, Messag
 #[cfg(test)]
 use std::sync::Arc;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     fs,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -50,13 +51,27 @@ struct TableEditorState {
     table: MarkdownTable,
 }
 
-// Exists only between two passes of one Context::run_ui call. The extra pass
-// lets the real TextEdit finish earlier input before a format command and its
-// following input, without reimplementing TextEdit's editing/IME semantics.
+// TextEdit owns keyboard/IME semantics. Each stage lets it consume a prefix,
+// then applies one app command. A stage is acknowledged only after rendering
+// the editor, since eframe also calls logic while a window is hidden.
+const MAX_ORDERED_INPUT_PASSES: usize = 8;
+
+enum InputShortcut {
+    App(ShortcutAction),
+    Escape,
+    FindNext(bool),
+}
+
+struct OrderedInputStage {
+    events: Vec<egui::Event>,
+    command: Option<InputShortcut>,
+}
+
 struct OrderedInputPass {
     document_id: u64,
-    frame_nr: u64,
-    suffix: Vec<egui::Event>,
+    remaining: VecDeque<egui::Event>,
+    stage: Option<OrderedInputStage>,
+    last_pass: Option<(u64, usize)>,
     cursor: Option<CCursorRange>,
 }
 
@@ -87,6 +102,11 @@ pub struct RuporaApp {
     background: BackgroundTasks,
     about_open: bool,
     ordered_input_pass: Option<OrderedInputPass>,
+    ordered_input_budget: Option<NonZeroUsize>,
+    ordered_raw_input: VecDeque<egui::RawInput>,
+    ordered_shell_pending: bool,
+    ordered_pointer_barrier: bool,
+    replayed_close: bool,
 }
 
 impl RuporaApp {
@@ -276,6 +296,11 @@ impl RuporaApp {
             background: BackgroundTasks::new(extension_registry),
             about_open: false,
             ordered_input_pass: None,
+            ordered_input_budget: None,
+            ordered_raw_input: VecDeque::new(),
+            ordered_shell_pending: false,
+            ordered_pointer_barrier: false,
+            replayed_close: false,
         }
     }
 
@@ -486,11 +511,7 @@ impl RuporaApp {
         };
 
         let result = if let Some(path) = selected_path {
-            if let Some(encoding) = encoding {
-                self.session[index].save_as_with_encoding(path, true, encoding)
-            } else {
-                self.session[index].save_as(path, true)
-            }
+            self.save_to_selected_path(index, path, encoding)
         } else {
             self.session[index].save(overwrite_external)
         };
@@ -515,6 +536,24 @@ impl RuporaApp {
                 self.external_changes.forget(self.session[index].id());
             }
             Err(error) => self.show_error("保存失败", &error),
+        }
+    }
+
+    fn save_to_selected_path(
+        &mut self,
+        index: usize,
+        path: PathBuf,
+        encoding: Option<TextEncoding>,
+    ) -> Result<(), String> {
+        // The native save dialog confirms replacement of an existing file.
+        // An absent target must still reject a creator racing the actual write.
+        let overwrite_existing = path
+            .try_exists()
+            .map_err(|error| format!("无法检查保存目标 {}：{error}", path.display()))?;
+        if let Some(encoding) = encoding {
+            self.session[index].save_as_with_encoding(path, overwrite_existing, encoding)
+        } else {
+            self.session[index].save_as(path, overwrite_existing)
         }
     }
 
@@ -731,223 +770,51 @@ impl RuporaApp {
         if self.resume_ordered_input(ctx) {
             return;
         }
-        let bindings = self.state.key_bindings.clone();
         let document_editing = ctx.memory(|memory| memory.focused()).is_none_or(|focused| {
             Some(focused) == self.editor_surface.widget_id()
                 || TextEdit::load_state(ctx, focused).is_none()
         });
-        if document_editing {
-            let shortcuts = [
-                (bindings.redo.as_str(), AppCommand::Redo),
-                ("Ctrl+Y", AppCommand::Redo),
-                (bindings.undo.as_str(), AppCommand::Undo),
-                (
-                    bindings.bold.as_str(),
-                    AppCommand::Format(MarkdownCommand::Bold),
-                ),
-                (
-                    bindings.italic.as_str(),
-                    AppCommand::Format(MarkdownCommand::Italic),
-                ),
-                (
-                    bindings.link.as_str(),
-                    AppCommand::Format(MarkdownCommand::Link),
-                ),
-            ];
-            let can_defer_format = self.can_defer_format_input(ctx);
-            let can_split_format = can_defer_format && ctx.current_pass_index() == 0;
-            let deferred = ctx.input(|input| {
-                let (position, command) =
-                    input
-                        .events
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .find_map(|(position, event)| {
-                            let egui::Event::Key {
-                                key,
-                                pressed: true,
-                                modifiers,
-                                ..
-                            } = event
-                            else {
-                                return None;
-                            };
-                            shortcuts.iter().find_map(|(binding, command)| {
-                                let shortcut = parse_shortcut(binding)?;
-                                (*key == shortcut.logical_key
-                                    && modifiers.matches_logically(shortcut.modifiers))
-                                .then_some((position, *command))
-                            })
-                        })?;
-                let edits = |event: &egui::Event| {
-                    matches!(
-                        event,
-                        egui::Event::Text(_)
-                            | egui::Event::Paste(_)
-                            | egui::Event::Cut
-                            | egui::Event::Ime(_)
-                            | egui::Event::Key {
-                                key: Key::Backspace | Key::Delete | Key::Enter | Key::Tab,
-                                pressed: true,
-                                ..
-                            }
-                    )
-                };
-                let affects_editor = |event: &egui::Event| {
-                    edits(event)
-                        || matches!(
-                            event,
-                            egui::Event::Copy
-                                | egui::Event::Key { pressed: true, .. }
-                        )
-                };
-                let formatting = matches!(command, AppCommand::Format(_));
-                let matches_binding = |event: &egui::Event, binding: &str| {
-                    if let egui::Event::Key {
-                        key, pressed: true, modifiers, ..
-                    } = event {
-                        parse_shortcut(binding).is_some_and(|shortcut| {
-                            *key == shortcut.logical_key
-                                && modifiers.matches_logically(shortcut.modifiers)
-                        })
-                    } else {
-                        false
-                    }
-                };
-                let prior_shortcut = input.events[..position].iter().any(|event| {
-                    shortcuts.iter().any(|(binding, _)| matches_binding(event, binding))
-                });
-                // Keep shell shortcuts and pointer-driven focus changes on the
-                // existing route; only an isolated trailing format is deferred.
-                let other_action = input.events.iter().any(|event| {
-                    matches!(event,
-                        egui::Event::PointerButton { pressed: true, .. }
-                            | egui::Event::Key { key: Key::Escape | Key::F3, pressed: true, .. })
-                        || [
-                            &bindings.save_as, &bindings.save, &bindings.open_folder,
-                            &bindings.open_file, &bindings.new_document,
-                            &bindings.command_palette, &bindings.replace, &bindings.find,
-                        ].iter().any(|binding| matches_binding(event, binding))
-                });
-                let composing = input.events[..position]
+        if document_editing && self.can_defer_format_input(ctx) {
+            // On its first focused pass egui cannot install TextEdit's focus
+            // lock yet. Arrow keys still belong to this editor, not spatial
+            // navigation to the adjacent preview or sidebar.
+            ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+            if ctx.input(|input| {
+                input
+                    .events
                     .iter()
-                    .rev()
-                    .find_map(|event| {
-                        if let egui::Event::Ime(event) = event {
-                            Some(matches!(event, egui::ImeEvent::Preedit { text, .. } if !text.is_empty()))
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(false);
-                let has_suffix = input.events[position + 1..].iter().any(affects_editor);
-                let split = formatting && has_suffix && can_split_format;
-                let ordered = if formatting {
-                    can_defer_format
-                        && input.events[..position].iter().any(affects_editor)
-                        && (!has_suffix || split)
-                        && !prior_shortcut && !other_action && !composing
-                } else {
-                    input.events[..position].iter().any(edits)
-                        && !input.events[position + 1..].iter().any(edits)
-                };
-                if ordered
-                {
-                    Some((position, command, split))
-                } else {
-                    None
-                }
-            });
-            if let Some((position, command, split)) = deferred
-                && (!split || {
-                    ctx.request_discard("finish input before the following format shortcut");
-                    ctx.will_discard()
-                })
-            {
-                let suffix = ctx.input_mut(|input| {
-                    let suffix = split.then(|| input.events.split_off(position + 1));
-                    input.events.remove(position);
-                    suffix
+                    .any(|event| self.input_shortcut_action(event, true).is_some())
+            }) {
+                let events = ctx.input_mut(|input| std::mem::take(&mut input.events));
+                self.ordered_input_pass = Some(OrderedInputPass {
+                    document_id: self.session.active_id().expect("focused document exists"),
+                    remaining: events.into(),
+                    stage: None,
+                    last_pass: None,
+                    cursor: self.editor_surface.bookmark().cursor,
                 });
-                if let Some(suffix) = suffix {
-                    self.ordered_input_pass = Some(OrderedInputPass {
-                        document_id: self.session.active_id().expect("focused document exists"),
-                        frame_nr: ctx.cumulative_frame_nr(),
-                        suffix,
-                        cursor: None,
-                    });
-                }
-                match command {
-                    AppCommand::Undo => self.editor_surface.defer_history(false),
-                    AppCommand::Redo => self.editor_surface.defer_history(true),
-                    AppCommand::Format(command) => self.editor_surface.defer_format(command),
-                    _ => unreachable!("only editor commands are deferred"),
-                }
+                self.resume_ordered_input(ctx);
                 return;
             }
         }
-        let action = ctx.input_mut(|input| {
-            if document_editing
-                && (consume_shortcut(input, &bindings.redo) || consume_shortcut(input, "Ctrl+Y"))
-            {
-                Some(ShortcutAction::Command(AppCommand::Redo))
-            } else if document_editing && consume_shortcut(input, &bindings.undo) {
-                Some(ShortcutAction::Command(AppCommand::Undo))
-            } else if consume_shortcut(input, &bindings.save_as) {
-                Some(ShortcutAction::Command(AppCommand::SaveAs))
-            } else if consume_shortcut(input, &bindings.save) {
-                Some(ShortcutAction::Command(AppCommand::Save))
-            } else if consume_shortcut(input, &bindings.open_folder) {
-                Some(ShortcutAction::Command(AppCommand::OpenFolder))
-            } else if consume_shortcut(input, &bindings.open_file) {
-                Some(ShortcutAction::Command(AppCommand::Open))
-            } else if consume_shortcut(input, &bindings.new_document) {
-                Some(ShortcutAction::Command(AppCommand::New))
-            } else if consume_shortcut(input, &bindings.command_palette) {
-                Some(ShortcutAction::Palette)
-            } else if document_editing && consume_shortcut(input, &bindings.bold) {
-                Some(ShortcutAction::Command(AppCommand::Format(
-                    MarkdownCommand::Bold,
-                )))
-            } else if document_editing && consume_shortcut(input, &bindings.italic) {
-                Some(ShortcutAction::Command(AppCommand::Format(
-                    MarkdownCommand::Italic,
-                )))
-            } else if document_editing && consume_shortcut(input, &bindings.link) {
-                Some(ShortcutAction::Command(AppCommand::Format(
-                    MarkdownCommand::Link,
-                )))
-            } else if consume_shortcut(input, &bindings.replace) {
-                Some(ShortcutAction::Replace)
-            } else if consume_shortcut(input, &bindings.find) {
-                Some(ShortcutAction::Find)
-            } else {
-                None
-            }
+        // A pointer/focus transition keeps the native route. Still remove and
+        // execute individual app shortcuts in order: leaving Ctrl+K for
+        // TextEdit invokes its unrelated delete-to-end-of-paragraph command.
+        let actions = ctx.input_mut(|input| {
+            let mut actions = Vec::new();
+            input.events.retain(|event| {
+                if let Some(action) = self.input_shortcut_action(event, document_editing) {
+                    let keep_native_escape = matches!(action, InputShortcut::Escape);
+                    actions.push(action);
+                    keep_native_escape
+                } else {
+                    true
+                }
+            });
+            actions
         });
-
-        match action {
-            Some(ShortcutAction::Command(command)) => self.execute(command),
-            Some(ShortcutAction::Find | ShortcutAction::Replace) => {
-                self.find_open = true;
-                self.find_focus_requested = true;
-            }
-            Some(ShortcutAction::Palette) => {
-                self.command_palette_open = true;
-                self.command_focus_requested = true;
-            }
-            None => {}
-        }
-        if ctx.input(|input| input.key_pressed(Key::Escape)) {
-            if self.command_palette_open {
-                self.command_palette_open = false;
-            } else if self.find_open {
-                self.find_open = false;
-            }
-        }
-        if ctx.input(|input| input.key_pressed(Key::F3)) {
-            self.find_match(!ctx.input(|input| input.modifiers.shift));
+        for action in actions {
+            self.execute_shortcut_action(action);
         }
     }
 
@@ -977,6 +844,7 @@ impl RuporaApp {
                         matches!(
                             event,
                             egui::Event::Key { .. }
+                                | egui::Event::PointerMoved(_)
                                 | egui::Event::Text(_)
                                 | egui::Event::Paste(_)
                                 | egui::Event::Copy
@@ -987,35 +855,275 @@ impl RuporaApp {
             })
     }
 
+    fn editor_input_command(&self, event: &egui::Event) -> Option<AppCommand> {
+        let bindings = &self.state.key_bindings;
+        [
+            (bindings.redo.as_str(), AppCommand::Redo),
+            ("Ctrl+Y", AppCommand::Redo),
+            (bindings.undo.as_str(), AppCommand::Undo),
+            (
+                bindings.bold.as_str(),
+                AppCommand::Format(MarkdownCommand::Bold),
+            ),
+            (
+                bindings.italic.as_str(),
+                AppCommand::Format(MarkdownCommand::Italic),
+            ),
+            (
+                bindings.link.as_str(),
+                AppCommand::Format(MarkdownCommand::Link),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(binding, command)| event_matches_shortcut(event, binding).then_some(command))
+    }
+
+    fn input_shortcut_action(
+        &self,
+        event: &egui::Event,
+        document_editing: bool,
+    ) -> Option<InputShortcut> {
+        if document_editing && let Some(command) = self.editor_input_command(event) {
+            return Some(InputShortcut::App(ShortcutAction::Command(command)));
+        }
+        let bindings = &self.state.key_bindings;
+        [
+            (
+                &bindings.save_as,
+                ShortcutAction::Command(AppCommand::SaveAs),
+            ),
+            (&bindings.save, ShortcutAction::Command(AppCommand::Save)),
+            (
+                &bindings.open_folder,
+                ShortcutAction::Command(AppCommand::OpenFolder),
+            ),
+            (
+                &bindings.open_file,
+                ShortcutAction::Command(AppCommand::Open),
+            ),
+            (
+                &bindings.new_document,
+                ShortcutAction::Command(AppCommand::New),
+            ),
+            (&bindings.command_palette, ShortcutAction::Palette),
+            (&bindings.replace, ShortcutAction::Replace),
+            (&bindings.find, ShortcutAction::Find),
+        ]
+        .into_iter()
+        .find_map(|(binding, action)| {
+            event_matches_shortcut(event, binding).then_some(InputShortcut::App(action))
+        })
+        .or({
+            if let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            {
+                match key {
+                    Key::Escape => Some(InputShortcut::Escape),
+                    Key::F3 => Some(InputShortcut::FindNext(!modifiers.shift)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    fn execute_shortcut_action(&mut self, action: InputShortcut) {
+        let action = match action {
+            InputShortcut::Escape => {
+                if self.command_palette_open {
+                    self.command_palette_open = false;
+                } else if self.find_open {
+                    self.find_open = false;
+                }
+                return;
+            }
+            InputShortcut::FindNext(forward) => {
+                self.find_match(forward);
+                return;
+            }
+            InputShortcut::App(action) => action,
+        };
+        match action {
+            ShortcutAction::Command(command) => self.execute(command),
+            ShortcutAction::Find | ShortcutAction::Replace => {
+                self.find_open = true;
+                self.find_focus_requested = true;
+            }
+            ShortcutAction::Palette => {
+                self.command_palette_open = true;
+                self.command_focus_requested = true;
+            }
+        }
+    }
+
+    fn restore_ordered_input_budget(&mut self, ctx: &Context) {
+        if let Some(budget) = self.ordered_input_budget.take() {
+            ctx.options_mut(|options| options.max_passes = budget);
+        }
+    }
+
+    fn enqueue_ordered_raw_input(&mut self, ctx: &Context, raw: egui::RawInput) {
+        self.ordered_pointer_barrier |= raw.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::PointerButton { .. } | egui::Event::Touch { .. }
+            )
+        });
+        let only_hover = |input: &egui::RawInput| {
+            input
+                .events
+                .iter()
+                .all(|event| matches!(event, egui::Event::PointerMoved(_)))
+                && input.dropped_files.is_empty()
+                && !input.viewport().close_requested()
+        };
+        if let Some(last) = self.ordered_raw_input.back_mut()
+            && !self.ordered_pointer_barrier
+            && ctx.input(|input| !input.pointer.any_down() && !input.any_touches())
+            && last.focused == raw.focused
+            && only_hover(last)
+            && only_hover(&raw)
+        {
+            // Motion without buttons cannot edit or change keyboard ownership.
+            // Retain its latest native state instead of one packet per repaint.
+            *last = raw;
+        } else {
+            self.ordered_raw_input.push_back(raw);
+        }
+    }
+
     fn resume_ordered_input(&mut self, ctx: &Context) -> bool {
         let Some(pending) = self.ordered_input_pass.as_ref() else {
             return false;
         };
-        if pending.frame_nr == ctx.cumulative_frame_nr() && ctx.current_pass_index() == 0 {
-            return false;
+        let pass = (ctx.cumulative_frame_nr(), ctx.current_pass_index());
+        if pending.last_pass == Some(pass) {
+            return true;
         }
         let Some(index) = self.session.index_of(pending.document_id) else {
-            // Session removal is guarded while this pass is pending. Retain
-            // the input if an internal caller ever violates that invariant.
             self.status = "输入目标暂不可用，待处理文字已保留".to_owned();
+            ctx.input_mut(|input| input.events.clear());
             return true;
         };
-        let pending = self
-            .ordered_input_pass
-            .take()
-            .expect("checked pending pass");
+        let cursor = pending.cursor;
         if self.session.active_index() != Some(index) {
             self.activate_document(index);
-            if let Some(cursor) = pending.cursor {
+            if let Some(cursor) = cursor {
                 self.editor_surface.select_cursor(cursor);
             }
         }
-        ctx.input_mut(|input| {
-            let mut events = pending.suffix;
-            events.append(&mut input.events);
-            input.events = events;
-        });
+        // Hidden passes do not register the widget with egui's focus system.
+        // This prefix was received while the editor owned input, so restore its
+        // focus before replaying it rather than acknowledging ignored text.
+        if let Some(id) = self.editor_surface.widget_id() {
+            ctx.memory_mut(|memory| {
+                if !memory.has_focus(id) {
+                    memory.request_focus(id);
+                }
+            });
+        }
+        let mut pending = self
+            .ordered_input_pass
+            .take()
+            .expect("pending editor input");
+        if pending.stage.is_none() {
+            let mut events = Vec::new();
+            let mut command = None;
+            while let Some(event) = pending.remaining.pop_front() {
+                if let Some(next) = self.input_shortcut_action(&event, true) {
+                    // Escape must still reach TextEdit to cancel IME/focus.
+                    if matches!(next, InputShortcut::Escape) {
+                        events.push(event);
+                    }
+                    command = Some(next);
+                    break;
+                }
+                events.push(event);
+            }
+            pending.stage = Some(OrderedInputStage { events, command });
+        }
+        let stage = pending.stage.as_ref().expect("stage prepared");
+        ctx.input_mut(|input| input.events.clone_from(&stage.events));
+        match stage.command.as_ref() {
+            Some(InputShortcut::App(ShortcutAction::Command(AppCommand::Undo))) => {
+                self.editor_surface.defer_history(false)
+            }
+            Some(InputShortcut::App(ShortcutAction::Command(AppCommand::Redo))) => {
+                self.editor_surface.defer_history(true)
+            }
+            Some(InputShortcut::App(ShortcutAction::Command(AppCommand::Format(command)))) => {
+                self.editor_surface.defer_format(*command)
+            }
+            _ => {} // Shell commands execute after the editor acknowledges the prefix.
+        }
+        pending.last_pass = Some(pass);
+        self.ordered_input_pass = Some(pending);
         true
+    }
+
+    fn finish_ordered_input_stage(&mut self, ctx: &Context, document_id: u64) {
+        let Some(pending) = &mut self.ordered_input_pass else {
+            return;
+        };
+        if pending.document_id != document_id
+            || pending.last_pass != Some((ctx.cumulative_frame_nr(), ctx.current_pass_index()))
+        {
+            return;
+        }
+        let Some(stage) = pending.stage.take() else {
+            return;
+        };
+        pending.cursor = self.editor_surface.bookmark().cursor;
+        if let Some(action) = stage.command.as_ref()
+            && !matches!(
+                action,
+                InputShortcut::App(ShortcutAction::Command(
+                    AppCommand::Undo | AppCommand::Redo | AppCommand::Format(_)
+                ))
+            )
+        {
+            let pending = self
+                .ordered_input_pass
+                .take()
+                .expect("acknowledged shell barrier");
+            if !pending.remaining.is_empty() {
+                let mut suffix = ctx.input(|input| input.raw.clone());
+                suffix.events = pending.remaining.into();
+                self.ordered_raw_input.push_front(suffix);
+            }
+            self.execute_shortcut_action(stage.command.expect("shell command"));
+            if self.session.active_id() != Some(document_id) {
+                let cursor = self
+                    .editor_surface
+                    .bookmark()
+                    .cursor
+                    .unwrap_or_else(|| CCursorRange::one(CCursor::new(0)));
+                self.editor_surface.select_cursor(cursor);
+            }
+            // Paint the new document/dialog once before returning its suffix
+            // to native input routing. Its widget/focus may not exist yet.
+            self.ordered_shell_pending = true;
+            ctx.request_discard("establish focus after an input shell command");
+            ctx.request_repaint();
+            return;
+        }
+        if stage.command.is_none() && pending.remaining.is_empty() {
+            self.ordered_input_pass = None;
+            self.restore_ordered_input_budget(ctx);
+            if !self.ordered_raw_input.is_empty() {
+                ctx.request_repaint();
+            }
+        } else {
+            ctx.request_discard("continue editor input in event order");
+            // The per-frame pass cap is deliberate. The remaining stages stay
+            // owned by this document and resume before any new native input.
+            ctx.request_repaint();
+        }
     }
 
     fn execute(&mut self, command: AppCommand) {
@@ -3031,11 +3139,7 @@ impl RuporaApp {
                 base_path: &base_path,
             },
         );
-        if let Some(pending) = &mut self.ordered_input_pass
-            && pending.document_id == self.session[index].id()
-        {
-            pending.cursor = self.editor_surface.bookmark().cursor;
-        }
+        let document_id = self.session[index].id();
         if !output.notice.is_empty() {
             self.status = output.notice;
         }
@@ -3048,6 +3152,7 @@ impl RuporaApp {
                 EditorCommand::EditTable => AppCommand::EditTable,
             });
         }
+        self.finish_ordered_input_stage(ui.ctx(), document_id);
     }
 
     #[cfg(test)]
@@ -3252,9 +3357,10 @@ impl RuporaApp {
         }
     }
 
-    fn confirm_application_close(&mut self, ctx: &Context) {
+    /// Returns whether this call already sent an explicit Close command.
+    fn confirm_application_close(&mut self, ctx: &Context) -> bool {
         if self.allow_close || !ctx.input(|input| input.viewport().close_requested()) {
-            return;
+            return false;
         }
         if !self
             .session
@@ -3263,7 +3369,7 @@ impl RuporaApp {
             .any(|document| document.dirty)
         {
             self.allow_close = true;
-            return;
+            return false;
         }
 
         ctx.send_viewport_cmd(ViewportCommand::CancelClose);
@@ -3277,12 +3383,92 @@ impl RuporaApp {
             self.allow_close = true;
             self.discard_recovery_on_exit = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
+            return true;
         }
+        false
     }
 }
 
 impl eframe::App for RuporaApp {
+    fn raw_input_hook(&mut self, ctx: &Context, raw: &mut egui::RawInput) {
+        // Child viewports do not run the root editor, and must not drain its
+        // queue or change the pass budget of a root run still in progress.
+        if raw.viewport_id != egui::ViewportId::ROOT {
+            return;
+        }
+        self.restore_ordered_input_budget(ctx);
+        self.replayed_close = false;
+        if self.ordered_input_pass.is_some()
+            || self.ordered_shell_pending
+            || !self.ordered_raw_input.is_empty()
+        {
+            // Keep whole native packets: pointer/focus state is computed by
+            // begin_pass and cannot be faithfully replayed through events alone.
+            let close_requested = raw.viewport().close_requested();
+            if !raw.events.is_empty()
+                || !raw.dropped_files.is_empty()
+                || !raw.hovered_files.is_empty()
+                || raw.viewport().close_requested()
+                || raw.focused
+                    != self
+                        .ordered_raw_input
+                        .back()
+                        .map_or_else(|| ctx.input(|input| input.focused), |queued| queued.focused)
+            {
+                self.enqueue_ordered_raw_input(ctx, raw.take());
+            }
+            if close_requested {
+                // eframe captures this request before calling raw_input_hook.
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                if self.ordered_input_pass.is_some() || self.ordered_shell_pending {
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+            }
+            if self.ordered_input_pass.is_some() || self.ordered_shell_pending {
+                raw.events.clear();
+                raw.dropped_files.clear();
+                raw.hovered_files.clear();
+                if self.ordered_input_pass.is_some() {
+                    raw.focused = true;
+                }
+                raw.viewports
+                    .get_mut(&raw.viewport_id)
+                    .unwrap()
+                    .events
+                    .clear();
+            } else if let Some(mut queued) = self.ordered_raw_input.pop_front() {
+                // Replay event ownership, but keep the native clock monotonic.
+                queued.time = raw.time;
+                self.replayed_close = queued.viewport().close_requested();
+                *raw = queued;
+                if self.ordered_raw_input.is_empty() {
+                    self.ordered_pointer_barrier = false;
+                }
+            }
+        }
+        let command_count = if self.ordered_input_pass.is_some() || self.ordered_shell_pending {
+            MAX_ORDERED_INPUT_PASSES
+        } else {
+            raw.events
+                .iter()
+                .filter(|event| self.input_shortcut_action(event, true).is_some())
+                .count()
+                .saturating_add(1)
+        };
+        if command_count > 1 {
+            let budget = ctx.options(|options| options.max_passes);
+            let reserved = command_count.clamp(2, MAX_ORDERED_INPUT_PASSES);
+            self.ordered_input_budget = Some(budget);
+            ctx.options_mut(|options| options.max_passes = NonZeroUsize::new(reserved).unwrap());
+        }
+    }
+
     fn logic(&mut self, ctx: &Context, _frame: &mut Frame) {
+        if self.ordered_shell_pending {
+            return;
+        }
         if self.resume_ordered_input(ctx) {
             return;
         }
@@ -3299,13 +3485,29 @@ impl eframe::App for RuporaApp {
         if self.ordered_input_pass.is_some() {
             return;
         }
+        self.restore_ordered_input_budget(ctx);
         self.handle_dropped_files(ctx);
         self.save_recovery_snapshot_if_due();
         self.check_external_changes_if_due();
-        self.confirm_application_close(ctx);
+        let close_sent = self.confirm_application_close(ctx);
+        // One native close request may span several egui passes, but should
+        // prompt (or issue the replayed Close command) only once.
+        ctx.input_mut(|input| {
+            input
+                .raw
+                .viewports
+                .get_mut(&input.raw.viewport_id)
+                .unwrap()
+                .events
+                .retain(|event| !matches!(event, egui::ViewportEvent::Close));
+        });
+        if std::mem::take(&mut self.replayed_close) && self.allow_close && !close_sent {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
+        let completing_shell_barrier = self.ordered_shell_pending;
         self.navigation_rail(ui);
         self.sidebar(ui);
         self.top_bar(ui);
@@ -3320,6 +3522,11 @@ impl eframe::App for RuporaApp {
         self.outline(ui);
         self.editor_tabs(ui);
         self.editor(ui);
+        if completing_shell_barrier {
+            self.ordered_shell_pending = false;
+            self.restore_ordered_input_budget(ui.ctx());
+            ui.ctx().request_repaint();
+        }
     }
 
     fn save(&mut self, storage: &mut dyn Storage) {
@@ -3352,6 +3559,22 @@ impl eframe::App for RuporaApp {
             let _ = self.recovery_store.save(self.session.documents());
         }
         diagnostics::append_event("INFO", "RUPORA exited normally").ok();
+    }
+}
+
+fn event_matches_shortcut(event: &egui::Event, binding: &str) -> bool {
+    if let egui::Event::Key {
+        key,
+        pressed: true,
+        modifiers,
+        ..
+    } = event
+    {
+        parse_shortcut(binding).is_some_and(|shortcut| {
+            *key == shortcut.logical_key && modifiers.matches_logically(shortcut.modifiers)
+        })
+    } else {
+        false
     }
 }
 
@@ -3416,10 +3639,6 @@ fn parse_shortcut(specification: &str) -> Option<egui::KeyboardShortcut> {
         modifiers,
         logical_key: key?,
     })
-}
-
-fn consume_shortcut(input: &mut egui::InputState, specification: &str) -> bool {
-    parse_shortcut(specification).is_some_and(|shortcut| input.consume_shortcut(&shortcut))
 }
 
 fn shortcut_row(ui: &mut Ui, label: &str, shortcut: &mut String) {

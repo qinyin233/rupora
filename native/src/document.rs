@@ -594,7 +594,8 @@ impl Document {
             .path
             .as_ref()
             .ok_or_else(|| "文档尚未选择保存路径".to_owned())?;
-        if !overwrite_external && self.has_external_changes()? {
+        let target_fingerprint = fingerprint(path)?;
+        if !overwrite_external && target_fingerprint != self.file_fingerprint {
             return Err(format!(
                 "文件已被其他程序修改：{}。保存会覆盖外部修改。",
                 path.display()
@@ -603,7 +604,7 @@ impl Document {
         let content = self.line_ending.apply(&self.content);
         let bytes = encode_text(&content, &encoding)?;
         ensure_document_size(bytes.len())?;
-        write_atomically(path, &bytes, true)?;
+        write_atomically(path, &bytes, &target_fingerprint)?;
         self.file_fingerprint = Some(fingerprint_from_bytes(path, &bytes));
         self.saved_content.clone_from(&self.content);
         self.dirty = false;
@@ -640,10 +641,14 @@ impl Document {
         }
 
         let new_lock = DocumentLock::acquire(&path)?;
+        let target_fingerprint = fingerprint(&path)?;
+        if target_fingerprint.is_some() && !overwrite_existing {
+            return Err(format!("目标文件已存在：{}", path.display()));
+        }
         let content = self.line_ending.apply(&self.content);
         let bytes = encode_text(&content, &encoding)?;
         ensure_document_size(bytes.len())?;
-        write_atomically(&path, &bytes, overwrite_existing)?;
+        write_atomically(&path, &bytes, &target_fingerprint)?;
 
         self.path = Some(path.clone());
         self.lock = Some(new_lock);
@@ -799,6 +804,13 @@ fn canonical_document_path(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn canonical_save_target(path: &Path) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    let absolute = std::path::absolute(path)
+        .map_err(|error| format!("无法解析文档路径 {}：{error}", path.display()))?;
+    // Apply Win32 normalization to ordinary input before adding the canonical
+    // parent's verbatim prefix. Explicit verbatim input retains its spelling.
+    #[cfg(windows)]
+    let path = absolute.as_path();
     if path.exists() {
         return canonical_document_path(path);
     }
@@ -809,7 +821,14 @@ fn canonical_save_target(path: &Path) -> Result<PathBuf, String> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    Ok(canonical_document_path(parent)?.join(file_name))
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|error| format!("无法解析文档路径 {}：{error}", parent.display()))?;
+    // Decide whether the verbatim prefix is needed after adding the new name.
+    // A normal parent can still contain a target such as `file.md.`.
+    Ok(normalize_windows_verbatim_path(
+        canonical_parent.join(file_name),
+    ))
 }
 
 #[cfg(windows)]
@@ -823,9 +842,21 @@ fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
     let Some(Component::Prefix(prefix)) = components.next() else {
         return path;
     };
+    // Removing the prefix would make Win32 reinterpret these components. Keep
+    // their native spelling for both file access and the document lock key.
+    if components.clone().any(|component| {
+        matches!(component, Component::Normal(name) if windows_component_requires_verbatim(name))
+    }) {
+        return path;
+    }
     let mut normalized = match prefix.kind() {
         Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
         Prefix::VerbatimUNC(server, share) => {
+            if windows_component_requires_verbatim(server)
+                || windows_component_requires_verbatim(share)
+            {
+                return path;
+            }
             let mut prefix = OsString::from(r"\\");
             prefix.push(server);
             prefix.push(r"\");
@@ -836,6 +867,35 @@ fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
     };
     normalized.push(components.as_path());
     normalized
+}
+
+#[cfg(windows)]
+fn windows_component_requires_verbatim(name: &std::ffi::OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    if matches!(name.encode_wide().last(), Some(0x20 | 0x2e)) {
+        return true;
+    }
+
+    // DOS device names are reserved even with an extension. Compare native
+    // units without lossy Unicode conversion or expanding case mappings.
+    let mut stem = name
+        .encode_wide()
+        .take_while(|unit| *unit != u16::from(b'.'))
+        .map(|unit| match unit {
+            0x61..=0x7a => unit - 0x20,
+            _ => unit,
+        })
+        .collect::<Vec<_>>();
+    while stem.last() == Some(&u16::from(b' ')) {
+        stem.pop();
+    }
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$"]
+        .iter()
+        .any(|reserved| stem.iter().copied().eq(reserved.encode_utf16()))
+        || (stem.len() == 4
+            && (stem[..3] == [0x43, 0x4f, 0x4d] || stem[..3] == [0x4c, 0x50, 0x54])
+            && matches!(stem[3], 0x31..=0x39 | 0xb9 | 0xb2 | 0xb3))
 }
 
 #[cfg(not(windows))]
@@ -1232,7 +1292,11 @@ fn text_hash(text: &str) -> u64 {
     hasher.finish()
 }
 
-fn write_atomically(path: &Path, bytes: &[u8], overwrite_existing: bool) -> Result<(), String> {
+fn write_atomically(
+    path: &Path,
+    bytes: &[u8],
+    expected: &Option<FileFingerprint>,
+) -> Result<(), String> {
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -1260,7 +1324,18 @@ fn write_atomically(path: &Path, bytes: &[u8], overwrite_existing: bool) -> Resu
         fs::write(path, b"concurrent creator")
             .map_err(|error| format!("测试无法创建并发目标 {}：{error}", path.display()))?;
     }
-    if overwrite_existing {
+    // Encoding and syncing the temporary file can take long enough for another
+    // writer to change the target. Recheck the version observed before preparing
+    // this write.
+    // This is not a filesystem compare-and-swap: an existing target can still
+    // change between this check and rename. New targets use an atomic no-clobber.
+    if &fingerprint(path)? != expected {
+        return Err(format!(
+            "文件在保存期间发生变化：{}。已保留磁盘版本，请重新检查后再保存。",
+            path.display()
+        ));
+    }
+    if expected.is_some() {
         temporary
             .persist(path)
             .map_err(|error| format!("无法替换 {}：{}", path.display(), error.error))?;
@@ -1292,7 +1367,7 @@ fn sync_parent_directory(_parent: &Path) -> Result<(), String> {
 #[cfg(test)]
 thread_local! {
     static FAIL_BEFORE_ATOMIC_PERSIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static CREATE_TARGET_BEFORE_ATOMIC_PERSIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static CREATE_TARGET_BEFORE_ATOMIC_PERSIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn trim_history(history: &mut Vec<EditTransaction>) {
@@ -1393,6 +1468,88 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn verbatim_file_names_keep_their_contents_and_save_target() {
+        for suffix in [".", " "] {
+            let directory = tempfile::tempdir().unwrap();
+            let ordinary = directory.path().join("note.md");
+            let native = PathBuf::from(format!(r"\\?\{}{suffix}", ordinary.display()));
+            fs::write(&ordinary, "ordinary file").unwrap();
+            fs::write(&native, "native file").unwrap();
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+
+            let mut document = Document::open(&native).unwrap();
+            assert_eq!(document.content, "native file");
+            assert!(Document::open(&native).is_err());
+            assert!(Document::open(&ordinary).is_ok());
+            document.edit(EditKind::Typing, None, |text| {
+                *text = "updated native file".to_owned();
+                None
+            });
+            document.save(false).unwrap();
+            assert_eq!(fs::read_to_string(&native).unwrap(), "updated native file");
+            assert_eq!(fs::read_to_string(&ordinary).unwrap(), "ordinary file");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_as_keeps_verbatim_new_names_and_parent_components() {
+        for (name, parent_name) in [
+            ("new.md.", "folder"),
+            ("new.md ", "folder"),
+            ("new.md", "folder."),
+            ("new.md", "folder "),
+            ("NUL.md", "folder"),
+            ("CON", "folder"),
+            ("COM1.md", "folder"),
+            ("COM¹.md", "folder"),
+            ("new.md", "NUL"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let parent =
+                PathBuf::from(format!(r"\\?\{}\{parent_name}", directory.path().display()));
+            fs::create_dir(&parent).unwrap();
+            let target = parent.join(name);
+            let mut document = Document::untitled(1);
+            document.edit(EditKind::Typing, None, |text| {
+                *text = "native draft".to_owned();
+                None
+            });
+
+            document.save_as(target.clone(), false).unwrap();
+
+            assert_eq!(fs::read_to_string(&target).unwrap(), "native draft");
+            assert!(Document::open(&target).is_err());
+            drop(document);
+            assert_eq!(Document::open(&target).unwrap().content, "native draft");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_as_keeps_win32_normalization_for_non_verbatim_new_names() {
+        for suffix in [".", " "] {
+            let directory = tempfile::tempdir().unwrap();
+            let ordinary = directory.path().join("new.md");
+            let target = directory.path().join(format!("new.md{suffix}"));
+            let native = PathBuf::from(format!(r"\\?\{}", target.display()));
+            let mut document = Document::untitled(1);
+            document.edit(EditKind::Typing, None, |text| {
+                *text = "normal draft".to_owned();
+                None
+            });
+
+            document.save_as(target.clone(), false).unwrap();
+
+            assert_eq!(fs::read_to_string(&ordinary).unwrap(), "normal draft");
+            assert!(!native.exists());
+            assert!(Document::open(&ordinary).is_err());
+            assert!(Document::open(&target).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn normalizes_only_verbatim_disk_and_unc_prefixes() {
         for (source, expected) in [
             (r"\\?\C:\notes\中文.md", r"C:\notes\中文.md"),
@@ -1409,6 +1566,29 @@ mod tests {
             assert_eq!(
                 normalize_windows_verbatim_path(PathBuf::from(source)),
                 PathBuf::from(expected),
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preserves_verbatim_components_with_native_path_semantics() {
+        for path in [
+            r"\\?\C:\notes\file.md.",
+            r"\\?\C:\notes\file.md ",
+            r"\\?\C:\notes.\file.md",
+            r"\\?\C:\notes \file.md",
+            r"\\?\C:\notes\NUL.md",
+            r"\\?\C:\notes\con",
+            r"\\?\C:\notes\COM1.md",
+            r"\\?\C:\notes\LPT³.md",
+            r"\\?\C:\NUL\file.md",
+            r"\\?\UNC\server\share.\file.md",
+            r"\\?\UNC\server\share\notes.\file.md",
+        ] {
+            assert_eq!(
+                normalize_windows_verbatim_path(PathBuf::from(path)),
+                PathBuf::from(path),
             );
         }
     }
@@ -2118,6 +2298,56 @@ mod tests {
         assert_eq!(fs::read_to_string(target).unwrap(), "concurrent creator");
         assert!(document.path.is_none());
         assert!(document.dirty);
+    }
+
+    #[test]
+    fn save_rechecks_external_content_before_atomic_commit() {
+        for overwrite_external in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("atomic-race.md");
+            fs::write(&path, "original disk content").unwrap();
+            let mut document = Document::open(&path).unwrap();
+            document.edit(EditKind::Typing, None, |text| {
+                *text = "local edit".to_owned();
+                None
+            });
+            let snapshot = document.snapshot();
+            CREATE_TARGET_BEFORE_ATOMIC_PERSIST.with(|create| create.set(true));
+
+            let result = document.save(overwrite_external);
+
+            assert_eq!(fs::read_to_string(&path).unwrap(), "concurrent creator");
+            assert!(result.is_err());
+            assert_eq!(document.snapshot(), snapshot);
+            assert!(document.dirty);
+            assert!(document.can_undo());
+        }
+    }
+
+    #[test]
+    fn save_as_rechecks_confirmed_target_before_atomic_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.md");
+        let target = directory.path().join("existing-target.md");
+        fs::write(&original, "original content").unwrap();
+        fs::write(&target, "confirmed target content").unwrap();
+        let mut document = Document::open(&original).unwrap();
+        document.edit(EditKind::Typing, None, |text| {
+            *text = "local edit".to_owned();
+            None
+        });
+        let snapshot = document.snapshot();
+        CREATE_TARGET_BEFORE_ATOMIC_PERSIST.with(|create| create.set(true));
+
+        let result = document.save_as(target.clone(), true);
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "concurrent creator");
+        assert_eq!(fs::read_to_string(&original).unwrap(), "original content");
+        assert!(result.is_err());
+        assert_eq!(document.snapshot(), snapshot);
+        assert!(document.dirty);
+        assert!(Document::open(&original).is_err());
+        assert!(Document::open(&target).is_ok());
     }
 
     #[test]

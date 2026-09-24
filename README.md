@@ -242,6 +242,7 @@ cargo build --locked --example extension_uppercase
 | [整体评估](docs/PROJECT-ASSESSMENT-2026-09-10.md) | 源码行为评估、架构升级依据、验证和剩余限制 |
 | [路线图](docs/ROADMAP.md) | P1–P8 完成情况与后续边界 |
 | [质量](docs/QUALITY.md) | 测试层次、性能预算和依赖策略 |
+| [可靠性](docs/RELIABILITY.md) | 输入、保存、恢复的行为契约与持续验收任务 |
 | [发布](docs/RELEASE.md) | 多平台打包、签名、验证与回滚 |
 | [扩展](docs/EXTENSIONS.md) | 进程外协议、权限和资源限制 |
 | [变更记录](CHANGELOG.md) | 版本演进与已知限制 |
