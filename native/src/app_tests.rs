@@ -2897,7 +2897,8 @@ fn selected_save_path_does_not_overwrite_a_concurrent_creator() {
         assert_eq!(fs::read_to_string(path).unwrap(), "concurrent creator");
         assert!(result.is_err());
         assert_eq!(app.session[0].snapshot(), snapshot);
-        assert_eq!(app.session[0].path.as_deref(), Some(original.as_path()));
+        // Opening resolves short paths and symlinks before saving starts.
+        assert_eq!(app.session[0].path.as_deref(), snapshot.path());
         assert_eq!(app.session[0].encoding, TextEncoding::Utf16Le);
         assert_eq!(
             app.session[0].line_ending,
