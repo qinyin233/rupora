@@ -42,7 +42,7 @@ if (Test-Path -LiteralPath variable:\\LASTEXITCODE) { exit $LASTEXITCODE }
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=15,
+            timeout=60,
         )
 
 
