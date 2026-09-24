@@ -1,6 +1,174 @@
 use rupora::wysiwyg::VisualProjection;
 
 #[test]
+fn replacing_text_across_emphasis_closer_keeps_plain_suffix_hidden() {
+    let source = "a *em* b";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "a em b");
+
+    // Replace the final formatted character and the following plain space.
+    let edited = "a e中🙂b";
+    let update = projection.apply_edit(source, edited, 5..5).unwrap();
+    let reparsed = VisualProjection::from_markdown(&update.source);
+    assert_eq!(
+        reparsed.text(),
+        edited,
+        "updated source: {:?}",
+        update.source
+    );
+    assert_eq!(
+        VisualProjection::from_markdown_with_selection(
+            &update.source,
+            Some(update.selection.clone())
+        )
+        .text(),
+        edited
+    );
+    let runs = reparsed.runs_for(reparsed.text());
+    assert!(runs.iter().any(|run| run.style.emphasis));
+    assert!(
+        runs.iter()
+            .any(|run| !run.style.emphasis && run.range.contains(&5))
+    );
+}
+
+#[test]
+fn deleting_formatted_tail_keeps_the_remaining_space_visible_without_markers() {
+    for (source, edited) in [
+        ("*italic abc*", "italic "),
+        ("**strong abc**", "strong "),
+        ("**outer *inner* rest**", "outer inner "),
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        let caret = edited.chars().count();
+        let update = projection.apply_edit(source, edited, caret..caret).unwrap();
+        assert_eq!(
+            VisualProjection::from_markdown(&update.source).text(),
+            edited,
+            "updated source: {:?}",
+            update.source
+        );
+        let styles = VisualProjection::from_markdown(&update.source);
+        let runs = styles.runs_for(styles.text());
+        assert!(
+            runs.iter()
+                .any(|run| run.style.emphasis || run.style.strong)
+        );
+        assert_eq!(
+            VisualProjection::from_markdown_with_selection(
+                &update.source,
+                Some(update.selection.clone())
+            )
+            .text(),
+            edited
+        );
+        let active = VisualProjection::from_markdown_with_selection(
+            &update.source,
+            Some(update.selection.clone()),
+        );
+        let next = format!("{edited}X");
+        let caret = next.chars().count();
+        let next_update = active
+            .apply_edit(&update.source, &next, caret..caret)
+            .unwrap();
+        assert_eq!(
+            VisualProjection::from_markdown(&next_update.source).text(),
+            next
+        );
+    }
+}
+
+#[test]
+fn replacing_across_adjacent_formatting_keeps_both_markers_hidden() {
+    let source = "前**粗体**后*斜体*尾";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "前粗体后斜体尾");
+    let edited = "前粗中🙂体尾";
+    let update = projection.apply_edit(source, edited, 4..4).unwrap();
+    assert_eq!(
+        VisualProjection::from_markdown(&update.source).text(),
+        edited,
+        "updated source: {:?}",
+        update.source
+    );
+    let styles = VisualProjection::from_markdown(&update.source);
+    let runs = styles.runs_for(styles.text());
+    assert!(runs.iter().any(|run| run.style.strong));
+    assert!(runs.iter().any(|run| run.style.emphasis));
+    assert_eq!(
+        VisualProjection::from_markdown_with_selection(
+            &update.source,
+            Some(update.selection.clone())
+        )
+        .text(),
+        edited
+    );
+}
+
+#[test]
+fn deleting_first_list_word_keeps_the_following_space_editable() {
+    let source = "- one **bold** then *em*";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "• one bold then em");
+    let edited = "•  bold then em";
+    let update = projection.apply_edit(source, edited, 2..2).unwrap();
+    assert_eq!(
+        VisualProjection::from_markdown(&update.source).text(),
+        edited,
+        "updated source: {:?}",
+        update.source
+    );
+    let styles = VisualProjection::from_markdown(&update.source);
+    let runs = styles.runs_for(styles.text());
+    assert!(runs.iter().any(|run| run.style.strong));
+    assert!(runs.iter().any(|run| run.style.emphasis));
+    assert_eq!(
+        VisualProjection::from_markdown_with_selection(
+            &update.source,
+            Some(update.selection.clone())
+        )
+        .text(),
+        edited
+    );
+    let active =
+        VisualProjection::from_markdown_with_selection(&update.source, Some(update.selection));
+    let next = "• X bold then em";
+    let next_update = active.apply_edit(&update.source, next, 3..3).unwrap();
+    assert_eq!(
+        VisualProjection::from_markdown(&next_update.source).text(),
+        next
+    );
+}
+
+#[test]
+fn replacing_first_list_word_with_space_keeps_every_space_visible() {
+    for source in [
+        "- one **bold** then *em*",
+        "+ one **bold** then *em*",
+        "* one **bold** then *em*",
+        "1. one **bold** then *em*",
+        "- [ ] one **bold** then *em*",
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        let start_byte = projection.text().find("one").unwrap();
+        let start = projection.text()[..start_byte].chars().count();
+        for spaces in 1..=3 {
+            let edited = projection.text().replacen("one", &" ".repeat(spaces), 1);
+            let caret = start + spaces;
+            let update = projection
+                .apply_edit(source, &edited, caret..caret)
+                .unwrap();
+            assert_eq!(
+                VisualProjection::from_markdown(&update.source).text(),
+                edited,
+                "original: {source:?}, updated source: {:?}",
+                update.source
+            );
+        }
+    }
+}
+
+#[test]
 fn thematic_break_does_not_replay_tabs_consumed_by_its_source_range() {
     let source = "x\n**\t*\t\t\t\t\t\t";
     let projection = VisualProjection::from_markdown(source);

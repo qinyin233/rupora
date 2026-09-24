@@ -595,6 +595,21 @@ impl VisualProjection {
         for range in &retained {
             inserted.push_str(&source[range.clone()]);
         }
+        let mut retained_offset =
+            source_start + decoded_prefix.len() + replacement.len() + decoded_suffix.len();
+        let mut retained_flanking_closers = Vec::new();
+        for range in &retained {
+            let start = retained_offset;
+            retained_offset += range.end - range.start;
+            if image_closers.is_empty()
+                && self.inline_wrappers.iter().any(|wrapper| {
+                    *range == (wrapper.content.end..wrapper.source.end)
+                        && inline_flanking_wrapper(source, &wrapper.source)
+                })
+            {
+                retained_flanking_closers.push((start, retained_offset));
+            }
+        }
         output.replace_range(source_start..source_end, &inserted);
         let mut delta = inserted.len() as isize - (source_end - source_start) as isize;
         let mut start_byte = self.edited_source_byte(
@@ -638,6 +653,7 @@ impl VisualProjection {
         // Removing an image's visual marker consumes its opening `![`.
         // Remove the matching destination too, while leaving the remaining
         // alt source (and any nested formatting or enclosing link) intact.
+        let removed_image_closer = !image_closers.is_empty();
         image_closers.sort_by_key(|range| range.start);
         let mut removed_closer_bytes = 0usize;
         for closer in image_closers.into_iter().rev() {
@@ -660,6 +676,7 @@ impl VisualProjection {
             source_start,
             source_end,
             delta,
+            &retained_flanking_closers,
             &mut output,
         );
         if !repair_bytes.is_empty() {
@@ -674,6 +691,26 @@ impl VisualProjection {
                 .filter(|repair| end_byte >= **repair)
                 .count()
                 * REPAIR.len();
+        }
+        if !removed_image_closer {
+            let adjusted_source_start = source_start
+                + repair_bytes
+                    .iter()
+                    .filter(|repair| **repair <= source_start)
+                    .count()
+                    * "<!---->".len();
+            if let Some(position) = self.repair_collapsed_list_space(
+                edited,
+                &change.old,
+                adjusted_source_start,
+                &mut output,
+            ) {
+                for caret in [&mut start_byte, &mut end_byte] {
+                    if *caret > position {
+                        *caret += "&#32;".len() - 1;
+                    }
+                }
+            }
         }
 
         Some(VisualSourceEdit {
@@ -711,6 +748,38 @@ impl VisualProjection {
         ranges
     }
 
+    fn repair_collapsed_list_space(
+        &self,
+        edited_visual: &str,
+        changed_visual: &Range<usize>,
+        source_start: usize,
+        output: &mut String,
+    ) -> Option<usize> {
+        if !self
+            .runs
+            .iter()
+            .any(|run| run.style.marker && run.range.end == changed_visual.start)
+            || output.get(source_start..source_start + 1) != Some(" ")
+            || Self::from_markdown_with_context(output, None, self.references.clone()).text()
+                == edited_visual
+        {
+            return None;
+        }
+        // After deleting the first word, Markdown can reinterpret its
+        // following space as part of the list prefix. An encoded ASCII space
+        // keeps it in the editable content without changing what is shown.
+        let mut candidate = output.clone();
+        candidate.replace_range(source_start..source_start + 1, "&#32;");
+        if Self::from_markdown_with_context(&candidate, None, self.references.clone()).text()
+            == edited_visual
+        {
+            *output = candidate;
+            Some(source_start)
+        } else {
+            None
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn repair_inline_flanking_boundaries(
         &self,
@@ -720,6 +789,7 @@ impl VisualProjection {
         source_start: usize,
         source_end: usize,
         delta: isize,
+        retained_flanking_closers: &[(usize, usize)],
         output: &mut String,
     ) -> Vec<usize> {
         const REPAIR: &str = "<!---->";
@@ -740,6 +810,23 @@ impl VisualProjection {
             let end = shift_index(wrapper.source.end, delta);
             if output.is_char_boundary(start) && output.is_char_boundary(end) {
                 candidates.extend([vec![end], vec![start], vec![start, end]]);
+            }
+            let closer_start = end.saturating_sub(wrapper.source.end - wrapper.content.end);
+            if output.get(closer_start..end)
+                == original_source.get(wrapper.content.end..wrapper.source.end)
+            {
+                candidates.push(vec![closer_start]);
+            }
+        }
+        for &(start, end) in retained_flanking_closers {
+            // A replacement can join a closer to following text or leave
+            // whitespace immediately before it. Try an invisible boundary on
+            // either side and keep it only if the visual text round-trips.
+            if output.is_char_boundary(end) {
+                candidates.push(vec![end]);
+            }
+            if output.is_char_boundary(start) {
+                candidates.push(vec![start]);
             }
         }
         let joins_formatted_spans = !changed_visual.is_empty()
