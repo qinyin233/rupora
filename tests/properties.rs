@@ -35,7 +35,7 @@ proptest! {
             let mut text = original.clone();
             let next = apply_markdown_command(&mut text, selection.clone(), command);
             apply_markdown_command(&mut text, next, command);
-            prop_assert_eq!(&text, &original);
+            prop_assert_eq!(&text, &original, "command={:?} selection={:?}", command, selection);
         }
     }
 

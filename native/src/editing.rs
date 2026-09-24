@@ -409,7 +409,22 @@ fn toggle_paragraph_emphasis(
 
     let selected = char_to_byte(text, selection.start)..char_to_byte(text, selection.end);
     if !text[selected.clone()].contains(['\r', '\n']) {
-        return None;
+        if marker != "~~" {
+            return None;
+        }
+        let body = &text[selected.clone()];
+        let trimmed = body.trim();
+        let start = selected.start + body.len() - body.trim_start().len();
+        let end = start + trimmed.len();
+        // Adding two tildes beside a literal tilde may open fenced code even
+        // on one line. Validate that collision, but keep ordinary single-line
+        // toggles (including headings) and removal of existing markers intact.
+        if trimmed.is_empty()
+            || (!trimmed.starts_with('~') && !text[..start].ends_with('~'))
+            || (text[..start].ends_with(marker) && text[end..].starts_with(marker))
+        {
+            return None;
+        }
     }
     struct Wrapper {
         range: Range<usize>,
@@ -460,19 +475,18 @@ fn toggle_paragraph_emphasis(
     }
     if paragraphs.len() < 2 {
         // Wrapping across a block boundary can change how the next toggle
-        // parses the document. Only use the single-span path inside one
-        // paragraph; keep unsupported mixed-block selections unchanged.
+        // parses the document. Keep unsupported mixed-block selections intact.
+        // Even one paragraph needs the validation below: adding `~~` before a
+        // literal line-leading `~` can turn its soft line break into fenced code.
         let body = &text[selected.clone()];
         let start = selected.start + body.len() - body.trim_start().len();
         let end = start + body.trim().len();
-        return if paragraphs
+        if !paragraphs
             .first()
             .is_some_and(|(paragraph, _, _)| paragraph.start <= start && end <= paragraph.end)
         {
-            None
-        } else {
-            Some(selection)
-        };
+            return Some(selection);
+        }
     }
     let mut ranges = Vec::new();
     for (mut scope, wrappers, literals) in paragraphs {
@@ -1419,6 +1433,115 @@ mod tests {
         let selection = apply_markdown_command(&mut text, selection, MarkdownCommand::Bold);
         assert_eq!(text, "你好 world");
         assert_eq!(selection, 0..2);
+    }
+
+    #[test]
+    fn single_line_strikethrough_rejects_an_opening_tilde_collision() {
+        for original in ["~a", "~中🙂", "   ~中🙂", "- ~中🙂", "> ~中🙂", "# ~中🙂"]
+        {
+            let tilde = original
+                .chars()
+                .position(|character| character == '~')
+                .unwrap();
+            for start in [tilde, tilde + 1] {
+                let selection = start..original.chars().count();
+                let mut source = original.to_owned();
+                let next = apply_markdown_command(
+                    &mut source,
+                    selection.clone(),
+                    MarkdownCommand::Strikethrough,
+                );
+                assert_eq!(
+                    source, original,
+                    "a delimiter collision must not create code or literal markers"
+                );
+                assert_eq!(next, selection);
+            }
+        }
+    }
+
+    #[test]
+    fn single_line_strikethrough_keeps_heading_list_and_quote_toggles() {
+        for (original, selection, expected) in [
+            ("中文🙂", 0..3, "~~中文🙂~~"),
+            ("# 中文🙂", 2..5, "# ~~中文🙂~~"),
+            ("- 中文🙂", 2..5, "- ~~中文🙂~~"),
+            ("> 中文🙂", 2..5, "> ~~中文🙂~~"),
+            ("前~中🙂后", 0..5, "~~前~中🙂后~~"),
+        ] {
+            let mut source = original.to_owned();
+            let next = apply_markdown_command(
+                &mut source,
+                selection.clone(),
+                MarkdownCommand::Strikethrough,
+            );
+            assert_eq!(source, expected);
+            let html = crate::markdown::render_html_fragment(&source);
+            assert_eq!(html.matches("<del>").count(), 1, "{html}");
+            assert_eq!(
+                apply_markdown_command(&mut source, next, MarkdownCommand::Strikethrough),
+                selection
+            );
+            assert_eq!(source, original);
+        }
+    }
+
+    #[test]
+    fn multiline_strikethrough_never_turns_a_literal_tilde_into_a_code_fence() {
+        for newline in ["\n", "\r", "\r\n"] {
+            for (initial, start) in [
+                (format!("~a{newline}b"), 0),
+                (
+                    format!("前{newline}~中🙂{newline}后"),
+                    1 + newline.chars().count(),
+                ),
+                (format!("前~a{newline}b"), 1),
+            ] {
+                let mut source = initial.clone();
+                let selected = start..initial.chars().count();
+                let next =
+                    apply_markdown_command(&mut source, selected, MarkdownCommand::Strikethrough);
+                assert_eq!(
+                    source, initial,
+                    "an unsafe delimiter must leave the paragraph intact"
+                );
+                assert!(
+                    !pulldown_cmark::Parser::new_ext(&source, crate::markdown::parser_options())
+                        .any(|event| matches!(
+                            event,
+                            pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_))
+                        )),
+                    "strikethrough changed a paragraph into code: {source:?}",
+                );
+                apply_markdown_command(&mut source, next, MarkdownCommand::Strikethrough);
+                assert_eq!(source, initial);
+            }
+        }
+    }
+
+    #[test]
+    fn emphasis_formats_soft_line_breaks_and_interior_literal_tildes() {
+        for (command, marker, tag) in [
+            (MarkdownCommand::Bold, "**", "strong"),
+            (MarkdownCommand::Italic, "*", "em"),
+            (MarkdownCommand::Strikethrough, "~~", "del"),
+        ] {
+            for newline in ["\n", "\r", "\r\n"] {
+                for body in [format!("中🙂{newline}文"), format!("前~a{newline}b~后")] {
+                    let mut source = body.clone();
+                    let selected =
+                        apply_markdown_command(&mut source, 0..body.chars().count(), command);
+                    assert_eq!(source, format!("{marker}{body}{marker}"));
+                    let html = crate::markdown::render_html_fragment(&source);
+                    assert_eq!(html.matches(&format!("<{tag}>")).count(), 1, "{html}");
+                    assert_eq!(
+                        apply_markdown_command(&mut source, selected, command),
+                        0..body.chars().count(),
+                    );
+                    assert_eq!(source, body);
+                }
+            }
+        }
     }
 
     #[test]
