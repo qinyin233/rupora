@@ -190,8 +190,18 @@ impl VisualProjection {
                         }
                         Tag::CodeBlock(_) | Tag::HtmlBlock => format.code += 1,
                         Tag::Item => {
+                            // A same-line parent item may already own part of
+                            // this physical line. Capture the consumed prefix
+                            // before adding the child's virtual line break.
+                            let mapped_until = builder
+                                .source_left_boundaries
+                                .last()
+                                .copied()
+                                .unwrap_or_default();
                             builder.ensure_line_break(range.start, format.visual());
-                            if let Some((prefix_range, prefix)) = item_prefix(source, range.start) {
+                            if let Some((prefix_range, prefix)) =
+                                item_prefix(source, range.start, mapped_until)
+                            {
                                 builder.append_marker(
                                     source,
                                     &prefix,
@@ -2380,17 +2390,25 @@ fn text_change_ranges_match(before: &str, after: &str, change: &TextChange) -> b
         && before[before_old_end..] == after[after_new_end..]
 }
 
-fn item_prefix(source: &str, item_start: usize) -> Option<(Range<usize>, String)> {
-    let line_start = source[..item_start]
-        .rfind('\n')
-        .map_or(0, |index| index + 1);
-    let line_end = source[item_start..]
-        .find('\n')
-        .map_or(source.len(), |offset| item_start + offset);
-    let line = &source[line_start..line_end];
-    let marker_offset = item_start - line_start;
-    let mut visual = container_prefix(&line[..marker_offset]).1;
-    let marker = &line[marker_offset..];
+fn item_prefix(
+    source: &str,
+    item_start: usize,
+    mapped_until: usize,
+) -> Option<(Range<usize>, String)> {
+    // The parser can include leading indentation in the first Item range.
+    let item_start = item_start
+        + source[item_start..]
+            .bytes()
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count();
+    let unmapped_start = mapped_until.min(item_start);
+    let prefix_start = source[unmapped_start..item_start]
+        .rfind(['\r', '\n'])
+        .map_or(unmapped_start, |index| unmapped_start + index + 1);
+    let mut visual = container_prefix(&source[prefix_start..item_start]).1;
+    // Marker scanning already stops at non-space/non-digit bytes, including
+    // line endings; avoid scanning the whole remaining line for every child.
+    let marker = &source[item_start..];
     let mut cursor;
 
     if marker.starts_with(['-', '+', '*']) {
@@ -2435,7 +2453,7 @@ fn item_prefix(source: &str, item_start: usize) -> Option<(Range<usize>, String)
         visual.push_str(". ");
     }
 
-    Some((line_start..item_start + cursor, visual))
+    Some((prefix_start..item_start + cursor, visual))
 }
 
 fn container_prefix(raw: &str) -> (usize, String) {

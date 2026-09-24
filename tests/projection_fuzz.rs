@@ -1,6 +1,44 @@
 #[path = "support/wysiwyg_projection.rs"]
 mod projection_fuzz;
 
+#[test]
+fn projection_trace_replays_same_line_nested_list_crash() {
+    // GitHub Actions run 35966941929: the original libFuzzer crash input.
+    let input = [
+        5, 42, 32, 42, 32, 120, 91, 12, 0, 0, 0, 255, 13, 91, 39, 253, 118,
+    ];
+    assert!(projection_fuzz::run(&input).is_some());
+}
+
+#[test]
+fn projection_trace_checks_container_prefix_combinations() {
+    let prefixes = ["* ", "- ", "1. ", "> ", "  ", "* [x] "];
+    // 108 fixed two-line cases exercise same-line nesting and continuation
+    // prefixes, including mixed list/quote/task syntax and all line endings.
+    for outer in prefixes {
+        for inner in prefixes {
+            for newline in ["\n", "\r\n", "\r"] {
+                let source = format!("{outer}{inner}中{newline}{outer}{inner}尾");
+                let projection = rupora::wysiwyg::VisualProjection::from_markdown(&source);
+                let positions = (0..=projection.text().chars().count())
+                    .map(|point| projection.source_char_range(&source, point..point).start)
+                    .collect::<Vec<_>>();
+                assert!(
+                    positions.windows(2).all(|pair| pair[0] <= pair[1]),
+                    "source={source:?}, positions={positions:?}"
+                );
+                let end = projection.text().chars().count() as u32;
+                let input = trace(&source, &[(0, end, end, "🙂")]);
+                let outcome = std::panic::catch_unwind(|| projection_fuzz::run(&input));
+                assert!(outcome.is_ok(), "source={source:?}");
+                let (edited, _, steps) = outcome.unwrap().unwrap();
+                assert_eq!(edited, format!("{source}🙂"));
+                assert_eq!(steps, 1);
+            }
+        }
+    }
+}
+
 fn number(output: &mut Vec<u8>, mut value: u32) {
     loop {
         let byte = (value & 0x7f) as u8;

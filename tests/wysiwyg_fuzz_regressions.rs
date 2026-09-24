@@ -1,6 +1,90 @@
 use rupora::wysiwyg::VisualProjection;
 
 #[test]
+fn same_line_nested_list_markers_map_to_their_own_source_prefix() {
+    let source = "* * x";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "• \n• x");
+    let child = projection.text().chars().position(|ch| ch == '\n').unwrap() + 1;
+    assert_eq!(projection.source_char_range(source, child..child), 2..2);
+    let positions = (0..=projection.text().chars().count())
+        .map(|point| projection.source_char_range(source, point..point).start)
+        .collect::<Vec<_>>();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] <= pair[1]),
+        "positions={positions:?}"
+    );
+}
+
+#[test]
+fn editing_a_nested_list_marker_preserves_the_parent_marker() {
+    let source = "* * x";
+    let projection = VisualProjection::from_markdown(source);
+    // Typing before the child's marker must not insert before the parent item.
+    let update = projection.apply_edit(source, "• \nX• x", 4..4).unwrap();
+    assert_eq!(update.source, "* X* x");
+    assert_eq!(update.selection, 3..3);
+    let update = projection.apply_edit(source, "• \nx", 3..3).unwrap();
+    assert_eq!(update.source, "* x");
+    assert_eq!(update.selection, 2..2);
+    assert_eq!(
+        VisualProjection::from_markdown(&update.source).text(),
+        "• x"
+    );
+    let update = projection.apply_edit(source, "• \n新🙂x", 5..5).unwrap();
+    assert_eq!(update.source, "* 新🙂x");
+    assert_eq!(update.selection, 4..4);
+    assert_eq!(
+        VisualProjection::from_markdown(&update.source).text(),
+        "• 新🙂x"
+    );
+}
+
+#[test]
+fn nested_list_prefixes_preserve_unconsumed_quote_and_indentation() {
+    for (source, expected) in [
+        ("* * ", "• \n• "),
+        ("* * * 中", "• \n• \n• 中"),
+        ("  * 中", "  • 中"),
+        ("> * * 中", "│ • \n• 中"),
+        ("* > * 中", "• \n│ • 中"),
+        ("* > > * 中", "• \n│ │ • 中"),
+        ("1. 2. 中", "1. \n2. 中"),
+        ("* * [x] 中", "• \n☑ 中"),
+        ("* [ ] 甲\n  * 中", "☐ 甲\n  • 中"),
+        ("* 甲\n  * 乙", "• 甲\n  • 乙"),
+        ("* 甲\r\n  * 乙", "• 甲\n  • 乙"),
+        ("* 甲\r  * 乙", "• 甲\n  • 乙"),
+        ("> * 甲\n>   * 乙", "│ • 甲\n│   • 乙"),
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        assert_eq!(projection.text(), expected, "source={source:?}");
+        let positions = (0..=projection.text().chars().count())
+            .map(|point| projection.source_char_range(source, point..point).start)
+            .collect::<Vec<_>>();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] <= pair[1]),
+            "source={source:?}, positions={positions:?}"
+        );
+        let mut edited = projection.text().to_owned();
+        edited.push('🙂');
+        let cursor = edited.chars().count();
+        let update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+        assert_eq!(update.source, format!("{source}🙂"));
+        assert_eq!(
+            update.selection,
+            update.source.chars().count()..update.source.chars().count()
+        );
+        assert_eq!(
+            VisualProjection::from_markdown(&update.source).text(),
+            edited
+        );
+    }
+}
+
+#[test]
 fn bare_cr_line_break_does_not_repeat_previous_indentation() {
     for (source, expected) in [
         (" a\rb", " a\nb"),

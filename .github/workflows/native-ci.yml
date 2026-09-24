@@ -110,6 +110,8 @@ jobs:
         with:
           # A fuzz finding should not discard the compiled nightly dependencies.
           cache-on-failure: true
+          # cargo-fuzz builds in its independent workspace, not the root target.
+          workspaces: fuzz -> target
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version '=0.13.2' --locked
