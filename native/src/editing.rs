@@ -516,6 +516,15 @@ fn toggle_paragraph_emphasis(
         // formats and avoids interpreting one '*' from '**' as italic syntax.
         for wrapper in &wrappers {
             if wrapper.range.start <= range.start && range.end <= wrapper.range.end {
+                if wrapper.requested
+                    && wrapper.range.start + wrapper.delimiter_len == range.start
+                    && wrapper.range.end.saturating_sub(wrapper.delimiter_len) == range.end
+                {
+                    // The selection is exactly the body of this format. Keep
+                    // nested emphasis markers selected so the outer wrapper
+                    // can be removed as one toggle.
+                    break;
+                }
                 range.start = range.start.max(wrapper.range.start + wrapper.delimiter_len);
                 range.end = range.end.min(wrapper.range.end - wrapper.delimiter_len);
             }
@@ -1597,6 +1606,17 @@ mod tests {
         assert!(html.contains("<strong>") && html.contains("<em>"), "{html}");
         apply_markdown_command(&mut text, next, MarkdownCommand::Italic);
         assert_eq!(text, "**中文🙂**");
+    }
+
+    #[test]
+    fn strikethrough_around_multiline_emphasis_toggles_back() {
+        let original = "a*=\na*";
+        let mut source = original.to_owned();
+        let selected = apply_markdown_command(&mut source, 1..6, MarkdownCommand::Strikethrough);
+        assert_eq!(source, "a~~*=\na*~~");
+        assert_eq!(selected, 3..8);
+        apply_markdown_command(&mut source, selected, MarkdownCommand::Strikethrough);
+        assert_eq!(source, original);
     }
 
     #[test]
