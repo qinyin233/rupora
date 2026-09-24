@@ -26,3 +26,6 @@ mod presentation;
 mod rendering;
 mod session;
 mod svg_fonts;
+
+#[cfg(test)]
+mod interrupted_save_tests;

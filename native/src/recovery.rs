@@ -595,14 +595,27 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .unwrap_or_else(|| Path::new("."));
     let mut temporary =
         NamedTempFile::new_in(parent).map_err(|error| format!("无法创建恢复临时文件：{error}"))?;
+    #[cfg(test)]
+    crate::interrupted_save_tests::checkpoint("recovery", "temporary-created");
     temporary
         .write_all(bytes)
-        .and_then(|()| temporary.as_file_mut().sync_all())
         .map_err(|error| format!("无法写入恢复数据：{error}"))?;
+    #[cfg(test)]
+    crate::interrupted_save_tests::checkpoint("recovery", "temporary-written");
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| format!("无法写入恢复数据：{error}"))?;
+    #[cfg(test)]
+    crate::interrupted_save_tests::checkpoint("recovery", "file-synced");
     temporary
         .persist(path)
         .map_err(|error| format!("无法提交恢复数据：{}", error.error))?;
+    #[cfg(test)]
+    crate::interrupted_save_tests::checkpoint("recovery", "committed");
     sync_parent_directory(parent)?;
+    #[cfg(test)]
+    crate::interrupted_save_tests::checkpoint("recovery", "directory-synced");
     Ok(())
 }
 

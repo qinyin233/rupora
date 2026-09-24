@@ -776,6 +776,9 @@ impl DocumentLock {
         let lock_directory = eframe::storage_dir("RUPORA")
             .map(|directory| directory.join("document-locks"))
             .unwrap_or_else(|| std::env::temp_dir().join("rupora-document-locks"));
+        #[cfg(test)]
+        let lock_directory =
+            crate::interrupted_save_tests::lock_directory().unwrap_or(lock_directory);
         fs::create_dir_all(&lock_directory)
             .map_err(|error| format!("无法创建文档锁目录 {}：{error}", lock_directory.display()))?;
         let lock_path = document_lock_path(&lock_directory, path);
@@ -1311,10 +1314,19 @@ fn write_atomically(
             .map_err(|error| format!("无法继承 {} 的文件权限：{error}", path.display()))?;
     }
 
+    #[cfg(test)]
+    crate::interrupted_save_tests::checkpoint("document", "temporary-created");
     temporary
         .write_all(bytes)
-        .and_then(|()| temporary.as_file_mut().sync_all())
         .map_err(|error| format!("无法写入 {}：{error}", path.display()))?;
+    #[cfg(test)]
+    crate::interrupted_save_tests::checkpoint("document", "temporary-written");
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| format!("无法写入 {}：{error}", path.display()))?;
+    #[cfg(test)]
+    crate::interrupted_save_tests::checkpoint("document", "file-synced");
     #[cfg(test)]
     if FAIL_BEFORE_ATOMIC_PERSIST.with(|failure| failure.replace(false)) {
         return Err("测试注入：临时文件同步后、原子替换前失败".to_owned());
@@ -1348,7 +1360,11 @@ fn write_atomically(
             )
         })?;
     }
+    #[cfg(test)]
+    crate::interrupted_save_tests::checkpoint("document", "committed");
     sync_parent_directory(parent)?;
+    #[cfg(test)]
+    crate::interrupted_save_tests::checkpoint("document", "directory-synced");
     Ok(())
 }
 
