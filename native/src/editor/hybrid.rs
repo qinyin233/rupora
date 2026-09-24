@@ -19,7 +19,18 @@ impl EditorSurface {
                 match event {
                     egui::Event::Ime(
                         egui::ImeEvent::Preedit { text, .. } | egui::ImeEvent::Commit(text),
-                    ) if text.is_empty() => return Some(index),
+                    ) if text.is_empty() => {
+                        // Windows sends an empty preedit immediately before
+                        // the committed candidate. Let TextEdit process that
+                        // pair against the provisional buffer: restoring the
+                        // document here would resurrect the replaced selection.
+                        if matches!(input.events.get(index + 1),
+                            Some(egui::Event::Ime(egui::ImeEvent::Commit(text))) if !text.is_empty())
+                        {
+                            return None;
+                        }
+                        return Some(index);
+                    }
                     egui::Event::Ime(egui::ImeEvent::Preedit { .. })
                     | egui::Event::Key {
                         key: Key::Escape, ..

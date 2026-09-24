@@ -1,6 +1,57 @@
 use super::*;
 
 #[test]
+fn ime_clear_before_commit_replaces_the_original_selection() {
+    for hybrid in [false, true] {
+        for (selection, expected) in [(2..4, "A中新B"), (2..2, "A中新文🙂B")] {
+            for trailing_clear in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = app_at(directory.path(), "A中文🙂B", selection.clone());
+                let ctx = Context::default();
+                frame(&mut app, &ctx, hybrid, vec![]);
+                for text in ["x", "xi", "xin"] {
+                    frame(
+                        &mut app,
+                        &ctx,
+                        hybrid,
+                        vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: text.into(),
+                            active_range_chars: Some(0..text.len()),
+                        })],
+                    );
+                    if hybrid {
+                        assert_eq!(app.session[0].content, "A中文🙂B");
+                    }
+                    frame(&mut app, &ctx, hybrid, vec![]);
+                }
+                // winit's Windows WM_IME_COMPOSITION / WM_IME_ENDCOMPOSITION
+                // paths clear the preedit immediately before the candidate.
+                let clear = egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: String::new(),
+                    active_range_chars: None,
+                });
+                let mut events = vec![
+                    clear.clone(),
+                    egui::Event::Ime(egui::ImeEvent::Commit("新".into())),
+                ];
+                if trailing_clear {
+                    events.push(clear);
+                }
+                frame(&mut app, &ctx, hybrid, events);
+                assert_eq!(
+                    app.session[0].content, expected,
+                    "hybrid={hybrid}, selection={selection:?}, trailing_clear={trailing_clear}"
+                );
+                app.undo_active();
+                assert_eq!(app.session[0].content, "A中文🙂B");
+                app.redo_active();
+                assert_eq!(app.session[0].content, expected);
+            }
+        }
+    }
+}
+
+#[test]
 fn replacing_image_alt_and_adjacent_format_in_one_frame_keeps_valid_markup() {
     let source = "![**甲**](a)*乙*";
     let directory = tempfile::tempdir().unwrap();
