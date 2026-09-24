@@ -1,6 +1,206 @@
 use super::*;
 
 #[test]
+fn source_ime_preedit_preserves_document_and_cancelled_selection() {
+    for selection in [1..1, 1..3] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_at(directory.path(), "A中文🙂B", selection);
+        let ctx = Context::default();
+        frame(&mut app, &ctx, false, vec![]);
+        let token = app.session[0].snapshot_token();
+        for text in ["n", "ni"] {
+            frame(
+                &mut app,
+                &ctx,
+                false,
+                vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: text.into(),
+                    active_range_chars: Some(0..text.len()),
+                })],
+            );
+            assert_eq!(app.session[0].content, "A中文🙂B");
+            assert_eq!(app.session[0].snapshot_token(), token);
+            assert!(!app.session[0].can_undo());
+        }
+        frame(
+            &mut app,
+            &ctx,
+            false,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Commit(String::new())),
+                egui::Event::Text("末".into()),
+            ],
+        );
+        assert_eq!(app.session[0].content, "A末中文🙂B");
+        app.undo_active();
+        assert_eq!(app.session[0].content, "A中文🙂B");
+    }
+}
+
+#[test]
+fn source_ime_mode_switch_does_not_publish_preedit() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = app_at(directory.path(), "A🙂B", 1..1);
+    app.state.view_mode = ViewMode::Edit;
+    let ctx = Context::default();
+    frame(&mut app, &ctx, false, vec![]);
+    frame(
+        &mut app,
+        &ctx,
+        false,
+        vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "ni".into(),
+            active_range_chars: Some(0..2),
+        })],
+    );
+    app.execute(AppCommand::SetView(ViewMode::Hybrid));
+    frame(&mut app, &ctx, true, vec![]);
+    assert_eq!(app.session[0].content, "A🙂B");
+    app.execute(AppCommand::SetView(ViewMode::Edit));
+    frame(&mut app, &ctx, false, vec![]);
+    frame(&mut app, &ctx, false, vec![egui::Event::Text("末".into())]);
+    assert_eq!(app.session[0].content, "A末🙂B");
+}
+
+#[test]
+fn source_ime_cancel_keeps_plain_text_before_preedit_in_the_same_frame() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = app_at(directory.path(), "A🙂B", 1..1);
+    let ctx = Context::default();
+    frame(&mut app, &ctx, false, vec![]);
+    frame(
+        &mut app,
+        &ctx,
+        false,
+        vec![
+            egui::Event::Text("X".into()),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "ni".into(),
+                active_range_chars: Some(0..2),
+            }),
+        ],
+    );
+    frame(
+        &mut app,
+        &ctx,
+        false,
+        vec![egui::Event::Ime(egui::ImeEvent::Commit(String::new()))],
+    );
+    assert_eq!(app.session[0].content, "AX🙂B");
+}
+
+#[test]
+fn source_ime_literal_input_interrupts_preedit_without_losing_the_edit() {
+    for event in [
+        egui::Event::Text("X".into()),
+        egui::Event::Paste("X".into()),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_at(directory.path(), "A中文🙂B", 1..3);
+        let ctx = Context::default();
+        frame(&mut app, &ctx, false, vec![]);
+        frame(
+            &mut app,
+            &ctx,
+            false,
+            vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "ni".into(),
+                active_range_chars: Some(0..2),
+            })],
+        );
+        frame(&mut app, &ctx, false, vec![event]);
+        frame(
+            &mut app,
+            &ctx,
+            false,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit(String::new()))],
+        );
+        assert_eq!(app.session[0].content, "AX🙂B");
+        app.undo_active();
+        assert_eq!(app.session[0].content, "A中文🙂B");
+    }
+}
+
+#[test]
+fn source_ime_commit_after_candidate_pause_undoes_the_whole_composition() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = app_at(directory.path(), "A🙂B", 1..1);
+    let ctx = Context::default();
+    frame(&mut app, &ctx, false, vec![]);
+    for text in ["z", "zhong'wen"] {
+        frame(
+            &mut app,
+            &ctx,
+            false,
+            vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: text.into(),
+                active_range_chars: Some(0..text.chars().count()),
+            })],
+        );
+    }
+    // Choosing a candidate can exceed the ordinary 900 ms typing coalescing
+    // window. That pause must not turn provisional spelling into undo history.
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    frame(
+        &mut app,
+        &ctx,
+        false,
+        vec![
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: String::new(),
+                active_range_chars: None,
+            }),
+            egui::Event::Ime(egui::ImeEvent::Commit("中文".into())),
+        ],
+    );
+    assert_eq!(app.session[0].content, "A中文🙂B");
+    app.undo_active();
+    assert_eq!(app.session[0].content, "A🙂B");
+    assert_eq!(app.active_selection(0), 1..1);
+    app.redo_active();
+    assert_eq!(app.session[0].content, "A中文🙂B");
+}
+
+#[test]
+fn source_ime_ordinary_keys_interrupt_preedit_and_keep_their_edit() {
+    for (pressed, expected) in [
+        (Key::Enter, "A\n🙂B"),
+        (Key::Backspace, "A🙂B"),
+        (Key::Delete, "A🙂B"),
+        (Key::Tab, "    A中文🙂B"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_at(directory.path(), "A中文🙂B", 1..3);
+        let ctx = Context::default();
+        frame(&mut app, &ctx, false, vec![]);
+        frame(
+            &mut app,
+            &ctx,
+            false,
+            vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "ni".into(),
+                active_range_chars: Some(0..2),
+            })],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            false,
+            vec![key(pressed, egui::Modifiers::NONE)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            false,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit(String::new()))],
+        );
+        assert_eq!(app.session[0].content, expected, "{pressed:?}");
+        app.undo_active();
+        assert_eq!(app.session[0].content, "A中文🙂B");
+    }
+}
+
+#[test]
 fn ime_clear_before_commit_replaces_the_original_selection() {
     for hybrid in [false, true] {
         for (selection, expected) in [(2..4, "A中新B"), (2..2, "A中新文🙂B")] {
@@ -878,25 +1078,24 @@ fn frame(app: &mut RuporaApp, ctx: &Context, hybrid: bool, events: Vec<egui::Eve
             _ => None,
         })
         .unwrap_or_default();
-    let _ = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1000.0, 800.0),
-            )),
-            events,
-            modifiers,
-            ..Default::default()
-        },
-        |ui| {
-            app.handle_shortcuts(ui.ctx());
-            if hybrid {
-                app.hybrid_pane(ui, 0);
-            } else {
-                app.edit_pane(ui, 0, None);
-            }
-        },
-    );
+    let mut raw = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1000.0, 800.0),
+        )),
+        events,
+        modifiers,
+        ..Default::default()
+    };
+    eframe::App::raw_input_hook(app, ctx, &mut raw);
+    let _ = ctx.run_ui(raw, |ui| {
+        app.handle_shortcuts(ui.ctx());
+        if hybrid {
+            app.hybrid_pane(ui, 0);
+        } else {
+            app.edit_pane(ui, 0, None);
+        }
+    });
 }
 
 #[test]

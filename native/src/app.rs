@@ -75,6 +75,88 @@ struct OrderedInputPass {
     cursor: Option<CCursorRange>,
 }
 
+/// Partition a native IME packet before egui derives pointer and focus state.
+/// TextEdit still executes every edit; only delivery boundaries change here.
+fn split_native_ime_input(
+    raw: &mut egui::RawInput,
+    previous_focused: bool,
+) -> VecDeque<egui::RawInput> {
+    let explicit_focus = raw
+        .events
+        .iter()
+        .any(|event| matches!(event, egui::Event::WindowFocused(_)));
+    let mut focused = if explicit_focus {
+        previous_focused
+    } else {
+        raw.focused
+    };
+    let mut remaining: VecDeque<_> = std::mem::take(&mut raw.events).into();
+    let mut groups = Vec::new();
+    let mut prefix = Vec::new();
+    while let Some(event) = remaining.pop_front() {
+        let ordinary_keyboard = matches!(
+            event,
+            egui::Event::Key { .. }
+                | egui::Event::Text(_)
+                | egui::Event::Paste(_)
+                | egui::Event::Copy
+                | egui::Event::Cut
+        );
+        if ordinary_keyboard {
+            prefix.push(event);
+            continue;
+        }
+        if !prefix.is_empty() {
+            groups.push((std::mem::take(&mut prefix), focused));
+        }
+        if let egui::Event::WindowFocused(next) = &event {
+            focused = *next;
+        }
+        let clear_before_commit = matches!(&event,
+            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }
+                | egui::ImeEvent::Commit(text)) if text.is_empty())
+            && matches!(remaining.front(),
+                Some(egui::Event::Ime(egui::ImeEvent::Commit(text))) if !text.is_empty());
+        let mut events = vec![event];
+        if clear_before_commit {
+            events.push(remaining.pop_front().expect("candidate after clear"));
+        }
+        groups.push((events, focused));
+    }
+    if !prefix.is_empty() {
+        groups.push((prefix, focused));
+    }
+
+    // Aggregate native effects have no position within the event list. Apply
+    // them once, after all preceding text has reached the editor UI.
+    let needs_terminal = !raw.dropped_files.is_empty()
+        || !raw.hovered_files.is_empty()
+        || raw
+            .viewports
+            .values()
+            .any(|viewport| !viewport.events.is_empty())
+        || focused != raw.focused;
+    let mut packets = VecDeque::new();
+    for (events, focused) in groups {
+        let mut packet = raw.clone();
+        packet.events = events;
+        packet.focused = focused;
+        packet.dropped_files.clear();
+        packet.hovered_files.clear();
+        for (id, viewport) in &mut packet.viewports {
+            viewport.events.clear();
+            if *id == packet.viewport_id && viewport.focused.is_some() {
+                viewport.focused = Some(focused);
+            }
+        }
+        packets.push_back(packet);
+    }
+    if needs_terminal {
+        packets.push_back(raw.clone());
+    }
+    packets
+}
+
 pub struct RuporaApp {
     editor_surface: EditorSurface,
     session: DocumentSession,
@@ -780,10 +862,10 @@ impl RuporaApp {
             // navigation to the adjacent preview or sidebar.
             ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
             if ctx.input(|input| {
-                input
-                    .events
-                    .iter()
-                    .any(|event| self.input_shortcut_action(event, true).is_some())
+                input.events.iter().any(|event| {
+                    self.input_shortcut_action(event, true).is_some()
+                        || matches!(event, egui::Event::Ime(_))
+                })
             }) {
                 let events = ctx.input_mut(|input| std::mem::take(&mut input.events));
                 self.ordered_input_pass = Some(OrderedInputPass {
@@ -1035,6 +1117,30 @@ impl RuporaApp {
             let mut events = Vec::new();
             let mut command = None;
             while let Some(event) = pending.remaining.pop_front() {
+                // Capture the composition baseline only after TextEdit has
+                // applied earlier ordinary input. Finish a candidate before
+                // starting another composition, even in the same native batch.
+                if matches!(event, egui::Event::Ime(_)) {
+                    if !events.is_empty() {
+                        pending.remaining.push_front(event);
+                        break;
+                    }
+                    let clear_before_commit = matches!(&event,
+                        egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }
+                            | egui::ImeEvent::Commit(text)) if text.is_empty())
+                        && matches!(pending.remaining.front(),
+                            Some(egui::Event::Ime(egui::ImeEvent::Commit(text))) if !text.is_empty());
+                    events.push(event);
+                    if clear_before_commit {
+                        events.push(
+                            pending
+                                .remaining
+                                .pop_front()
+                                .expect("candidate after clear"),
+                        );
+                    }
+                    break;
+                }
                 if let Some(next) = self.input_shortcut_action(&event, true) {
                     // Escape must still reach TextEdit to cancel IME/focus.
                     if matches!(next, InputShortcut::Escape) {
@@ -3448,7 +3554,58 @@ impl eframe::App for RuporaApp {
                 }
             }
         }
-        let command_count = if self.ordered_input_pass.is_some() || self.ordered_shell_pending {
+        // The fast route uses editor passes. Anything that cannot use that
+        // route must isolate IME through RawInput instead: replacing only
+        // InputState.events cannot replay native pointer/focus transitions.
+        let can_stage_ime = self.can_defer_format_input(ctx)
+            && raw.focused
+            && raw.dropped_files.is_empty()
+            && raw.hovered_files.is_empty()
+            && raw
+                .viewports
+                .values()
+                .all(|viewport| viewport.events.is_empty())
+            && raw.events.iter().all(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key { .. }
+                        | egui::Event::PointerMoved(_)
+                        | egui::Event::Text(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Copy
+                        | egui::Event::Cut
+                        | egui::Event::Ime(_)
+                )
+            });
+        if raw
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Ime(_)))
+            && !can_stage_ime
+        {
+            let close_requested = raw.viewport().close_requested();
+            let mut packets = split_native_ime_input(raw, ctx.input(|input| input.focused));
+            *raw = packets.pop_front().expect("native IME prefix");
+            let has_suffix = !packets.is_empty();
+            for packet in packets.into_iter().rev() {
+                self.ordered_raw_input.push_front(packet);
+            }
+            self.replayed_close = raw.viewport().close_requested();
+            self.ordered_pointer_barrier |= has_suffix;
+            if close_requested && !self.replayed_close {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            }
+            if has_suffix {
+                ctx.request_repaint();
+            }
+        }
+        let command_count = if self.ordered_input_pass.is_some()
+            || self.ordered_shell_pending
+            || raw
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Ime(_)))
+        {
             MAX_ORDERED_INPUT_PASSES
         } else {
             raw.events

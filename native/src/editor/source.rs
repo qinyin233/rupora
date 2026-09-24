@@ -11,6 +11,32 @@ impl EditorSurface {
         scroll_offset: Option<f32>,
     ) -> PaneScroll {
         normalize_editor_input_line_endings(ui);
+        self.finish_leading_ime_cancel(ui, document);
+        if self.source_ime_session.is_some()
+            && ui.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Cut
+                            | egui::Event::Key { pressed: true, .. }
+                            | egui::Event::PointerButton { pressed: true, .. }
+                    )
+                })
+            })
+        {
+            // egui-winit filters keys consumed by the system IME. Ordinary
+            // input that reaches the editor interrupts composition: restore
+            // its durable selection before TextEdit executes the new action.
+            self.source_ime_session = None;
+            if let Some(editor_id) = self.editor_widget_id {
+                let mut state = egui::text_edit::TextEditState::default();
+                state.cursor.set_char_range(self.editor_cursor);
+                state.store(ui.ctx(), editor_id);
+            }
+            self.ime_interrupted_frame = Some(ui.ctx().cumulative_frame_nr());
+        }
         if take_leading_select_all(ui, self.editor_widget_id) {
             self.queue_editor_selection(0..document.content.chars().count());
         }
@@ -18,7 +44,7 @@ impl EditorSurface {
             effects.notice = "已修改缩进".to_owned();
         }
         let cursor_before = self.editor_cursor;
-        let selection_before = cursor_before.map(cursor_range_to_char_range);
+        let mut selection_before = cursor_before.map(cursor_range_to_char_range);
         let mut scroll_area = ScrollArea::vertical().id_salt(("editor-scroll", document.id()));
         if let Some(offset) = scroll_offset {
             scroll_area = scroll_area.vertical_scroll_offset(offset);
@@ -43,15 +69,50 @@ impl EditorSurface {
                         self.editor_widget_id = Some(editor_id);
                         let requested_cursor = self.pending_editor_cursor;
                         if let Some(cursor_range) = self.pending_editor_cursor.take() {
-                            let mut state =
-                                TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+                            // A new source selection also ends any previous
+                            // TextEdit composition after view/document changes.
+                            let mut state = if self.source_ime_session.is_some() {
+                                TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default()
+                            } else {
+                                egui::text_edit::TextEditState::default()
+                            };
                             state.cursor.set_char_range(Some(cursor_range));
                             state.store(ui.ctx(), editor_id);
                             ui.memory_mut(|memory| memory.request_focus(editor_id));
                             self.editor_cursor = Some(cursor_range);
                         }
                         let input_action = editor_input_action(ui);
-                        let mut editor_buffer = TrackingTextBuffer::new(&mut document.content);
+                        let (ime_action, ime_has_commit, starts_preedit) = ui.input(|input| {
+                            (
+                                ime_frame_action(&input.events),
+                                input.events.iter().any(|event| matches!(event,
+                                    egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty())),
+                                input.events.iter().any(|event| matches!(event,
+                                    egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if !text.is_empty())),
+                            )
+                        });
+                        let mut composition = self.source_ime_session.take()
+                            .filter(|session| session.document_id == document.id());
+                        if composition.is_none() && starts_preedit
+                            && ui.memory(|memory| memory.has_focus(editor_id))
+                            && ui.input(|input| input.focused)
+                        {
+                            // A later accepted composition supersedes an
+                            // earlier interruption within this native frame.
+                            self.ime_interrupted_frame = None;
+                            composition = Some(SourceImeSession {
+                                document_id: document.id(),
+                                visual_content: document.content.clone(),
+                                selection_before: selection_before.clone(),
+                            });
+                        }
+                        let mut editor_buffer = TrackingTextBuffer::new(
+                            if let Some(session) = composition.as_mut() {
+                                &mut session.visual_content
+                            } else {
+                                &mut document.content
+                            },
+                        );
                         let output = TextEdit::multiline(&mut editor_buffer)
                             .id(editor_id)
                             .font(egui::TextStyle::Monospace)
@@ -114,6 +175,26 @@ impl EditorSurface {
                         });
                         let cursor_after = text_edit_cursor_after_input(&output);
                         let mut selection_after = cursor_after.map(cursor_range_to_char_range);
+                        if let Some(session) = composition {
+                            let defer = output.response.has_focus() && ui.input(|input| input.focused)
+                                && matches!(ime_action, ImeFrameAction::Preedit | ImeFrameAction::None);
+                            if defer {
+                                self.source_ime_session = Some(session);
+                                return;
+                            }
+                            if !ime_has_commit {
+                                // Cancellation or loss of focus must not turn
+                                // the displayed spelling into durable content.
+                                let mut state = egui::text_edit::TextEditState::default();
+                                state.cursor.set_char_range(self.editor_cursor);
+                                state.store(ui.ctx(), editor_id);
+                                return;
+                            }
+                            selection_before = session.selection_before;
+                            before_content = Some(std::mem::replace(
+                                &mut document.content, session.visual_content,
+                            ));
+                        }
                         if let Some(cursor_range) = cursor_after {
                             self.editor_cursor = Some(cursor_range);
                         }
@@ -122,7 +203,9 @@ impl EditorSurface {
                         let accepted_input =
                             output.response.has_focus() || output.response.changed();
                         let mut changed = output.response.changed();
-                        let mut kind = EditKind::Typing;
+                        // A composition is a single history transaction,
+                        // independent of typing pauses or earlier plain input.
+                        let mut kind = if ime_has_commit { EditKind::Other } else { EditKind::Typing };
                         let mut cursor_adjusted = false;
                         if accepted_input
                             && let (Some(url), Some(selection)) = (

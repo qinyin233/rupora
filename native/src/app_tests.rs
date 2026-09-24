@@ -65,6 +65,264 @@ fn shortcut_editor_frame(
     })
 }
 
+#[test]
+fn ime_batches_keep_prefixes_and_candidates_across_pass_limits() {
+    for mode in [ViewMode::Edit, ViewMode::Split, ViewMode::Hybrid] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.state.view_mode = mode;
+        app.session[0].content = "A🙂B".into();
+        app.session[0].update_after_edit();
+        app.queue_editor_selection(1..1);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        shortcut_editor_frame(&mut app, &ctx, vec![]);
+        let events = (0..12)
+            .flat_map(|_| {
+                [
+                    egui::Event::Text("X".into()),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "ni".into(),
+                        active_range_chars: Some(0..2),
+                    }),
+                    egui::Event::Ime(egui::ImeEvent::Commit("你".into())),
+                ]
+            })
+            .collect();
+        shortcut_editor_frame(&mut app, &ctx, events);
+        assert!(app.ordered_input_pass.is_some());
+        shortcut_editor_frame(&mut app, &ctx, vec![egui::Event::Text("尾".into())]);
+        drain_ordered_input(&mut app, &ctx);
+        let expected = format!("A{}尾🙂B", "X你".repeat(12));
+        assert_eq!(app.session[0].content, expected, "{mode:?}");
+        while app.session[0].can_undo() {
+            app.undo_active();
+        }
+        assert_eq!(app.session[0].content, "A🙂B");
+        while app.session[0].can_redo() {
+            app.redo_active();
+        }
+        assert_eq!(app.session[0].content, expected);
+    }
+}
+
+#[test]
+fn ime_commit_then_preedit_and_native_focus_loss_keeps_only_candidate() {
+    for mode in [ViewMode::Edit, ViewMode::Split] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.state.view_mode = mode;
+        app.session[0].content = "A🙂B".into();
+        app.session[0].update_after_edit();
+        app.queue_editor_selection(1..1);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        shortcut_editor_frame(&mut app, &ctx, vec![]);
+        shortcut_raw_frame(
+            &mut app,
+            &ctx,
+            egui::RawInput {
+                focused: false,
+                events: vec![
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "zhong".into(),
+                        active_range_chars: Some(0..5),
+                    }),
+                    egui::Event::Ime(egui::ImeEvent::Commit("中".into())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "wen".into(),
+                        active_range_chars: Some(0..3),
+                    }),
+                    egui::Event::WindowFocused(false),
+                ],
+                ..Default::default()
+            },
+            true,
+        );
+        drain_ordered_input(&mut app, &ctx);
+        assert_eq!(app.session[0].content, "A中🙂B", "{mode:?}");
+        shortcut_editor_frame(&mut app, &ctx, vec![egui::Event::Text("末".into())]);
+        assert_eq!(app.session[0].content, "A中末🙂B", "{mode:?}");
+        while app.session[0].can_undo() {
+            app.undo_active();
+        }
+        assert_eq!(app.session[0].content, "A🙂B");
+    }
+}
+
+#[test]
+fn ime_with_scroll_or_held_pointer_preserves_plain_input_before_cancellation() {
+    for held_pointer in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.state.view_mode = ViewMode::Edit;
+        app.session[0].content = "A🙂B".into();
+        app.session[0].update_after_edit();
+        app.queue_editor_selection(1..1);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        shortcut_editor_frame(&mut app, &ctx, vec![]);
+        if held_pointer {
+            shortcut_editor_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerButton {
+                    pos: egui::pos2(990.0, 790.0),
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            app.queue_editor_selection(1..1);
+            shortcut_editor_frame(&mut app, &ctx, vec![]);
+        }
+        let mut events = vec![
+            egui::Event::Text("X".into()),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "ni".into(),
+                active_range_chars: Some(0..2),
+            }),
+            egui::Event::Ime(egui::ImeEvent::Commit(String::new())),
+        ];
+        if !held_pointer {
+            events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -5.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        shortcut_editor_frame(&mut app, &ctx, events);
+        drain_ordered_input(&mut app, &ctx);
+        assert_eq!(
+            app.session[0].content, "AX🙂B",
+            "held_pointer={held_pointer}"
+        );
+        app.undo_active();
+        assert_eq!(app.session[0].content, "A🙂B");
+    }
+}
+
+#[test]
+fn ime_and_close_deliver_candidate_before_the_single_close_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = isolated_app(directory.path());
+    app.new_document();
+    app.state.view_mode = ViewMode::Edit;
+    app.queue_editor_selection(0..0);
+    let ctx = Context::default();
+    shortcut_editor_frame(&mut app, &ctx, vec![]);
+    // Avoid opening a native confirmation dialog in this scheduler regression.
+    app.allow_close = true;
+    let mut raw = egui::RawInput {
+        events: vec![
+            egui::Event::Ime(egui::ImeEvent::Commit("中".into())),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "wen".into(),
+                active_range_chars: Some(0..3),
+            }),
+        ],
+        ..Default::default()
+    };
+    raw.viewports
+        .get_mut(&egui::ViewportId::ROOT)
+        .unwrap()
+        .events
+        .push(egui::ViewportEvent::Close);
+    let output = shortcut_raw_frame(&mut app, &ctx, raw, true);
+    assert!(
+        output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&ViewportCommand::CancelClose)
+    );
+    assert_eq!(app.session[0].content, "中");
+    let mut closes = 0;
+    for _ in 0..8 {
+        let output = shortcut_editor_frame(&mut app, &ctx, vec![]);
+        closes += output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .filter(|command| matches!(command, ViewportCommand::Close))
+            .count();
+    }
+    assert_eq!(closes, 1);
+    assert_eq!(app.session[0].content, "中");
+}
+
+#[test]
+fn ime_interruption_reaches_the_backend_after_all_input_passes() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = isolated_app(directory.path());
+    app.new_document();
+    app.state.view_mode = ViewMode::Edit;
+    app.session[0].content = "A🙂B".into();
+    app.session[0].update_after_edit();
+    app.queue_editor_selection(1..1);
+    let ctx = Context::default();
+    shortcut_editor_frame(&mut app, &ctx, vec![]);
+    shortcut_editor_frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "ni".into(),
+            active_range_chars: Some(0..2),
+        })],
+    );
+    let output = shortcut_editor_frame(
+        &mut app,
+        &ctx,
+        vec![
+            egui::Event::Text("X".into()),
+            egui::Event::Ime(egui::ImeEvent::Commit(String::new())),
+        ],
+    );
+    assert_eq!(app.session[0].content, "AX🙂B");
+    assert!(
+        output
+            .platform_output
+            .ime
+            .unwrap()
+            .should_interrupt_composition
+    );
+}
+
+#[test]
+fn ime_new_preedit_after_literal_input_supersedes_the_old_interruption() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = isolated_app(directory.path());
+    app.new_document();
+    app.state.view_mode = ViewMode::Edit;
+    app.session[0].content = "A🙂B".into();
+    app.session[0].update_after_edit();
+    app.queue_editor_selection(1..1);
+    let ctx = Context::default();
+    shortcut_editor_frame(&mut app, &ctx, vec![]);
+    let preedit = egui::Event::Ime(egui::ImeEvent::Preedit {
+        text: "ni".into(),
+        active_range_chars: Some(0..2),
+    });
+    shortcut_editor_frame(&mut app, &ctx, vec![preedit.clone()]);
+    let output =
+        shortcut_editor_frame(&mut app, &ctx, vec![egui::Event::Text("X".into()), preedit]);
+    assert_eq!(app.session[0].content, "AX🙂B");
+    assert!(
+        !output
+            .platform_output
+            .ime
+            .unwrap()
+            .should_interrupt_composition
+    );
+    shortcut_editor_frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::Ime(egui::ImeEvent::Commit(String::new()))],
+    );
+    assert_eq!(app.session[0].content, "AX🙂B");
+}
+
 fn command_key(key: Key) -> egui::Event {
     egui::Event::Key {
         key,
@@ -739,7 +997,15 @@ fn middle_format_shortcut_keeps_input_order_in_the_same_context_run() {
                     ];
                     if batched {
                         let output = shortcut_editor_frame(&mut app, &ctx, events);
-                        assert_eq!(output.platform_output.num_completed_passes, 2);
+                        // IME confirmation has its own transaction boundary
+                        // before the format command; all stages still finish
+                        // within this native frame.
+                        let expected_passes = if matches!(prefix, egui::Event::Ime(_)) {
+                            3
+                        } else {
+                            2
+                        };
+                        assert_eq!(output.platform_output.num_completed_passes, expected_passes);
                         assert!(app.ordered_input_pass.is_none());
                     } else {
                         for event in events {

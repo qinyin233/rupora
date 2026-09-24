@@ -93,6 +93,12 @@ struct HybridImeSession {
     visual_content: String,
 }
 
+struct SourceImeSession {
+    document_id: u64,
+    visual_content: String,
+    selection_before: Option<std::ops::Range<usize>>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct HybridPointerAnchor {
     document_id: u64,
@@ -124,6 +130,8 @@ pub(crate) struct EditorSurface {
     document_views: HashMap<u64, DocumentViewState>,
     hybrid_active: Option<(u64, BlockId)>,
     hybrid_ime_session: Option<HybridImeSession>,
+    source_ime_session: Option<SourceImeSession>,
+    ime_interrupted_frame: Option<u64>,
     hybrid_pointer_anchor: Option<HybridPointerAnchor>,
     hybrid_cross_selection: Option<HybridCrossSelection>,
     split_scroll_ratio: f32,
@@ -178,6 +186,7 @@ impl EditorSurface {
     }
     pub(crate) fn change_mode(&mut self, mode: ViewMode) {
         self.pending_editor_cursor = self.editor_cursor;
+        self.source_ime_session = None;
         if mode != ViewMode::Hybrid {
             self.hybrid_ime_session = None;
         }
@@ -185,6 +194,7 @@ impl EditorSurface {
     pub(crate) fn invalidate_content(&mut self) {
         self.hybrid_active = None;
         self.hybrid_ime_session = None;
+        self.source_ime_session = None;
         self.hybrid_pointer_anchor = None;
         self.hybrid_cross_selection = None;
     }
@@ -367,6 +377,11 @@ impl EditorSurface {
                     ime.rect = ime.cursor_rect;
                 }
             });
+        }
+        // PlatformOutput replaces its IME field on later passes. Repeat this
+        // frame's interruption so the final output still reaches the backend.
+        if self.ime_interrupted_frame == Some(ui.ctx().cumulative_frame_nr()) {
+            ui.memory_mut(|memory| memory.interrupt_ime());
         }
         output
     }

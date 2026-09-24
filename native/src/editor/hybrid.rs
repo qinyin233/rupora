@@ -2,16 +2,19 @@
 use super::*;
 
 impl EditorSurface {
-    fn finish_leading_ime_cancel(&mut self, ui: &mut Ui, document: &Document) {
+    pub(super) fn finish_leading_ime_cancel(&mut self, ui: &mut Ui, document: &Document) {
         let Some(editor_id) = self.editor_widget_id else {
             return;
         };
-        if self
+        let has_session = self
             .hybrid_ime_session
             .as_ref()
-            .is_none_or(|session| session.document_id != document.id())
-            || ui.memory(|memory| memory.focused()) != Some(editor_id)
-        {
+            .is_some_and(|session| session.document_id == document.id())
+            || self
+                .source_ime_session
+                .as_ref()
+                .is_some_and(|session| session.document_id == document.id());
+        if !has_session || ui.memory(|memory| memory.focused()) != Some(editor_id) {
             return;
         }
         let cancel = ui.input(|input| {
@@ -53,6 +56,7 @@ impl EditorSurface {
         // Restore the document buffer before processing subsequent input. IME
         // replacement text (including a replaced selection) is only provisional.
         self.hybrid_ime_session = None;
+        self.source_ime_session = None;
         egui::text_edit::TextEditState::default().store(ui.ctx(), editor_id);
         if let Some(cursor) = self.editor_cursor {
             let start = cursor_range_to_char_range(cursor).start;

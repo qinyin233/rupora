@@ -6,7 +6,7 @@ impl EditorSurface {
     /// command uses the updated full source selection before widgets can replace
     /// it with a literal tab. Other input and IME events retain their order.
     pub(super) fn apply_leading_tab_input(&mut self, ui: &mut Ui, document: &mut Document) -> bool {
-        if self.hybrid_ime_session.is_some() {
+        if self.hybrid_ime_session.is_some() || self.source_ime_session.is_some() {
             return false;
         }
         let mut consumed = false;
