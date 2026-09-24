@@ -12,6 +12,30 @@ fn projection_trace_replays_ci_backward_mapping_crash() {
 }
 
 #[test]
+fn projection_trace_replays_inline_code_backward_mapping_crash() {
+    // GitHub Actions run 36042990525, libFuzzer artifact crash-1182a6f37aabfbe5bbae6407624ac42704cb1fd6.
+    let input = [
+        10, 7, 34, 93, 91, 94, 47, 96, 26, 94, 10, 47, 10, 96, 10, 255, 255, 255, 255, 255, 58,
+        246, 96, 93, 91, 94,
+    ];
+    assert!(projection_fuzz::run(&input).is_some());
+}
+
+#[test]
+fn footnote_like_text_crossing_inline_code_is_rendered_once() {
+    let source = "[^/`x`]";
+    let projection = rupora::wysiwyg::VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "[^/x]");
+    let positions = (0..=projection.text().chars().count())
+        .map(|point| projection.source_char_range(source, point..point).start)
+        .collect::<Vec<_>>();
+    assert!(positions.windows(2).all(|pair| pair[0] <= pair[1]));
+
+    let valid = rupora::wysiwyg::VisualProjection::from_markdown("[^missing]");
+    assert_eq!(valid.text(), "〔missing〕");
+}
+
+#[test]
 fn list_tabs_before_indented_code_keep_source_mapping_ordered() {
     let source = "x\n*\t\t\t\t\t\t\t#*";
     for selection in 0..=source.chars().count() {

@@ -127,7 +127,7 @@ impl VisualProjection {
             .filter(|selection| selection.is_empty())
             .map(|selection| selection.start);
         let mut cursor_in_literal_syntax = false;
-        let standalone_footnotes = standalone_footnote_references(source);
+        let standalone_footnotes = standalone_footnote_references(source, &references);
 
         let mut events = crate::markdown::events_with_references(source, &references).peekable();
         while let Some((event, range)) = events.next() {
@@ -2178,7 +2178,10 @@ fn inline_code_content_range(
     })
 }
 
-fn standalone_footnote_references(text: &str) -> Vec<Range<usize>> {
+fn standalone_footnote_references(
+    text: &str,
+    definitions: &crate::markdown::ReferenceDefinitions,
+) -> Vec<Range<usize>> {
     let bytes = text.as_bytes();
     let mut references = Vec::new();
     let mut cursor = 0usize;
@@ -2206,7 +2209,37 @@ fn standalone_footnote_references(text: &str) -> Vec<Range<usize>> {
         }
         cursor = end;
     }
+    if references.is_empty() {
+        return references;
+    }
+
+    // Undefined footnotes are split into several Text events by the parser.
+    // Only combine those events when they cover the entire candidate. A raw
+    // [^...] scan can otherwise cross an inline-code or link event and project
+    // that event's source twice, sending later visual cursors backwards.
+    let mut covered_until = references
+        .iter()
+        .map(|reference| reference.start)
+        .collect::<Vec<_>>();
+    for (event, range) in crate::markdown::events_with_references(text, definitions) {
+        if !matches!(event, Event::Text(_)) {
+            continue;
+        }
+        let first = references.partition_point(|reference| reference.end <= range.start);
+        for (reference, covered) in references[first..].iter().zip(&mut covered_until[first..]) {
+            if reference.start >= range.end {
+                break;
+            }
+            if range.start <= *covered {
+                *covered = (*covered).max(range.end.min(reference.end));
+            }
+        }
+    }
     references
+        .into_iter()
+        .zip(covered_until)
+        .filter_map(|(reference, covered)| (covered >= reference.end).then_some(reference))
+        .collect()
 }
 
 fn inline_code_delimited_content_range(
