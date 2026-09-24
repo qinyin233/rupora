@@ -339,6 +339,86 @@ fn command_key(key: Key) -> egui::Event {
 }
 
 #[test]
+fn ime_late_preedit_after_window_focus_loss_never_changes_the_document() {
+    for mode in [ViewMode::Edit, ViewMode::Split, ViewMode::Hybrid] {
+        for explicit_focus_event in [false, true] {
+            for already_composing in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = isolated_app(directory.path());
+                app.new_document();
+                app.state.view_mode = mode;
+                app.session[0].content = "A🙂B".into();
+                app.session[0].update_after_edit();
+                app.queue_editor_selection(1..1);
+                let ctx = Context::default();
+                install_fonts(&ctx);
+                shortcut_editor_frame(&mut app, &ctx, vec![]);
+                let token = app.session[0].snapshot_token();
+                if already_composing {
+                    shortcut_editor_frame(
+                        &mut app,
+                        &ctx,
+                        vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: "zhong'wen".into(),
+                            active_range_chars: Some(0..8),
+                        })],
+                    );
+                }
+                shortcut_raw_frame(
+                    &mut app,
+                    &ctx,
+                    egui::RawInput {
+                        focused: false,
+                        events: if explicit_focus_event {
+                            vec![egui::Event::WindowFocused(false)]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    },
+                    true,
+                );
+                shortcut_raw_frame(
+                    &mut app,
+                    &ctx,
+                    egui::RawInput {
+                        focused: false,
+                        events: vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: "ni".into(),
+                            active_range_chars: Some(0..2),
+                        })],
+                        ..Default::default()
+                    },
+                    true,
+                );
+                assert_eq!(
+                    app.session[0].content, "A🙂B",
+                    "mode={mode:?}, explicit_focus_event={explicit_focus_event}, already_composing={already_composing}"
+                );
+                assert_eq!(app.session[0].snapshot_token(), token);
+                assert!(!app.session[0].can_undo());
+                shortcut_editor_frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::WindowFocused(true),
+                        egui::Event::Ime(egui::ImeEvent::Commit(String::new())),
+                        egui::Event::Text("X".into()),
+                    ],
+                );
+                drain_ordered_input(&mut app, &ctx);
+                assert_eq!(
+                    app.session[0].content, "AX🙂B",
+                    "{mode:?}, explicit_focus_event={explicit_focus_event}"
+                );
+                app.undo_active();
+                assert_eq!(app.session[0].content, "A🙂B");
+            }
+        }
+    }
+}
+
+#[test]
 fn multiple_format_shortcuts_match_separate_frames() {
     let events = vec![
         egui::Event::Text("中".into()),

@@ -1057,7 +1057,24 @@ impl EditorSurface {
                                                         || had_ime_session
                                                             && ime_action == ImeFrameAction::None);
 
-                                                if defer_ime {
+                                                if !focused && !ime_has_commit
+                                                    && (had_ime_session || ime_action == ImeFrameAction::Preedit)
+                                                {
+                                                    // Internal TextEdit focus can survive native
+                                                    // focus loss. Discard late/provisional spelling
+                                                    // and its visual cursor, never publish it.
+                                                    ime_session = None;
+                                                    changed = false;
+                                                    boundary_input_handled = true;
+                                                    next_global_cursor = cursor_before;
+                                                    let mut state = egui::text_edit::TextEditState::default();
+                                                    if let (Some(selection), Some(cursor)) =
+                                                        (visual_selection_before.clone(), local_source_cursor_before)
+                                                    {
+                                                        state.cursor.set_char_range(Some(cursor_range_with_direction(selection, cursor)));
+                                                    }
+                                                    state.store(ui.ctx(), editor_id);
+                                                } else if defer_ime {
                                                     changed = false;
                                                 } else if had_ime_session
                                                     && ime_action == ImeFrameAction::Cancel

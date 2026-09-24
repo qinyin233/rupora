@@ -95,11 +95,15 @@ impl EditorSurface {
                             .filter(|session| session.document_id == document.id());
                         if composition.is_none() && starts_preedit
                             && ui.memory(|memory| memory.has_focus(editor_id))
-                            && ui.input(|input| input.focused)
                         {
                             // A later accepted composition supersedes an
                             // earlier interruption within this native frame.
-                            self.ime_interrupted_frame = None;
+                            if ui.input(|input| input.focused) {
+                                self.ime_interrupted_frame = None;
+                            }
+                            // TextEdit's internal focus survives window focus
+                            // loss and can consume a late preedit. Keep that
+                            // spelling out of the document even while unfocused.
                             composition = Some(SourceImeSession {
                                 document_id: document.id(),
                                 visual_content: document.content.clone(),
