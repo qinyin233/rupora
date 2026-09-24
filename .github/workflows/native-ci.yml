@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds per fuzz target (30-600)
+        required: false
+        default: 30
+        type: number
   schedule:
     - cron: "17 3 * * 1"
 
@@ -120,10 +126,16 @@ jobs:
         working-directory: fuzz
         env:
           RUST_BACKTRACE: "1"
+          FUZZ_SECONDS: ${{ inputs.fuzz_seconds || 30 }}
         run: |
+          if ! [[ "$FUZZ_SECONDS" =~ ^[0-9]+$ ]] || (( FUZZ_SECONDS < 30 || FUZZ_SECONDS > 600 )); then
+            echo "fuzz_seconds must be between 30 and 600" >&2
+            exit 1
+          fi
+          python3 ../scripts/seed_fuzz_corpus.py
           cargo fuzz build
           for target in markdown_pipeline table_parser wysiwyg_projection; do
-            cargo fuzz run "$target" -- -max_total_time=30 -rss_limit_mb=4096
+            cargo fuzz run "$target" -- "-max_total_time=$FUZZ_SECONDS" -rss_limit_mb=4096
           done
           git -C .. diff --exit-code -- fuzz/Cargo.lock
 

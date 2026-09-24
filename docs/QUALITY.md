@@ -41,7 +41,7 @@ cargo check --manifest-path fuzz/Cargo.toml --bins --locked
   输入最多 256 KiB，每次替换最多 4 KiB，每条轨迹最多 32 步。位置字段可覆盖全文，
   每步验证投影边界、选区及样式覆盖；普通 CI 还回放固定种子的多步轨迹。
   这些是投影测试，不代替 App、历史、系统 IME 或真实窗口验收。
-- 每周及手动 CI 使用 nightly 构建并分别运行三个 fuzz 目标，每个至少分配 30 秒；本地 `cargo check` 只验证可构建性。
+- 每周 CI 使用 nightly 构建并分别运行三个 fuzz 目标，每个分配 30 秒；手动运行可将每个目标调至 30–600 秒。运行前从 `scripts/seed_fuzz_corpus.py` 生成只含合成 Markdown 的初始语料，避免随机输入长期停在无效 UTF-8 或不完整轨迹；本地 `cargo check` 只验证可构建性。
 - 已发现的 fuzz 崩溃输入转为常规回归测试，每次 push 都会运行；fuzz 失败时保留崩溃样本 artifact 和调用栈。
 
 关键行为契约、尚需验证的边界及任务状态入口见 [可靠性改进与验收](RELIABILITY.md)。
