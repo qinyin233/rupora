@@ -346,6 +346,59 @@ fn hybrid_replacing_text_at_formatting_boundaries_keeps_visible_text() {
 }
 
 #[test]
+fn hybrid_deleting_table_cell_text_keeps_the_table_and_history() {
+    let source = "| A | **B** |\n| --- | --- |\n| x | y |";
+    for (character, expected) in [
+        ('A', "|  | **B** |\n| --- | --- |\n| x | y |"),
+        ('x', "| A | **B** |\n| --- | --- |\n|  | y |"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let start = source.find(character).unwrap();
+        let mut app = app_at(directory.path(), source, start..start + 1);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        frame(&mut app, &ctx, true, vec![]);
+        frame(
+            &mut app,
+            &ctx,
+            true,
+            vec![key(Key::Backspace, egui::Modifiers::NONE)],
+        );
+        assert_eq!(app.session[0].content, expected);
+        app.undo_active();
+        assert_eq!(app.session[0].content, source);
+        app.redo_active();
+        assert_eq!(app.session[0].content, expected);
+    }
+}
+
+#[test]
+fn hybrid_replacing_table_cell_text_with_space_keeps_it_visible() {
+    let source = "| A | **B** |\n| --- | --- |\n| x | y |";
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = app_at(directory.path(), source, 2..3);
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    frame(&mut app, &ctx, true, vec![]);
+    frame(&mut app, &ctx, true, vec![egui::Event::Text(" ".into())]);
+    assert_eq!(
+        app.session[0].content,
+        "| &#32; | **B** |\n| --- | --- |\n| x | y |"
+    );
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "   │  B\n\nx  │  y"
+    );
+    app.undo_active();
+    assert_eq!(app.session[0].content, source);
+    app.redo_active();
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "   │  B\n\nx  │  y"
+    );
+}
+
+#[test]
 fn leading_edits_before_enter_keep_their_input_semantics_and_history() {
     let cases = [
         (

@@ -571,6 +571,14 @@ impl VisualProjection {
         if replacement.is_empty()
             && !change.old.is_empty()
             && image_closers.is_empty()
+            // The hidden bytes around a table cell are column pipes and
+            // padding, not an inline wrapper to remove with its last letter.
+            && !self.runs.iter().any(|run| {
+                run.style.table
+                    && !run.style.marker
+                    && run.range.start <= change.old.start
+                    && change.old.end <= run.range.end
+            })
             && self.source_left_boundaries[change.old.start] < source_start
             && self.source_boundaries[change.old.end] > source_end
         {
@@ -708,7 +716,7 @@ impl VisualProjection {
                     .filter(|repair| **repair <= source_start)
                     .count()
                     * "<!---->".len();
-            if let Some(position) = self.repair_collapsed_list_space(
+            if let Some(position) = self.repair_collapsed_structural_space(
                 edited,
                 &change.old,
                 adjusted_source_start,
@@ -757,26 +765,30 @@ impl VisualProjection {
         ranges
     }
 
-    fn repair_collapsed_list_space(
+    fn repair_collapsed_structural_space(
         &self,
         edited_visual: &str,
         changed_visual: &Range<usize>,
         source_start: usize,
         output: &mut String,
     ) -> Option<usize> {
-        if !self
+        let at_list_prefix_end = self
             .runs
             .iter()
-            .any(|run| run.style.marker && run.range.end == changed_visual.start)
+            .any(|run| run.style.marker && run.range.end == changed_visual.start);
+        let in_table_cell = self.runs.iter().any(|run| {
+            run.style.table && !run.style.marker && run.range.contains(&changed_visual.start)
+        });
+        if !(at_list_prefix_end || in_table_cell)
             || output.get(source_start..source_start + 1) != Some(" ")
             || Self::from_markdown_with_context(output, None, self.references.clone()).text()
                 == edited_visual
         {
             return None;
         }
-        // After deleting the first word, Markdown can reinterpret its
-        // following space as part of the list prefix. An encoded ASCII space
-        // keeps it in the editable content without changing what is shown.
+        // A list can consume the first surviving space as marker whitespace;
+        // a table cell can trim a replacement space as cell padding. Encoding
+        // the space keeps it in editable content without changing its display.
         let mut candidate = output.clone();
         candidate.replace_range(source_start..source_start + 1, "&#32;");
         if Self::from_markdown_with_context(&candidate, None, self.references.clone()).text()
