@@ -988,6 +988,54 @@ fn ordered_shortcuts_undo_precedes_save() {
 }
 
 #[test]
+fn ordered_save_never_persists_unconfirmed_ime_preedit() {
+    for mode in [ViewMode::Edit, ViewMode::Split, ViewMode::Hybrid] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ime-save.md");
+        fs::write(&path, "A🙂B").unwrap();
+        let mut app = isolated_app(directory.path());
+        app.session.insert(Document::open(&path).unwrap());
+        app.restore_active_view_state();
+        app.state.view_mode = mode;
+        app.queue_editor_selection(1..1);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        shortcut_editor_frame(&mut app, &ctx, vec![]);
+
+        shortcut_editor_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "ni".into(),
+                active_range_chars: Some(0..2),
+            })],
+        );
+        assert_eq!(app.session[0].content, "A🙂B", "{mode:?}");
+        shortcut_editor_frame(&mut app, &ctx, vec![command_key(Key::S)]);
+        drain_ordered_input(&mut app, &ctx);
+        assert_eq!(fs::read(&path).unwrap(), "A🙂B".as_bytes(), "{mode:?}");
+        assert_eq!(app.session[0].content, "A🙂B", "{mode:?}");
+        assert!(!app.session[0].can_undo(), "{mode:?}");
+
+        shortcut_editor_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("你".into()))],
+        );
+        drain_ordered_input(&mut app, &ctx);
+        assert_eq!(app.session[0].content, "A你🙂B", "{mode:?}");
+        assert_eq!(fs::read(&path).unwrap(), "A🙂B".as_bytes(), "{mode:?}");
+        shortcut_editor_frame(&mut app, &ctx, vec![command_key(Key::S)]);
+        drain_ordered_input(&mut app, &ctx);
+        assert_eq!(fs::read(&path).unwrap(), "A你🙂B".as_bytes(), "{mode:?}");
+        app.undo_active();
+        assert_eq!(app.session[0].content, "A🙂B", "{mode:?}");
+        app.redo_active();
+        assert_eq!(app.session[0].content, "A你🙂B", "{mode:?}");
+    }
+}
+
+#[test]
 fn ordered_shortcuts_preserve_composition_and_escape_or_find_barriers() {
     for mode in [ViewMode::Edit, ViewMode::Hybrid] {
         for (case, events) in [
