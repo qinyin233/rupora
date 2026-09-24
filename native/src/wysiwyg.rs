@@ -780,7 +780,6 @@ impl VisualProjection {
             run.style.table && !run.style.marker && run.range.contains(&changed_visual.start)
         });
         if !(at_list_prefix_end || in_table_cell)
-            || output.get(source_start..source_start + 1) != Some(" ")
             || Self::from_markdown_with_context(output, None, self.references.clone()).text()
                 == edited_visual
         {
@@ -789,16 +788,26 @@ impl VisualProjection {
         // A list can consume the first surviving space as marker whitespace;
         // a table cell can trim a replacement space as cell padding. Encoding
         // the space keeps it in editable content without changing its display.
-        let mut candidate = output.clone();
-        candidate.replace_range(source_start..source_start + 1, "&#32;");
-        if Self::from_markdown_with_context(&candidate, None, self.references.clone()).text()
-            == edited_visual
+        for position in [
+            Some(source_start),
+            in_table_cell.then(|| source_start.checked_sub(1)).flatten(),
+        ]
+        .into_iter()
+        .flatten()
         {
-            *output = candidate;
-            Some(source_start)
-        } else {
-            None
+            if output.get(position..position + 1) != Some(" ") {
+                continue;
+            }
+            let mut candidate = output.clone();
+            candidate.replace_range(position..position + 1, "&#32;");
+            if Self::from_markdown_with_context(&candidate, None, self.references.clone()).text()
+                == edited_visual
+            {
+                *output = candidate;
+                return Some(position);
+            }
         }
+        None
     }
 
     #[allow(clippy::too_many_arguments)]

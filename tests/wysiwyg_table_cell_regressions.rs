@@ -126,3 +126,40 @@ fn replacing_each_single_table_cell_character_preserves_the_visible_edit() {
         }
     }
 }
+
+#[test]
+fn deleting_the_last_word_character_keeps_a_surviving_table_cell_space() {
+    let source = "| a b | c d |\n| --- | --- |\n| e f | g h |";
+    let projection = VisualProjection::from_markdown(source);
+    for (edited, cursor, expected_source) in [
+        (
+            "a   │  c d\n\ne f  │  g h",
+            2,
+            "| a&#32; | c d |\n| --- | --- |\n| e f | g h |",
+        ),
+        (
+            "a b  │  c \n\ne f  │  g h",
+            10,
+            "| a b | c&#32; |\n| --- | --- |\n| e f | g h |",
+        ),
+        (
+            "a b  │  c d\n\ne f  │  g ",
+            23,
+            "| a b | c d |\n| --- | --- |\n| e f | g&#32; |",
+        ),
+    ] {
+        let update = projection
+            .apply_edit(source, edited, cursor..cursor)
+            .unwrap();
+        assert_eq!(update.source, expected_source);
+        let active = VisualProjection::from_markdown_with_selection(
+            &update.source,
+            Some(update.selection.clone()),
+        );
+        assert_eq!(active.text(), edited);
+        assert_eq!(
+            active.visual_char_range(&update.source, update.selection),
+            cursor..cursor
+        );
+    }
+}

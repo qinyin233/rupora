@@ -399,6 +399,38 @@ fn hybrid_replacing_table_cell_text_with_space_keeps_it_visible() {
 }
 
 #[test]
+fn hybrid_deleting_table_cell_tail_keeps_the_surviving_space() {
+    let source = "| a b | c d |\n| --- | --- |\n| e f | g h |";
+    let directory = tempfile::tempdir().unwrap();
+    let b = source.find('b').unwrap();
+    let mut app = app_at(directory.path(), source, b..b + 1);
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    frame(&mut app, &ctx, true, vec![]);
+    frame(
+        &mut app,
+        &ctx,
+        true,
+        vec![key(Key::Backspace, egui::Modifiers::NONE)],
+    );
+    assert_eq!(
+        app.session[0].content,
+        "| a&#32; | c d |\n| --- | --- |\n| e f | g h |"
+    );
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "a   │  c d\n\ne f  │  g h"
+    );
+    app.undo_active();
+    assert_eq!(app.session[0].content, source);
+    app.redo_active();
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "a   │  c d\n\ne f  │  g h"
+    );
+}
+
+#[test]
 fn leading_edits_before_enter_keep_their_input_semantics_and_history() {
     let cases = [
         (
