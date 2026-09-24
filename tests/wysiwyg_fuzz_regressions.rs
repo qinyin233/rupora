@@ -1,6 +1,115 @@
 use rupora::wysiwyg::VisualProjection;
 
 #[test]
+fn replacing_first_formatted_character_with_space_does_not_expose_markers() {
+    for (source, edited) in [
+        ("*italic abc*", " talic abc"),
+        ("**strong abc**", " trong abc"),
+        ("~~struck text~~", " truck text"),
+        ("**outer *inner* rest**", " uter inner rest"),
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        let update = projection.apply_edit(source, edited, 1..1).unwrap();
+        let reparsed = VisualProjection::from_markdown(&update.source);
+        assert_eq!(
+            reparsed.text(),
+            edited,
+            "updated source: {:?}",
+            update.source
+        );
+        assert!(
+            reparsed
+                .runs_for(reparsed.text())
+                .iter()
+                .any(|run| run.style.emphasis || run.style.strong || run.style.strikethrough),
+            "formatting was lost: {:?}",
+            update.source
+        );
+        let active = VisualProjection::from_markdown_with_selection(
+            &update.source,
+            Some(update.selection.clone()),
+        );
+        assert_eq!(active.text(), edited);
+        assert_eq!(
+            active.visual_char_range(&update.source, update.selection),
+            1..1
+        );
+    }
+}
+
+#[test]
+fn replacing_an_entire_emphasis_span_with_space_removes_empty_markers() {
+    for (source, edited, cursor) in [
+        ("a *em* b", "a   b", 3),
+        ("*one* **two** *three*", "  two three", 1),
+        ("**outer *inner* rest**", "outer   rest", 7),
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        let update = projection
+            .apply_edit(source, edited, cursor..cursor)
+            .unwrap();
+        if source == "a *em* b" {
+            assert_eq!(update.source, "a   b");
+        }
+        assert_eq!(
+            VisualProjection::from_markdown(&update.source).text(),
+            edited,
+            "updated source: {:?}",
+            update.source
+        );
+        let active = VisualProjection::from_markdown_with_selection(
+            &update.source,
+            Some(update.selection.clone()),
+        );
+        assert_eq!(active.text(), edited);
+        assert_eq!(
+            active.visual_char_range(&update.source, update.selection),
+            cursor..cursor
+        );
+    }
+}
+
+#[test]
+fn editing_spaces_next_to_underscore_emphasis_keeps_markers_hidden() {
+    let source = "prefix **strong** _em_ suffix";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "prefix strong em suffix");
+    for edited in [
+        "prefix strong新em suffix",
+        "prefix strong新m suffix",
+        "prefix strong em新suffix",
+    ] {
+        let cursor = edited.find('新').unwrap() + '新'.len_utf8();
+        let cursor = edited[..cursor].chars().count();
+        let update = projection
+            .apply_edit(source, edited, cursor..cursor)
+            .unwrap();
+        let reparsed = VisualProjection::from_markdown(&update.source);
+        assert_eq!(
+            reparsed.text(),
+            edited,
+            "updated source: {:?}",
+            update.source
+        );
+        assert!(
+            reparsed
+                .runs_for(reparsed.text())
+                .iter()
+                .any(|run| run.style.emphasis)
+        );
+        let active = VisualProjection::from_markdown_with_selection(
+            &update.source,
+            Some(update.selection.clone()),
+        );
+        assert_eq!(active.text(), edited);
+        assert_eq!(
+            active.visual_char_range(&update.source, update.selection),
+            cursor..cursor
+        );
+    }
+}
+
+#[test]
 fn replacing_text_across_emphasis_closer_keeps_plain_suffix_hidden() {
     let source = "a *em* b";
     let projection = VisualProjection::from_markdown(source);

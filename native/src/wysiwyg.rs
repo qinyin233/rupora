@@ -544,6 +544,8 @@ impl VisualProjection {
         }) {
             if replacement.is_empty()
                 || source[wrapper.source.clone()].starts_with("![")
+                || (replacement.trim().is_empty()
+                    && inline_flanking_wrapper(source, &wrapper.source))
                 || change.old.start < wrapper.visual.start
                 || wrapper.visual.end < change.old.end
             {
@@ -598,16 +600,22 @@ impl VisualProjection {
         let mut retained_offset =
             source_start + decoded_prefix.len() + replacement.len() + decoded_suffix.len();
         let mut retained_flanking_closers = Vec::new();
+        let mut retained_flanking_openers = Vec::new();
         for range in &retained {
             let start = retained_offset;
             retained_offset += range.end - range.start;
-            if image_closers.is_empty()
-                && self.inline_wrappers.iter().any(|wrapper| {
-                    *range == (wrapper.content.end..wrapper.source.end)
-                        && inline_flanking_wrapper(source, &wrapper.source)
-                })
-            {
-                retained_flanking_closers.push((start, retained_offset));
+            if image_closers.is_empty() {
+                for wrapper in self
+                    .inline_wrappers
+                    .iter()
+                    .filter(|wrapper| inline_flanking_wrapper(source, &wrapper.source))
+                {
+                    if *range == (wrapper.content.end..wrapper.source.end) {
+                        retained_flanking_closers.push((start, retained_offset));
+                    } else if *range == (wrapper.source.start..wrapper.content.start) {
+                        retained_flanking_openers.push((start, retained_offset));
+                    }
+                }
             }
         }
         output.replace_range(source_start..source_end, &inserted);
@@ -677,6 +685,7 @@ impl VisualProjection {
             source_end,
             delta,
             &retained_flanking_closers,
+            &retained_flanking_openers,
             &mut output,
         );
         if !repair_bytes.is_empty() {
@@ -790,6 +799,7 @@ impl VisualProjection {
         source_end: usize,
         delta: isize,
         retained_flanking_closers: &[(usize, usize)],
+        retained_flanking_openers: &[(usize, usize)],
         output: &mut String,
     ) -> Vec<usize> {
         const REPAIR: &str = "<!---->";
@@ -811,6 +821,18 @@ impl VisualProjection {
             if output.is_char_boundary(start) && output.is_char_boundary(end) {
                 candidates.extend([vec![end], vec![start], vec![start, end]]);
             }
+            if changed_visual.start == wrapper.visual.start
+                && source_start == wrapper.content.start
+                && output
+                    .get(source_start..)
+                    .is_some_and(|tail| tail.starts_with(' '))
+            {
+                // A leading replacement space can turn `* word*` into a
+                // list item, or make an emphasis delimiter literal. An
+                // invisible inline boundary lets the opening delimiter keep
+                // its Markdown role while preserving the visible space.
+                candidates.push(vec![source_start]);
+            }
             let closer_start = end.saturating_sub(wrapper.source.end - wrapper.content.end);
             if output.get(closer_start..end)
                 == original_source.get(wrapper.content.end..wrapper.source.end)
@@ -827,6 +849,39 @@ impl VisualProjection {
             }
             if output.is_char_boundary(start) {
                 candidates.push(vec![start]);
+            }
+        }
+        for &(start, end) in retained_flanking_openers {
+            // Replacing text across an opener can leave `_word_` next to a
+            // letter, making the underscores literal. Restore a parsing
+            // boundary before the retained opener.
+            if output.is_char_boundary(start) {
+                candidates.push(vec![start]);
+            }
+            if output.is_char_boundary(end) {
+                candidates.push(vec![end]);
+            }
+        }
+        for adjacent in self
+            .inline_wrappers
+            .iter()
+            .filter(|wrapper| inline_flanking_wrapper(original_source, &wrapper.source))
+        {
+            if adjacent.visual.start == changed_visual.end && adjacent.source.start >= source_end {
+                // Replacing the separator before `_em_` can turn its opener
+                // into an intraword underscore.
+                let opener = shift_index(adjacent.source.start, delta);
+                if output.is_char_boundary(opener) {
+                    candidates.push(vec![opener]);
+                }
+            }
+            if adjacent.visual.end == changed_visual.start
+                && adjacent.source.end <= source_start
+                && output.is_char_boundary(adjacent.source.end)
+            {
+                // Likewise, removing the separator after `_em_` can make
+                // the closer literal beside the next word.
+                candidates.push(vec![adjacent.source.end]);
             }
         }
         let joins_formatted_spans = !changed_visual.is_empty()

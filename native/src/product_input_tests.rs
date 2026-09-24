@@ -308,6 +308,44 @@ fn hybrid_deleting_first_list_word_keeps_the_remaining_space_and_history() {
 }
 
 #[test]
+fn hybrid_replacing_text_at_formatting_boundaries_keeps_visible_text() {
+    for (source, selection, replacement, expected) in [
+        ("*italic abc*", 1..2, " ", " talic abc"),
+        (
+            "prefix **strong** _em_ suffix",
+            17..18,
+            "新",
+            "prefix strong新em suffix",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_at(directory.path(), source, selection);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        frame(&mut app, &ctx, true, vec![]);
+        frame(
+            &mut app,
+            &ctx,
+            true,
+            vec![egui::Event::Text(replacement.into())],
+        );
+        assert_eq!(
+            VisualProjection::from_markdown(&app.session[0].content).text(),
+            expected,
+            "source after edit: {:?}",
+            app.session[0].content
+        );
+        app.undo_active();
+        assert_eq!(app.session[0].content, source);
+        app.redo_active();
+        assert_eq!(
+            VisualProjection::from_markdown(&app.session[0].content).text(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn leading_edits_before_enter_keep_their_input_semantics_and_history() {
     let cases = [
         (
