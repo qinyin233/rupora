@@ -108,7 +108,12 @@ fn check_projection(source: &str, projection: &VisualProjection) {
     ] {
         let cursor = projection.source_char_range(source, point..point);
         check_range(&cursor, source_length);
-        assert!(cursor.start >= previous, "source mapping moves backwards");
+        assert!(
+            cursor.start >= previous,
+            "source mapping moves backwards: source={source:?}, visual={:?}, point={point}, previous={previous}, current={}",
+            projection.text(),
+            cursor.start
+        );
         previous = cursor.start;
         check_range(
             &projection.source_char_range(source, 0..point),

@@ -2,6 +2,34 @@
 mod projection_fuzz;
 
 #[test]
+fn projection_trace_replays_ci_backward_mapping_crash() {
+    // GitHub Actions run 36040333784, libFuzzer artifact crash-d23ba72e1046248e0eea47c001034ef708ed6145.
+    let input = [
+        4, 2, 3, 46, 93, 16, 46, 4, 3, 10, 42, 9, 187, 9, 13, 9, 9, 9, 9, 9, 9, 9, 9, 35, 42, 255,
+        255, 255, 255, 255, 0, 36, 0, 0, 0, 0, 0, 9,
+    ];
+    assert!(projection_fuzz::run(&input).is_some());
+}
+
+#[test]
+fn list_tabs_before_indented_code_keep_source_mapping_ordered() {
+    let source = "x\n*\t\t\t\t\t\t\t#*";
+    for selection in 0..=source.chars().count() {
+        let projection = rupora::wysiwyg::VisualProjection::from_markdown_with_selection(
+            source,
+            Some(selection..selection),
+        );
+        let positions = (0..=projection.text().chars().count())
+            .map(|point| projection.source_char_range(source, point..point).start)
+            .collect::<Vec<_>>();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] <= pair[1]),
+            "selection={selection}, positions={positions:?}"
+        );
+    }
+}
+
+#[test]
 fn projection_trace_replays_same_line_nested_list_crash() {
     // GitHub Actions run 35966941929: the original libFuzzer crash input.
     let input = [

@@ -129,7 +129,8 @@ impl VisualProjection {
         let mut cursor_in_literal_syntax = false;
         let standalone_footnotes = standalone_footnote_references(source);
 
-        for (event, range) in crate::markdown::events_with_references(source, &references) {
+        let mut events = crate::markdown::events_with_references(source, &references).peekable();
+        while let Some((event, range)) = events.next() {
             if collapsed_source_cursor.is_some_and(|cursor| range.contains(&cursor))
                 && matches!(
                     &event,
@@ -199,8 +200,15 @@ impl VisualProjection {
                                 .copied()
                                 .unwrap_or_default();
                             builder.ensure_line_break(range.start, format.visual());
+                            // The parser may leave tabs after a list marker for an
+                            // indented code block. Those tabs belong to the next
+                            // event and must not be mapped into the marker too.
+                            let content_start = events.peek().and_then(|(next, next_range)| {
+                                (!matches!(next, Event::End(_)) && next_range.start > range.start)
+                                    .then_some(next_range.start)
+                            });
                             if let Some((prefix_range, prefix)) =
-                                item_prefix(source, range.start, mapped_until)
+                                item_prefix(source, range.start, mapped_until, content_start)
                             {
                                 builder.append_marker(
                                     source,
@@ -422,6 +430,7 @@ impl VisualProjection {
             }
         }
 
+        drop(events);
         builder.append_trailing_container_line(source);
         let mut projection =
             builder.finish(source, trailing_container_block, trailing_fenced_code_block);
@@ -2394,6 +2403,7 @@ fn item_prefix(
     source: &str,
     item_start: usize,
     mapped_until: usize,
+    content_start: Option<usize>,
 ) -> Option<(Range<usize>, String)> {
     // The parser can include leading indentation in the first Item range.
     let item_start = item_start
@@ -2416,6 +2426,9 @@ fn item_prefix(
         cursor += marker[cursor..]
             .bytes()
             .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .take(content_start.map_or(usize::MAX, |start| {
+                start.saturating_sub(item_start + cursor)
+            }))
             .count();
         if cursor == 1 {
             return None;
@@ -2444,6 +2457,9 @@ fn item_prefix(
         let spaces = marker[cursor..]
             .bytes()
             .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .take(content_start.map_or(usize::MAX, |start| {
+                start.saturating_sub(item_start + cursor)
+            }))
             .count();
         if spaces == 0 {
             return None;
