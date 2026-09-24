@@ -235,3 +235,57 @@ Alt+F4 未出现退出确认，候选仍在；点击标题栏关闭则出现未�
 [CI 35996810230](https://github.com/qinyin233/rupora/actions/runs/35996810230)
 全部必需作业成功，普通 push 的 fuzz 按配置跳过。#6 保持开放，组合退出的事件分类、
 文件关联、强制退出恢复、其他输入法及跨平台原生矩阵仍需完成。
+
+## 关闭确认时拼音提交的事件诊断
+
+为分类上节的现象，在 `4579f14` 上临时给 `raw_input_hook` 增加只读记录，位置在
+应用输入调度之前，只对合成文件 `分栏停顿撤销.md` 生效。记录事件类型、字符数量、
+焦点和关闭状态，不记录正文或输入文本。此诊断程序由 Rust 1.92.0 release 构建，
+SHA-256 为 `e8804ca73c567ee83f95963f6984589dbf7ec3b3fb1274fe8c6611d12f69ebf2`；
+它不是上节的 NSIS 验收程序，也不作为新发布资产。
+
+分栏模式恢复 `A末尾🙂B`，在尾后 Backspace 得到未保存的 `A末🙂B`。在末后按 z，
+候选出现，左侧显示拼音，右侧保持已确认正文。执行 Alt+F4、点击标题栏关闭、在确认框
+选择“否”，结果仍为 `A末z🙂B`。入口记录如下，括号内数字为文本字符数：
+
+```text
+time=41.280433  focused=true close=false body_chars=4 events=[Preedit(1)]
+time=52.776715  focused=true close=false body_chars=4 events=[F4(pressed=false,alt=true)]
+time=61.663224  focused=true close=true  body_chars=4 events=[]
+time=85.170871  focused=true close=false body_chars=4 events=[Focus(false), Preedit(0), Commit(1), Focus(true)]
+```
+
+一次撤销恢复 `A末🙂B`。再次按 z，直接点击关闭（省略 Alt+F4），选择“否”，结果相同：
+
+```text
+time=106.969479 focused=true close=false body_chars=4 events=[Preedit(1)]
+time=114.255630 focused=true close=true  body_chars=4 events=[]
+time=133.013421 focused=true close=false body_chars=4 events=[Focus(false), Preedit(0), Commit(1), Focus(true)]
+```
+
+两次都在正文仍为 4 字符时收到明确的 1 字符 Commit，随后两侧均为 `A末z🙂B`。
+因此，这两次是原生输入后端交付正式提交，应用应保留且允许撤销；不属于无 Commit
+而错误写回预编辑的情形。Alt+F4 那次入口只收到 F4 松开，没有关闭请求，故不把它
+归因于应用丢弃 Close；更底层的按键消费位置没有记录，仍不能由此确定。
+
+新增 `ime_commit_after_modal_focus_round_trip_is_one_undoable_edit` 重放所记录的
+焦点往返、空 Preedit、Commit 顺序，验证提交结果、单次撤销/重做边界，以及继续输入。
+三模式重放均通过；实际窗口诊断只执行分栏，测试不模拟系统确认框，也不冒充三模式原生验收。
+
+诊断结束通过两次撤销回到磁盘基线 `A末尾🙂B`，正常退出。临时探针已从源码移除，
+本轮保留的是测试与证据，没有改变产品输入逻辑。原始日志、探针 diff 和诊断程序保留在
+忽略目录 `target/ime-close-diagnostic/`。#6 仍开放，其他原生矩阵和恢复验收继续执行。
+
+验证：583 项测试通过、4 项既有 ignored；fmt、严格全特性 Clippy、release 性能门禁
+通过。`4579f14` 的 [CI 35998537904](https://github.com/qinyin233/rupora/actions/runs/35998537904)
+全部必需作业成功，普通 push 的 fuzz 按配置跳过。
+
+### Standards 复核
+
+独立只读复核未发现规范违反或需要处理的代码 smell。新增测试沿现有应用入口与模块
+边界执行；记录区分临时程序、真实分栏验收和三模式重放。
+
+### Spec 复核
+
+独立只读复核未发现本轮需求遗漏、范围扩大或错误实现；正式 Commit 的分类有两次
+入口记录支持。两路共同建议把“正文仅改变一次”收紧为提交结果和单次历史边界，已采纳。

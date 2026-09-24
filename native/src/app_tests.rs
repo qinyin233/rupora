@@ -153,6 +153,64 @@ fn ime_commit_then_preedit_and_native_focus_loss_keeps_only_candidate() {
 }
 
 #[test]
+fn ime_commit_after_modal_focus_round_trip_is_one_undoable_edit() {
+    // Captured at raw_input_hook on Windows/Microsoft Pinyin after cancelling
+    // the close dialog: focus lost, empty preedit, commit, focus regained.
+    // The OS really commits the spelling; do not mistake it for ghost preedit.
+    // The native dialog itself is covered by Computer Use, not this replay.
+    for mode in [ViewMode::Edit, ViewMode::Split, ViewMode::Hybrid] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.state.view_mode = mode;
+        app.session[0].content = "A末🙂B".into();
+        app.session[0].update_after_edit();
+        app.queue_editor_selection(2..2);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        shortcut_editor_frame(&mut app, &ctx, vec![]);
+        shortcut_editor_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "z".into(),
+                active_range_chars: Some(0..1),
+            })],
+        );
+        assert_eq!(app.session[0].content, "A末🙂B", "{mode:?}");
+        assert!(!app.session[0].can_undo(), "{mode:?}");
+        shortcut_raw_frame(
+            &mut app,
+            &ctx,
+            egui::RawInput {
+                focused: true,
+                events: vec![
+                    egui::Event::WindowFocused(false),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: String::new(),
+                        active_range_chars: None,
+                    }),
+                    egui::Event::Ime(egui::ImeEvent::Commit("z".into())),
+                    egui::Event::WindowFocused(true),
+                ],
+                ..Default::default()
+            },
+            true,
+        );
+        drain_ordered_input(&mut app, &ctx);
+        assert_eq!(app.session[0].content, "A末z🙂B", "{mode:?}");
+        app.undo_active();
+        assert_eq!(app.session[0].content, "A末🙂B", "{mode:?}");
+        assert!(!app.session[0].can_undo(), "{mode:?}");
+        app.redo_active();
+        assert_eq!(app.session[0].content, "A末z🙂B", "{mode:?}");
+        shortcut_editor_frame(&mut app, &ctx, vec![egui::Event::Text("尾".into())]);
+        drain_ordered_input(&mut app, &ctx);
+        assert_eq!(app.session[0].content, "A末z尾🙂B", "{mode:?}");
+    }
+}
+
+#[test]
 fn ime_with_scroll_or_held_pointer_preserves_plain_input_before_cancellation() {
     for held_pointer in [false, true] {
         let directory = tempfile::tempdir().unwrap();
