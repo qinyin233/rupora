@@ -355,6 +355,19 @@ impl EditorSurface {
                 }
             }
         }
+        if self
+            .editor_widget_id
+            .is_some_and(|id| ui.memory(|memory| memory.has_focus(id)))
+        {
+            // egui-winit 0.35 passes `rect`, not `cursor_rect`, to the OS.
+            // A multiline TextEdit's full rectangle puts Windows candidates
+            // below the entire page instead of beside the current caret.
+            ui.output_mut(|platform| {
+                if let Some(ime) = platform.ime.as_mut() {
+                    ime.rect = ime.cursor_rect;
+                }
+            });
+        }
         output
     }
 }

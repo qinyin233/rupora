@@ -2932,3 +2932,37 @@ fn selected_save_path_preserves_confirmed_existing_target_semantics() {
         assert!(Document::open(&path).is_err());
     }
 }
+
+#[test]
+fn editor_ime_candidate_area_tracks_the_caret_in_a_tall_editor() {
+    for mode in [ViewMode::Edit, ViewMode::Split, ViewMode::Hybrid] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.session[0].content = "A🙂B".into();
+        app.session[0].update_after_edit();
+        app.queue_editor_selection(1..1);
+        app.state.view_mode = mode;
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        shortcut_editor_frame(&mut app, &ctx, vec![]);
+        let output = shortcut_editor_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "zhong'wen".into(),
+                active_range_chars: Some(0..8),
+            })],
+        );
+        let ime = output
+            .platform_output
+            .ime
+            .expect("focused editor enables IME");
+        assert!(
+            (ime.rect.bottom() - ime.cursor_rect.bottom()).abs() <= 1.0,
+            "mode={mode:?}: candidate area {:?} must end at caret {:?}, not at the bottom of the editor",
+            ime.rect,
+            ime.cursor_rect,
+        );
+    }
+}
