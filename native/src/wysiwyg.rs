@@ -850,6 +850,11 @@ impl VisualProjection {
             if output.is_char_boundary(start) {
                 candidates.push(vec![start]);
             }
+            if output.is_char_boundary(start) && output.is_char_boundary(end) {
+                // A closer left between a new space and the next word may
+                // need both sides isolated for its parent wrapper to parse.
+                candidates.push(vec![start, end]);
+            }
         }
         for &(start, end) in retained_flanking_openers {
             // Replacing text across an opener can leave `_word_` next to a

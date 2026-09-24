@@ -110,6 +110,68 @@ fn editing_spaces_next_to_underscore_emphasis_keeps_markers_hidden() {
 }
 
 #[test]
+fn replacing_across_nested_emphasis_closer_keeps_outer_text_visible() {
+    let source = "**outer *inner* rest**";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "outer inner rest");
+    let edited = "outer inn est";
+    let update = projection.apply_edit(source, edited, 10..10).unwrap();
+    assert_eq!(
+        VisualProjection::from_markdown(&update.source).text(),
+        edited,
+        "updated source: {:?}",
+        update.source
+    );
+    let reparsed = VisualProjection::from_markdown(&update.source);
+    let runs = reparsed.runs_for(reparsed.text());
+    assert!(runs.iter().any(|run| run.style.strong));
+    assert!(runs.iter().any(|run| run.style.emphasis));
+    let active = VisualProjection::from_markdown_with_selection(
+        &update.source,
+        Some(update.selection.clone()),
+    );
+    assert_eq!(active.text(), edited);
+    assert_eq!(
+        active.visual_char_range(&update.source, update.selection),
+        10..10
+    );
+    let next = "outer inn Xest";
+    let follow_up = active.apply_edit(&update.source, next, 11..11).unwrap();
+    assert_eq!(
+        VisualProjection::from_markdown(&follow_up.source).text(),
+        next
+    );
+}
+
+#[test]
+fn replacing_across_adjacent_emphasis_and_strong_keeps_both_styles() {
+    let source = "*one* **two** *three*";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "one two three");
+    let edited = "o wo three";
+    let update = projection.apply_edit(source, edited, 2..2).unwrap();
+    let reparsed = VisualProjection::from_markdown(&update.source);
+    assert_eq!(
+        reparsed.text(),
+        edited,
+        "updated source: {:?}",
+        update.source
+    );
+    let runs = reparsed.runs_for(reparsed.text());
+    assert!(runs.iter().any(|run| run.style.strong));
+    assert!(runs.iter().any(|run| run.style.emphasis));
+    let active = VisualProjection::from_markdown_with_selection(
+        &update.source,
+        Some(update.selection.clone()),
+    );
+    assert_eq!(active.text(), edited);
+    assert_eq!(
+        active.visual_char_range(&update.source, update.selection),
+        2..2
+    );
+}
+
+#[test]
 fn replacing_text_across_emphasis_closer_keeps_plain_suffix_hidden() {
     let source = "a *em* b";
     let projection = VisualProjection::from_markdown(source);
