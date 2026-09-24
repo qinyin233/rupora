@@ -1743,7 +1743,10 @@ impl ProjectionBuilder {
             return;
         }
         let line_start = source[..source_start]
-            .rfind('\n')
+            // CommonMark also treats a standalone CR as a line ending. Looking
+            // past it would replay the previous line's indentation and map the
+            // new visual line backwards into that earlier source prefix.
+            .rfind(['\r', '\n'])
             .map_or(0, |index| index + 1);
         let raw = &source[line_start..source_start];
         let (consumed, visual) = container_prefix(raw);

@@ -1,6 +1,70 @@
 use rupora::wysiwyg::VisualProjection;
 
 #[test]
+fn bare_cr_line_break_does_not_repeat_previous_indentation() {
+    for (source, expected) in [
+        (" a\rb", " a\nb"),
+        (" a\r\nb", " a\nb"),
+        (" a\nb", " a\nb"),
+        (" \rb", "\nb"),
+        (" 甲\r乙", " 甲\n乙"),
+        (" \u{3}\rV+", " \u{3}\nV+"),
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        assert_eq!(projection.text(), expected, "source={source:?}");
+        let positions = (0..=projection.text().chars().count())
+            .map(|index| projection.source_char_range(source, index..index).start)
+            .collect::<Vec<_>>();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] <= pair[1]),
+            "source={source:?} positions={positions:?}"
+        );
+    }
+}
+
+#[test]
+fn inserting_after_bare_cr_edits_the_second_source_line() {
+    let source = " a\rb";
+    let projection = VisualProjection::from_markdown(source);
+    let at = projection.text().find('\n').unwrap() + 1;
+    let mut edited = projection.text().to_owned();
+    edited.insert(at, 'X');
+    let cursor = edited[..at + 1].chars().count();
+    let update = projection
+        .apply_edit(source, &edited, cursor..cursor)
+        .unwrap();
+    assert_eq!(update.source, " a\rXb");
+    assert_eq!(update.selection, 4..4);
+    assert_eq!(
+        VisualProjection::from_markdown(&update.source).text(),
+        " a\nXb"
+    );
+}
+
+#[test]
+fn editing_across_bare_cr_preserves_source_ranges_and_unicode() {
+    for (source, edited, selection, expected_source) in [
+        (" a\rb", " a\n中", 3..4, " a\r中"),
+        (" a\rb", " a\n", 3..3, " a\r"),
+        (" a\rb", " ab", 2..2, " ab"),
+        (" 甲\r乙", " 甲\n🙂乙", 4..4, " 甲\r🙂乙"),
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        let update = projection
+            .apply_edit(source, edited, selection.clone())
+            .unwrap();
+        assert_eq!(update.source, expected_source, "source={source:?}");
+        assert_eq!(update.selection, selection, "source={source:?}");
+        let reparsed = VisualProjection::from_markdown(&update.source);
+        assert_eq!(reparsed.text(), edited, "source={source:?}");
+        assert_eq!(
+            reparsed.visual_char_range(&update.source, update.selection),
+            selection
+        );
+    }
+}
+
+#[test]
 fn deleting_images_between_formatted_spans_keeps_text_and_caret() {
     for source in [
         "**前**![*中*](x)**后**",

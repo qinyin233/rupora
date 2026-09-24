@@ -107,6 +107,9 @@ jobs:
           toolchain: nightly
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          # A fuzz finding should not discard the compiled nightly dependencies.
+          cache-on-failure: true
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version '=0.13.2' --locked

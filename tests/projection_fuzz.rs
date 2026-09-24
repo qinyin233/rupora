@@ -129,6 +129,16 @@ fn projection_trace_handles_truncation_invalid_utf8_and_overflow_fields() {
 }
 
 #[test]
+fn projection_trace_replays_standalone_carriage_return_crash() {
+    // Nightly libFuzzer artifact crash-911d06f806f25b43073a589c46d835b11bfc5cd5.
+    // Initial source is " \u{3}\rV+"; the incomplete edit must not affect it.
+    let input = [5, 32, 3, 13, 86, 43, 62, 2, 1, 102, 0];
+    let (source, _, steps) = projection_fuzz::run(&input).unwrap();
+    assert_eq!(source, " \u{3}\rV+");
+    assert_eq!(steps, 0);
+}
+
+#[test]
 fn projection_trace_replays_fixed_seed_markdown_edit_sequences() {
     // These bounded deterministic traces exercise the same assertions as the
     // fuzz target on every normal test run. They are not a libFuzzer campaign.
