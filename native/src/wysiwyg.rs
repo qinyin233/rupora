@@ -733,7 +733,7 @@ impl VisualProjection {
                     .filter(|repair| **repair <= source_start)
                     .count()
                     * "<!---->".len();
-            if let Some(position) = self.repair_collapsed_structural_space(
+            if let Some((position, count)) = self.repair_collapsed_structural_space(
                 edited,
                 &change.old,
                 adjusted_source_start,
@@ -741,7 +741,7 @@ impl VisualProjection {
             ) {
                 for caret in [&mut start_byte, &mut end_byte] {
                     if *caret > position {
-                        *caret += "&#32;".len() - 1;
+                        *caret += (*caret - position).min(count) * ("&#32;".len() - 1);
                     }
                 }
             }
@@ -808,23 +808,32 @@ impl VisualProjection {
         changed_visual: &Range<usize>,
         source_start: usize,
         output: &mut String,
-    ) -> Option<usize> {
+    ) -> Option<(usize, usize)> {
         let at_list_prefix_end = self
             .runs
             .iter()
             .any(|run| run.style.marker && run.range.end == changed_visual.start);
         let in_table_cell = self.runs.iter().any(|run| {
-            run.style.table && !run.style.marker && run.range.contains(&changed_visual.start)
+            run.style.table
+                && !run.style.marker
+                && run.range.start <= changed_visual.start
+                && changed_visual.start <= run.range.end
         });
-        if !(at_list_prefix_end || in_table_cell)
-            || Self::from_markdown_with_context(output, None, self.references.clone()).text()
-                == edited_visual
-        {
+        if !(at_list_prefix_end || in_table_cell) {
             return None;
         }
+        let actual = Self::from_markdown_with_context(output, None, self.references.clone());
+        if actual.text() == edited_visual {
+            return None;
+        }
+        let missing = edited_visual
+            .chars()
+            .count()
+            .saturating_sub(actual.text().chars().count())
+            .max(1);
         // A list can consume the first surviving space as marker whitespace;
-        // a table cell can trim a replacement space as cell padding. Encoding
-        // the space keeps it in editable content without changing its display.
+        // a table cell can trim inserted spaces as cell padding. Encoding the
+        // missing visible spaces keeps them in editable content.
         for position in [
             Some(source_start),
             in_table_cell.then(|| source_start.checked_sub(1)).flatten(),
@@ -832,16 +841,19 @@ impl VisualProjection {
         .into_iter()
         .flatten()
         {
-            if output.get(position..position + 1) != Some(" ") {
+            if output.get(position..).map_or(0, |tail| {
+                tail.bytes().take_while(|byte| *byte == b' ').count()
+            }) < missing
+            {
                 continue;
             }
             let mut candidate = output.clone();
-            candidate.replace_range(position..position + 1, "&#32;");
+            candidate.replace_range(position..position + missing, &"&#32;".repeat(missing));
             if Self::from_markdown_with_context(&candidate, None, self.references.clone()).text()
                 == edited_visual
             {
                 *output = candidate;
-                return Some(position);
+                return Some((position, missing));
             }
         }
         None

@@ -485,6 +485,34 @@ fn hybrid_follow_up_typing_keeps_surviving_spaces_and_table_padding() {
 }
 
 #[test]
+fn hybrid_typing_space_at_table_cell_end_keeps_it_visible() {
+    let source = "| a | b |\n| - | - |\n| c | d |";
+    for count in 1..=3 {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_at(directory.path(), source, 3..3);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        frame(&mut app, &ctx, true, vec![]);
+        frame(
+            &mut app,
+            &ctx,
+            true,
+            vec![egui::Event::Text(" ".repeat(count))],
+        );
+        assert_eq!(
+            VisualProjection::from_markdown(&app.session[0].content).text(),
+            format!("a{}  │  b\n\nc  │  d", " ".repeat(count))
+        );
+
+        frame(&mut app, &ctx, true, vec![egui::Event::Text("X".into())]);
+        assert_eq!(
+            VisualProjection::from_markdown(&app.session[0].content).text(),
+            format!("a{}X  │  b\n\nc  │  d", " ".repeat(count))
+        );
+    }
+}
+
+#[test]
 fn hybrid_typing_inside_an_indented_later_paragraph_keeps_its_separator() {
     for (source, cursor, expected) in [
         ("第一段\n\n  第二段", 5, "第一段\n\nX  第二段"),

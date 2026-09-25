@@ -183,3 +183,58 @@ fn deleting_the_only_header_cell_character_keeps_caret_in_the_empty_cell() {
         6..6
     );
 }
+
+#[test]
+fn typing_a_space_at_the_end_of_a_table_cell_keeps_it_visible() {
+    let source = "| a | b |\n| - | - |\n| c | d |";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "a  │  b\n\nc  │  d");
+    for (edited, cursor, expected_source) in [
+        (
+            "a   │  b\n\nc  │  d",
+            2,
+            "| a&#32; | b |\n| - | - |\n| c | d |",
+        ),
+        (
+            "a  │  b\n\nc  │  d ",
+            17,
+            "| a | b |\n| - | - |\n| c | d&#32; |",
+        ),
+    ] {
+        let update = projection
+            .apply_edit(source, edited, cursor..cursor)
+            .unwrap();
+        assert_eq!(update.source, expected_source);
+        let active = VisualProjection::from_markdown_with_selection(
+            &update.source,
+            Some(update.selection.clone()),
+        );
+        assert_eq!(active.text(), edited);
+        assert_eq!(
+            active.visual_char_range(&update.source, update.selection),
+            cursor..cursor
+        );
+    }
+}
+
+#[test]
+fn typing_multiple_spaces_at_a_table_cell_end_keeps_every_space() {
+    let source = "| a | b |\n| - | - |\n| c | d |";
+    let projection = VisualProjection::from_markdown(source);
+    for count in 2..=3 {
+        let edited = format!("a{}  │  b\n\nc  │  d", " ".repeat(count));
+        let cursor = 1 + count;
+        let update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+        let active = VisualProjection::from_markdown_with_selection(
+            &update.source,
+            Some(update.selection.clone()),
+        );
+        assert_eq!(active.text(), edited, "source={:?}", update.source);
+        assert_eq!(
+            active.visual_char_range(&update.source, update.selection),
+            cursor..cursor
+        );
+    }
+}
