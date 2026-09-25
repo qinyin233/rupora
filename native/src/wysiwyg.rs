@@ -1994,7 +1994,15 @@ impl ProjectionBuilder {
             .rfind(['\r', '\n'])
             .map_or(0, |index| index + 1);
         let raw = &source[line_start..source_start];
-        let (consumed, _) = container_prefix(raw);
+        let (mut consumed, _) = container_prefix(raw);
+        if format.quote > 0 && format.code > 0 {
+            // Indented code events already render the whitespace consumed
+            // after the final quote marker, including tab expansion. Replaying
+            // that source prefix here would display the indentation twice.
+            if let Some(marker) = raw[..consumed].rfind('>') {
+                consumed = marker + 2;
+            }
+        }
         if consumed > 0 {
             self.append_container_prefix_segments(
                 source,
@@ -2079,7 +2087,7 @@ impl ProjectionBuilder {
                 self.append_marker(source, &raw[cursor..cursor + whitespace], segment, style);
                 cursor += whitespace;
             }
-            if raw[cursor..].starts_with("> ") {
+            if raw[cursor..].starts_with("> ") || raw[cursor..].starts_with(">\t") {
                 let segment = range.start + cursor..range.start + cursor + 2;
                 self.append_marker(source, "│ ", segment, style);
                 cursor += 2;
@@ -2700,12 +2708,10 @@ fn item_prefix(
     mapped_until: usize,
     content_start: Option<usize>,
 ) -> Option<(Range<usize>, String)> {
-    // The parser can include leading indentation in the first Item range.
-    let item_start = item_start
-        + source[item_start..]
-            .bytes()
-            .take_while(|byte| matches!(byte, b' ' | b'\t'))
-            .count();
+    // The parser can include indentation or a quote prefix in an Item range,
+    // particularly when a tab follows `>`. Skip that container syntax before
+    // looking for the list marker itself.
+    let item_start = item_start + container_prefix(&source[item_start..]).0;
     let unmapped_start = mapped_until.min(item_start);
     let prefix_start = source[unmapped_start..item_start]
         .rfind(['\r', '\n'])
@@ -2777,7 +2783,7 @@ fn container_prefix(raw: &str) -> (usize, String) {
             .count();
         visual.push_str(&raw[cursor..cursor + whitespace]);
         cursor += whitespace;
-        if raw[cursor..].starts_with("> ") {
+        if raw[cursor..].starts_with("> ") || raw[cursor..].starts_with(">\t") {
             visual.push_str("│ ");
             cursor += 2;
         } else {

@@ -1,6 +1,59 @@
 use rupora::wysiwyg::VisualProjection;
 
 #[test]
+fn tab_after_quote_marker_keeps_quote_and_nested_list_visible() {
+    for (source, expected) in [
+        (">\ta  b", "│ a  b"),
+        ("  >\ta  b", "  │ a  b"),
+        (">\t- item", "│ • item"),
+        (">\t1. one", "│ 1. one"),
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        assert_eq!(projection.text(), expected, "source={source:?}");
+        let edited = format!("{expected}X");
+        let cursor = edited.chars().count();
+        let update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+        assert_eq!(
+            VisualProjection::from_markdown(&update.source).text(),
+            edited,
+            "source={source:?}, output={:?}",
+            update.source
+        );
+    }
+}
+
+#[test]
+fn quoted_indented_code_does_not_repeat_consumed_tabs_and_spaces() {
+    for source in [">\t\ta", "> \t\ta", ">\t    a"] {
+        let projection = VisualProjection::from_markdown(source);
+        assert_eq!(projection.text(), "│   a", "source={source:?}");
+        assert!(
+            projection
+                .runs_for(projection.text())
+                .iter()
+                .any(|run| run.style.code)
+        );
+    }
+}
+
+#[test]
+fn quoted_fenced_code_keeps_its_content_indentation() {
+    for source in [
+        "> ```\n>   a\n> ```",
+        "> ```\n>\ta\n> ```",
+        ">\t```\n>\t  a\n>\t```",
+    ] {
+        assert_eq!(
+            VisualProjection::from_markdown(source).text(),
+            "│   a\n",
+            "source={source:?}"
+        );
+    }
+}
+
+#[test]
 fn replacing_first_formatted_character_with_space_does_not_expose_markers() {
     for (source, edited) in [
         ("*italic abc*", " talic abc"),

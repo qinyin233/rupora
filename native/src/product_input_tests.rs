@@ -500,6 +500,26 @@ fn hybrid_typing_after_deleting_quote_first_character_keeps_the_quote() {
 }
 
 #[test]
+fn hybrid_quote_tab_prefix_keeps_nested_list_marker_while_typing() {
+    let source = ">\t- item";
+    let directory = tempfile::tempdir().unwrap();
+    let end = source.chars().count();
+    let mut app = app_at(directory.path(), source, end..end);
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    frame(&mut app, &ctx, true, vec![]);
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "│ • item"
+    );
+    frame(&mut app, &ctx, true, vec![egui::Event::Text("X".into())]);
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "│ • itemX"
+    );
+}
+
+#[test]
 fn hybrid_deleting_heading_first_character_keeps_surviving_spaces() {
     let source = "## a  b";
     let directory = tempfile::tempdir().unwrap();
