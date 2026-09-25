@@ -42,7 +42,14 @@ pub struct VisualProjection {
 struct AtomicVisualRange {
     visual: Range<usize>,
     source: Range<usize>,
-    container_marker: bool,
+    kind: AtomicVisualKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtomicVisualKind {
+    Generic,
+    ContainerMarker,
+    InlineCodeBody,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -394,7 +401,7 @@ impl VisualProjection {
                             style,
                         );
                     } else {
-                        builder.append_mapped(source, &text, content_range, style);
+                        builder.append_inline_code_body(source, &text, content_range, style);
                     }
                     builder.end_inline_wrapper(syntax.end);
                 }
@@ -540,7 +547,7 @@ impl VisualProjection {
         let container_marker_insertion = insertion
             .then(|| {
                 self.atomic_ranges.iter().find(|atomic| {
-                    atomic.container_marker
+                    atomic.kind == AtomicVisualKind::ContainerMarker
                         && atomic.visual.start < change.old.start
                         && change.old.start < atomic.visual.end
                 })
@@ -613,22 +620,28 @@ impl VisualProjection {
             source_start = source_start.min(atomic.source.start);
             source_end = source_end.max(atomic.source.end);
             let syntax = &source[atomic.source.clone()];
-            if syntax.starts_with('&') && syntax.ends_with(';') {
+            if (syntax.starts_with('&') && syntax.ends_with(';'))
+                || atomic.kind == AtomicVisualKind::InlineCodeBody
+            {
                 // An entity can decode to multiple characters. Replacing
                 // its syntax must retain any unselected decoded characters.
                 if atomic.visual.start < change.old.start {
-                    append_literal_inline_text(
-                        &mut decoded_prefix,
-                        &self.text[char_to_byte(&self.text, atomic.visual.start)
-                            ..char_to_byte(&self.text, change.old.start)],
-                    );
+                    let prefix = &self.text[char_to_byte(&self.text, atomic.visual.start)
+                        ..char_to_byte(&self.text, change.old.start)];
+                    if atomic.kind == AtomicVisualKind::InlineCodeBody {
+                        decoded_prefix.push_str(prefix);
+                    } else {
+                        append_literal_inline_text(&mut decoded_prefix, prefix);
+                    }
                 }
                 if change.old.end < atomic.visual.end {
-                    append_literal_inline_text(
-                        &mut decoded_suffix,
-                        &self.text[char_to_byte(&self.text, change.old.end)
-                            ..char_to_byte(&self.text, atomic.visual.end)],
-                    );
+                    let suffix = &self.text[char_to_byte(&self.text, change.old.end)
+                        ..char_to_byte(&self.text, atomic.visual.end)];
+                    if atomic.kind == AtomicVisualKind::InlineCodeBody {
+                        decoded_suffix.push_str(suffix);
+                    } else {
+                        append_literal_inline_text(&mut decoded_suffix, suffix);
+                    }
                 }
             }
         }
@@ -2268,6 +2281,44 @@ impl ProjectionBuilder {
         self.append_transformed(source, rendered, range, style);
     }
 
+    fn append_inline_code_body(
+        &mut self,
+        source: &str,
+        rendered: &str,
+        range: Range<usize>,
+        style: VisualStyle,
+    ) {
+        let raw = &source[range.clone()];
+        if !raw
+            .chars()
+            .map(normalized_inline_code_char)
+            .eq(rendered.chars())
+        {
+            // Keep the unselected visible characters even if a future parser
+            // normalization cannot be mapped character by character.
+            self.append_transformed_with_kind(
+                source,
+                rendered,
+                range,
+                style,
+                AtomicVisualKind::InlineCodeBody,
+            );
+            return;
+        }
+        self.record_inline_content(range.clone());
+        self.set_current_boundary(range.start);
+        let visual_start = self.char_count();
+        self.text.push_str(rendered);
+        let mut source_byte = range.start;
+        for character in raw.chars() {
+            source_byte += character.len_utf8();
+            self.source_left_boundaries.push(source_byte);
+            self.source_boundaries.push(source_byte);
+        }
+        let visual_end = self.char_count();
+        push_run(&mut self.runs, visual_start..visual_end, style);
+    }
+
     fn append_text_with_footnote_references(
         &mut self,
         source: &str,
@@ -2460,7 +2511,13 @@ impl ProjectionBuilder {
         source_range: Range<usize>,
         style: VisualStyle,
     ) {
-        self.append_transformed_with_kind(source, rendered, source_range, style, false);
+        self.append_transformed_with_kind(
+            source,
+            rendered,
+            source_range,
+            style,
+            AtomicVisualKind::Generic,
+        );
     }
 
     fn append_transformed_with_kind(
@@ -2469,7 +2526,7 @@ impl ProjectionBuilder {
         rendered: &str,
         source_range: Range<usize>,
         style: VisualStyle,
-        container_marker: bool,
+        kind: AtomicVisualKind,
     ) {
         self.record_inline_content(source_range.clone());
         if rendered.is_empty() {
@@ -2499,7 +2556,7 @@ impl ProjectionBuilder {
             self.atomic_ranges.push(AtomicVisualRange {
                 visual: visual_start..visual_end,
                 source: source_range,
-                container_marker,
+                kind,
             });
         }
         push_run(&mut self.runs, visual_start..visual_end, style);
@@ -2524,7 +2581,13 @@ impl ProjectionBuilder {
         mut style: VisualStyle,
     ) {
         style.marker = true;
-        self.append_transformed_with_kind(source, rendered, source_range, style, true);
+        self.append_transformed_with_kind(
+            source,
+            rendered,
+            source_range,
+            style,
+            AtomicVisualKind::ContainerMarker,
+        );
     }
 
     fn append_virtual(&mut self, rendered: &str, source_byte: usize, style: VisualStyle) {
@@ -2569,9 +2632,33 @@ fn inline_code_content_range(
     let content = crate::markdown::inline_code_source_ranges(source, syntax_range.clone())
         .map_or(syntax_range, |(_, body)| body);
     let fragment = &source[content.clone()];
+    if let (Some(first), Some(last)) = (fragment.chars().next(), fragment.chars().next_back())
+        && normalized_inline_code_char(first) == ' '
+        && normalized_inline_code_char(last) == ' '
+        && fragment
+            .chars()
+            .any(|character| normalized_inline_code_char(character) != ' ')
+    {
+        let candidate = content.start + first.len_utf8()..content.end - last.len_utf8();
+        if source[candidate.clone()]
+            .chars()
+            .map(normalized_inline_code_char)
+            .eq(rendered.chars())
+        {
+            return candidate;
+        }
+    }
     fragment.find(rendered).map_or(content.clone(), |start| {
         content.start + start..content.start + start + rendered.len()
     })
+}
+
+fn normalized_inline_code_char(character: char) -> char {
+    if matches!(character, '\r' | '\n') {
+        ' '
+    } else {
+        character
+    }
 }
 
 fn standalone_footnote_references(
@@ -3108,6 +3195,38 @@ mod tests {
         assert_eq!(
             VisualProjection::from_markdown(&updated.source).text(),
             "🙂"
+        );
+    }
+
+    #[test]
+    fn editing_visual_space_in_multiline_inline_code_keeps_adjacent_text() {
+        for (source, visual, edited, expected) in [
+            ("`a\nb`", "a b", "aX b", "`aX\nb`"),
+            ("` a\nb `", "a b", "aX b", "` aX\nb `"),
+            ("`\na\nb\n`", "a b\n", "aX b\n", "`\naX\nb\n`"),
+            ("`中\n🙂`", "中 🙂", "中X 🙂", "`中X\n🙂`"),
+            ("`a\r\nb`", "a  b", "aX  b", "`aX\r\nb`"),
+        ] {
+            let projection = VisualProjection::from_markdown(source);
+            assert_eq!(projection.text(), visual, "source={source:?}");
+            let inserted = projection.apply_edit(source, edited, 2..2).unwrap();
+            assert_eq!(inserted.source, expected, "source={source:?}");
+            let reparsed = VisualProjection::from_markdown(&inserted.source);
+            assert_eq!(reparsed.text(), edited, "source={source:?}");
+            assert_eq!(
+                reparsed.visual_char_range(&inserted.source, inserted.selection),
+                2..2,
+                "source={source:?}"
+            );
+        }
+
+        let source = "`a\nb`";
+        let projection = VisualProjection::from_markdown(source);
+        let replaced = projection.apply_edit(source, "aYb", 2..2).unwrap();
+        assert_eq!(replaced.source, "`aYb`");
+        assert_eq!(
+            VisualProjection::from_markdown(&replaced.source).text(),
+            "aYb"
         );
     }
 

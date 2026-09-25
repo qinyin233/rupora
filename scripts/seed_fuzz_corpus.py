@@ -74,6 +74,9 @@ SEEDS = {
         "container-marker-input": trace(
             "> - hello\n- [ ] task\n1) item", [(0, 1, 1, "X"), (1, 5, 5, " ")]
         ),
+        "multiline-inline-code-input": trace(
+            "`中\n🙂`", [(0, 1, 1, "X"), (1, 2, 3, "Y")]
+        ),
         "long-unicode-offset": trace("a" * 1024 + "中文🙂尾", [(0, 1024, 1027, "新🙂")]),
     },
 }
