@@ -68,6 +68,9 @@ SEEDS = {
         "table-cell-space-follow-up": trace(
             "| a  b | c |\n| - | - |\n| d | e |", [(0, 3, 4, ""), (1, 3, 3, "X")]
         ),
+        "table-separator-input": trace(
+            "| a | b |\n| - | - |\n| c | d |", [(0, 3, 3, "X"), (1, 2, 2, " ")]
+        ),
         "long-unicode-offset": trace("a" * 1024 + "中文🙂尾", [(0, 1024, 1027, "新🙂")]),
     },
 }

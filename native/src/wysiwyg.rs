@@ -507,6 +507,45 @@ impl VisualProjection {
         } else {
             self.source_left_boundaries[change.old.end]
         };
+        let table_separator_insertion = insertion
+            .then(|| {
+                self.atomic_ranges.iter().find(|atomic| {
+                    atomic.visual.start < change.old.start
+                        && change.old.start < atomic.visual.end
+                        && source.get(atomic.source.clone()) == Some("|")
+                        && self.runs.iter().any(|run| {
+                            run.style.table
+                                && run.style.marker
+                                && run.range.start <= atomic.visual.start
+                                && atomic.visual.end <= run.range.end
+                        })
+                })
+            })
+            .flatten();
+        if let Some(separator) = table_separator_insertion {
+            // The five visible separator characters all represent one pipe.
+            // Typing between them must not replace that pipe and collapse two
+            // columns. Put the new text in the nearer adjacent cell instead.
+            let left_half =
+                (change.old.start - separator.visual.start) * 2 <= separator.visual.len();
+            if left_half {
+                source_start = separator.source.start;
+                while source_start > 0
+                    && matches!(source.as_bytes()[source_start - 1], b' ' | b'\t')
+                {
+                    source_start -= 1;
+                }
+                source_end = separator.source.start;
+            } else {
+                source_start = separator.source.end;
+                source_end = source_start;
+                while source_end < source.len()
+                    && matches!(source.as_bytes()[source_end], b' ' | b'\t')
+                {
+                    source_end += 1;
+                }
+            }
+        }
         if insertion
             && self.runs.iter().any(|run| {
                 run.style.table && !run.style.marker && run.range.end == change.old.start
@@ -534,6 +573,11 @@ impl VisualProjection {
             .iter()
             .filter(|atomic| visual_change_intersects(&change.old, &atomic.visual))
         {
+            if table_separator_insertion.is_some_and(|separator| {
+                separator.visual == atomic.visual && separator.source == atomic.source
+            }) {
+                continue;
+            }
             source_start = source_start.min(atomic.source.start);
             source_end = source_end.max(atomic.source.end);
             let syntax = &source[atomic.source.clone()];
@@ -617,7 +661,9 @@ impl VisualProjection {
         let mut output = source.to_owned();
         let retained = self.retained_inline_syntax(&change.old, source_start..source_end);
         let mut inserted = decoded_prefix.clone();
-        inserted.push_str(replacement);
+        let encoded_table_replacement =
+            table_separator_insertion.map(|_| replacement.replace(' ', "&#32;"));
+        inserted.push_str(encoded_table_replacement.as_deref().unwrap_or(replacement));
         inserted.push_str(&decoded_suffix);
         for range in &retained {
             inserted.push_str(&source[range.clone()]);
@@ -681,6 +727,24 @@ impl VisualProjection {
             }
             if selection.end == change.new.end {
                 end_byte = source_start + decoded_prefix.len() + replacement.len();
+            }
+        }
+        if table_separator_insertion.is_some() {
+            // Source mapping for positions inside a transformed separator
+            // still points at the pipe. After snapping the insertion into a
+            // cell, anchor the selection to the inserted text instead. Spaces
+            // are encoded so Markdown cannot trim them as cell padding.
+            let source_byte_for_replacement_char = |index: usize| {
+                let prefix = &replacement[..char_to_byte(replacement, index)];
+                source_start
+                    + prefix.len()
+                    + prefix.bytes().filter(|byte| *byte == b' ').count() * 4
+            };
+            if (change.new.start..=change.new.end).contains(&selection.start) {
+                start_byte = source_byte_for_replacement_char(selection.start - change.new.start);
+            }
+            if (change.new.start..=change.new.end).contains(&selection.end) {
+                end_byte = source_byte_for_replacement_char(selection.end - change.new.start);
             }
         }
         // Removing an image's visual marker consumes its opening `![`.
