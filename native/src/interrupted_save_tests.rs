@@ -400,7 +400,7 @@ fn process_termination_during_document_save_preserves_disk_and_checkpoint() {
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].content, CHECKPOINT);
             let recovered = recover(entries.remove(0));
-            assert!(recovered.warning.is_none());
+            assert_eq!(recovered.warning, None, "{scenario:?}/{stage}");
             assert!(recovered.document.dirty);
             if matches!(scenario, Scenario::ExistingDocument) && is_committed(stage) {
                 // The previous checkpoint and the newer committed document
