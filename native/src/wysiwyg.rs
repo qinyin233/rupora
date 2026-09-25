@@ -523,12 +523,28 @@ impl VisualProjection {
             }
         }
         let insertion = change.old.is_empty();
+        let replacement_start = char_to_byte(edited, change.new.start);
+        let replacement_end = char_to_byte(edited, change.new.end);
+        let replacement = &edited[replacement_start..replacement_end];
         let mut source_start = self.source_boundaries[change.old.start];
         let mut source_end = if insertion {
             source_start
         } else {
             self.source_left_boundaries[change.old.end]
         };
+        let table_divider_insertion = (insertion
+            && !replacement.contains(['\r', '\n'])
+            && change.old.start > 0
+            && change.old.start < self.char_count()
+            && self.text.chars().nth(change.old.start - 1) == Some('\n')
+            && self.text.chars().nth(change.old.start) == Some('\n')
+            && self.runs.iter().any(|run| {
+                run.style.table
+                    && run.range.start <= change.old.start
+                    && change.old.start < run.range.end
+            }))
+        .then(|| table_body_first_cell_start(source, source_start))
+        .flatten();
         let table_separator_insertion = insertion
             .then(|| {
                 self.atomic_ranges.iter().find(|atomic| {
@@ -553,7 +569,12 @@ impl VisualProjection {
                 })
             })
             .flatten();
-        if let Some(separator) = table_separator_insertion {
+        if let Some(first_cell) = table_divider_insertion {
+            // The separator row is a visual spacer, not an editable table
+            // row. Typing there must not invalidate the table syntax.
+            source_start = first_cell;
+            source_end = first_cell;
+        } else if let Some(separator) = table_separator_insertion {
             // The five visible separator characters all represent one pipe.
             // Typing between them must not replace that pipe and collapse two
             // columns. Put the new text in the nearer adjacent cell instead.
@@ -600,9 +621,6 @@ impl VisualProjection {
                 source_end = left;
             }
         }
-        let replacement_start = char_to_byte(edited, change.new.start);
-        let replacement_end = char_to_byte(edited, change.new.end);
-        let replacement = &edited[replacement_start..replacement_end];
         let mut decoded_prefix = String::new();
         let mut decoded_suffix = String::new();
         for atomic in self
@@ -706,7 +724,8 @@ impl VisualProjection {
         let mut output = source.to_owned();
         let retained = self.retained_inline_syntax(&change.old, source_start..source_end);
         let mut inserted = decoded_prefix.clone();
-        let encoded_marker_replacement = (table_separator_insertion.is_some()
+        let encoded_marker_replacement = (table_divider_insertion.is_some()
+            || table_separator_insertion.is_some()
             || container_marker_insertion.is_some())
         .then(|| replacement.replace(' ', "&#32;"));
         inserted.push_str(encoded_marker_replacement.as_deref().unwrap_or(replacement));
@@ -780,7 +799,10 @@ impl VisualProjection {
                 end_byte = source_start + decoded_prefix.len() + replacement.len();
             }
         }
-        if table_separator_insertion.is_some() || container_marker_insertion.is_some() {
+        if table_divider_insertion.is_some()
+            || table_separator_insertion.is_some()
+            || container_marker_insertion.is_some()
+        {
             // Source mapping inside a transformed marker still points at its
             // syntax. After snapping the insertion into editable text, anchor
             // the selection to that text. Encode spaces so Markdown retains
@@ -2815,6 +2837,28 @@ fn table_separator_range(source: &str, cell_start: usize) -> Option<Range<usize>
                 == 1;
             (!escaped).then_some(pipe..pipe + 1)
         })
+}
+
+fn table_body_first_cell_start(source: &str, divider_start: usize) -> Option<usize> {
+    let divider = source.get(divider_start..)?;
+    let break_offset = divider.find(['\r', '\n'])?;
+    let after_break = divider_start + break_offset;
+    let row_start = after_break
+        + if source[after_break..].starts_with("\r\n") {
+            2
+        } else {
+            1
+        };
+    let row = source.get(row_start..)?.split(['\r', '\n']).next()?;
+    let without_indent = row.trim_start_matches([' ', '\t']);
+    let mut content_start = row_start + row.len() - without_indent.len();
+    if let Some(after_pipe) = without_indent.strip_prefix('|') {
+        content_start += 1;
+        if after_pipe.starts_with([' ', '\t']) {
+            content_start += 1;
+        }
+    }
+    Some(content_start)
 }
 
 fn fenced_code_content_start(source: &str, block_start: usize) -> usize {

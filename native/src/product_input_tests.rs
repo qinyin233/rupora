@@ -373,6 +373,29 @@ fn hybrid_deleting_table_cell_text_keeps_the_table_and_history() {
 }
 
 #[test]
+fn hybrid_typing_on_the_table_divider_keeps_the_table_and_history() {
+    let source = "| left | right |\n| --- | --- |\n| cell | value |";
+    let directory = tempfile::tempdir().unwrap();
+    let divider = source.find("| ---").unwrap();
+    let mut app = app_at(directory.path(), source, divider..divider);
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    frame(&mut app, &ctx, true, vec![]);
+    frame(&mut app, &ctx, true, vec![egui::Event::Text("中".into())]);
+
+    let expected = "| left | right |\n| --- | --- |\n| 中cell | value |";
+    assert_eq!(app.session[0].content, expected);
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "left  │  right\n\n中cell  │  value"
+    );
+    app.undo_active();
+    assert_eq!(app.session[0].content, source);
+    app.redo_active();
+    assert_eq!(app.session[0].content, expected);
+}
+
+#[test]
 fn hybrid_replacing_table_cell_text_with_space_keeps_it_visible() {
     let source = "| A | **B** |\n| --- | --- |\n| x | y |";
     let directory = tempfile::tempdir().unwrap();
