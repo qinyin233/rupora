@@ -319,6 +319,7 @@ fn hybrid_replacing_text_at_formatting_boundaries_keeps_visible_text() {
         ),
         ("a $x+y$ tail", 0..4, "新", "新+y tail"),
         ("a $x+y$ tail", 4..8, "新", "a x新tail"),
+        ("a $x+y$ tail", 3..4, " ", "a  +y tail"),
     ] {
         let directory = tempfile::tempdir().unwrap();
         let mut app = app_at(directory.path(), source, selection);

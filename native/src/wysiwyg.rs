@@ -685,6 +685,39 @@ impl VisualProjection {
                 }
             }
         }
+        let mut unwrapped_math = Vec::new();
+        for wrapper in self.inline_wrappers.iter().filter(|wrapper| {
+            source[wrapper.source.clone()].starts_with('$')
+                && source[wrapper.source.clone()].ends_with('$')
+        }) {
+            let leading_space = replacement.chars().next().is_some_and(char::is_whitespace);
+            let trailing_space = replacement.chars().last().is_some_and(char::is_whitespace);
+            let touches_start = (change.old.start <= wrapper.visual.start
+                && wrapper.visual.start < change.old.end)
+                || (insertion && change.old.start == wrapper.visual.start);
+            let touches_end = (change.old.start < wrapper.visual.end
+                && wrapper.visual.end <= change.old.end)
+                || (insertion && change.old.start == wrapper.visual.end);
+            if !(leading_space && touches_start || trailing_space && touches_end) {
+                continue;
+            }
+            // A math span with whitespace just inside its dollar delimiter
+            // becomes literal Markdown, exposing both delimiters. Unwrap the
+            // affected span and keep any unselected visible formula text.
+            source_start = source_start.min(wrapper.source.start);
+            source_end = source_end.max(wrapper.source.end);
+            if wrapper.visual.start < change.old.start {
+                let prefix = &self.text[char_to_byte(&self.text, wrapper.visual.start)
+                    ..char_to_byte(&self.text, change.old.start)];
+                append_literal_inline_text(&mut decoded_prefix, prefix);
+            }
+            if change.old.end < wrapper.visual.end {
+                let suffix = &self.text[char_to_byte(&self.text, change.old.end)
+                    ..char_to_byte(&self.text, wrapper.visual.end)];
+                append_literal_inline_text(&mut decoded_suffix, suffix);
+            }
+            unwrapped_math.push(wrapper.source.clone());
+        }
         for wrapper in self.inline_wrappers.iter().filter(|wrapper| {
             change.old.start <= wrapper.visual.start && change.old.end >= wrapper.visual.end
         }) {
@@ -744,7 +777,15 @@ impl VisualProjection {
         }
 
         let mut output = source.to_owned();
-        let retained = self.retained_inline_syntax(&change.old, source_start..source_end);
+        let retained = self
+            .retained_inline_syntax(&change.old, source_start..source_end)
+            .into_iter()
+            .filter(|range| {
+                !unwrapped_math
+                    .iter()
+                    .any(|math| math.start <= range.start && range.end <= math.end)
+            })
+            .collect::<Vec<_>>();
         let mut inserted = decoded_prefix.clone();
         let encoded_marker_replacement = (table_divider_insertion.is_some()
             || table_separator_insertion.is_some()
