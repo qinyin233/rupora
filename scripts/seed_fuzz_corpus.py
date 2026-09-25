@@ -58,6 +58,16 @@ SEEDS = {
         "crlf-task-list": trace(
             "- [ ] 任务\r\n- [x] 完成\r\n", [(0, 2, 2, "新"), (1, 0, 0, "前")]
         ),
+        "quote-tab-list-follow-up": trace(
+            ">\t- a  b", [(0, 4, 5, ""), (1, 4, 4, "X")]
+        ),
+        "quote-tab-indented-code": trace(">\t\ta", [(0, 4, 4, "X")]),
+        "heading-leading-space-follow-up": trace(
+            "## a  b", [(0, 0, 1, ""), (1, 0, 0, "X")]
+        ),
+        "table-cell-space-follow-up": trace(
+            "| a  b | c |\n| - | - |\n| d | e |", [(0, 3, 4, ""), (1, 3, 3, "X")]
+        ),
         "long-unicode-offset": trace("a" * 1024 + "中文🙂尾", [(0, 1024, 1027, "新🙂")]),
     },
 }
