@@ -824,7 +824,10 @@ impl VisualProjection {
                 && run.range.start <= changed_visual.start
                 && changed_visual.start <= run.range.end
         });
-        if !(at_list_prefix_end || in_table_cell) {
+        let at_heading_content_start = self.runs.iter().any(|run| {
+            run.style.heading > 0 && !run.style.marker && run.range.start == changed_visual.start
+        });
+        if !(at_list_prefix_end || in_table_cell || at_heading_content_start) {
             return None;
         }
         let actual = Self::from_markdown_with_context(output, None, self.references.clone());
@@ -836,14 +839,17 @@ impl VisualProjection {
             .count()
             .saturating_sub(actual.text().chars().count())
             .max(1);
-        // A list can consume the first surviving space as marker whitespace;
-        // a table cell can trim inserted spaces as cell padding. Encoding the
-        // missing visible spaces keeps them in editable content.
+        // A list or heading can consume the first surviving space as marker
+        // whitespace; a table cell can trim inserted spaces as cell padding.
+        // Encoding the missing visible spaces keeps them in editable content.
         // Replacing the last character in a cell can leave several spaces
         // immediately before the edit. The parser trims the entire suffix,
         // so include those preceding spaces when looking for an encoding.
         let backtrack = if in_table_cell { missing } else { 0 };
-        for position in (0..=backtrack).filter_map(|offset| source_start.checked_sub(offset)) {
+        for position in (0..=usize::from(at_heading_content_start))
+            .filter_map(|offset| source_start.checked_add(offset))
+            .chain((1..=backtrack).filter_map(|offset| source_start.checked_sub(offset)))
+        {
             if output.get(position..).map_or(0, |tail| {
                 tail.bytes().take_while(|byte| *byte == b' ').count()
             }) < missing
@@ -1988,11 +1994,10 @@ impl ProjectionBuilder {
             .rfind(['\r', '\n'])
             .map_or(0, |index| index + 1);
         let raw = &source[line_start..source_start];
-        let (consumed, visual) = container_prefix(raw);
-        if !visual.is_empty() {
-            self.append_marker(
+        let (consumed, _) = container_prefix(raw);
+        if consumed > 0 {
+            self.append_container_prefix_segments(
                 source,
-                &visual,
                 line_start..line_start + consumed,
                 marker_style(format),
             );
@@ -2011,11 +2016,10 @@ impl ProjectionBuilder {
         let line_end = source[line_start..]
             .find('\n')
             .map_or(source.len(), |offset| line_start + offset);
-        let (consumed, visual) = container_prefix(&source[line_start..line_end]);
-        if !visual.is_empty() {
-            self.append_marker(
+        let (consumed, _) = container_prefix(&source[line_start..line_end]);
+        if consumed > 0 {
+            self.append_container_prefix_segments(
                 source,
-                &visual,
                 line_start..line_start + consumed,
                 marker_style(format),
             );
@@ -2053,8 +2057,37 @@ impl ProjectionBuilder {
             };
             style.marker = true;
             self.ensure_line_break(line_start, style);
-            self.append_marker(source, &visual, line_start..line_start + consumed, style);
+            self.append_container_prefix_segments(source, line_start..line_start + consumed, style);
         }
+    }
+
+    fn append_container_prefix_segments(
+        &mut self,
+        source: &str,
+        range: Range<usize>,
+        style: VisualStyle,
+    ) {
+        let raw = &source[range.clone()];
+        let mut cursor = 0usize;
+        while cursor < raw.len() {
+            let whitespace = raw[cursor..]
+                .bytes()
+                .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                .count();
+            if whitespace > 0 {
+                let segment = range.start + cursor..range.start + cursor + whitespace;
+                self.append_marker(source, &raw[cursor..cursor + whitespace], segment, style);
+                cursor += whitespace;
+            }
+            if raw[cursor..].starts_with("> ") {
+                let segment = range.start + cursor..range.start + cursor + 2;
+                self.append_marker(source, "│ ", segment, style);
+                cursor += 2;
+            } else {
+                break;
+            }
+        }
+        debug_assert_eq!(cursor, raw.len());
     }
 
     fn append_trailing_editable_whitespace(&mut self, source: &str) {

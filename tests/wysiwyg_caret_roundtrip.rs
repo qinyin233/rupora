@@ -16,6 +16,13 @@ fn short_content_edits_preserve_the_visible_caret() {
         "- **bold** tail",
         "> *quoted* tail",
         "# **heading** tail",
+        "- a  b",
+        "> a  b",
+        "> > a  b",
+        "  > a  b",
+        "## a  b",
+        "A &amp; B",
+        "a\n\n| x | y |\n| - | - |\n| p | q |\n\nz",
         "| a b | c d |\n| --- | --- |\n| e f | g h |",
         "| 中文🙂 | **bravo** |\n| --- | --- |\n| e f | g h |",
     ];

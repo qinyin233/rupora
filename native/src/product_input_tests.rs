@@ -478,6 +478,53 @@ fn hybrid_replacing_last_column_character_with_space_keeps_follow_up_input_in_ce
 }
 
 #[test]
+fn hybrid_typing_after_deleting_quote_first_character_keeps_the_quote() {
+    let source = "> a  b";
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = app_at(directory.path(), source, 2..3);
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    frame(&mut app, &ctx, true, vec![]);
+    frame(
+        &mut app,
+        &ctx,
+        true,
+        vec![key(Key::Backspace, egui::Modifiers::NONE)],
+    );
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "│   b"
+    );
+    frame(&mut app, &ctx, true, vec![egui::Event::Text("X".into())]);
+    assert_eq!(app.session[0].content, "> X  b");
+}
+
+#[test]
+fn hybrid_deleting_heading_first_character_keeps_surviving_spaces() {
+    let source = "## a  b";
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = app_at(directory.path(), source, 3..4);
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    frame(&mut app, &ctx, true, vec![]);
+    frame(
+        &mut app,
+        &ctx,
+        true,
+        vec![key(Key::Backspace, egui::Modifiers::NONE)],
+    );
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "  b"
+    );
+    frame(&mut app, &ctx, true, vec![egui::Event::Text("X".into())]);
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "X  b"
+    );
+}
+
+#[test]
 fn hybrid_deleting_a_header_cell_keeps_the_caret_in_that_cell() {
     let source = "| a | b |\n| - | - |\n| c | d |";
     let directory = tempfile::tempdir().unwrap();
