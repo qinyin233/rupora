@@ -10,9 +10,9 @@ fn byte_at(text: &str, index: usize) -> usize {
 fn editing_collapsed_reference_label_keeps_visible_text_and_target() {
     let source = "a [label][] z\n\n[label]: https://x.test";
     let projection = VisualProjection::from_markdown(source);
-    assert_eq!(projection.text(), "a label z\n");
+    assert_eq!(projection.text(), "a label z");
 
-    let edited = "a 新abel z\n";
+    let edited = "a 新abel z";
     let update = projection.apply_edit(source, edited, 3..3).unwrap();
     let actual = VisualProjection::from_markdown(&update.source);
     assert_eq!(
@@ -33,9 +33,9 @@ fn editing_collapsed_reference_label_keeps_visible_text_and_target() {
 fn editing_shortcut_reference_label_keeps_visible_text_and_target() {
     let source = "a [label] z\n\n[label]: https://x.test";
     let projection = VisualProjection::from_markdown(source);
-    assert_eq!(projection.text(), "a label z\n");
+    assert_eq!(projection.text(), "a label z");
 
-    let edited = "a 新abel z\n";
+    let edited = "a 新abel z";
     let update = projection.apply_edit(source, edited, 3..3).unwrap();
     let actual = VisualProjection::from_markdown(&update.source);
     assert_eq!(
@@ -59,7 +59,7 @@ fn selecting_implicit_reference_label_keeps_syntax_hidden() {
         "a [label] z\n\n[label]: https://x.test",
     ] {
         let active = VisualProjection::from_markdown_with_selection(source, Some(3..4));
-        assert_eq!(active.text(), "a label z\n");
+        assert_eq!(active.text(), "a label z");
     }
 }
 
@@ -125,8 +125,8 @@ fn formatting_inside_implicit_reference_label_keeps_original_lookup_id() {
         "a [*label*] z\n\n[*label*]: https://x.test",
     ] {
         let projection = VisualProjection::from_markdown(source);
-        assert_eq!(projection.text(), "a label z\n");
-        let edited = "a 新abel z\n";
+        assert_eq!(projection.text(), "a label z");
+        let edited = "a 新abel z";
         let update = projection.apply_edit(source, edited, 3..3).unwrap();
         let actual = VisualProjection::from_markdown(&update.source);
         assert_eq!(actual.text(), edited, "new source: {:?}", update.source);

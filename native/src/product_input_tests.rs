@@ -326,13 +326,13 @@ fn hybrid_replacing_text_at_formatting_boundaries_keeps_visible_text() {
             "a [label][] z\n\n[label]: https://x.test",
             3..4,
             "新",
-            "a 新abel z\n",
+            "a 新abel z",
         ),
         (
             "a [label] z\n\n[label]: https://x.test",
             3..4,
             "新",
-            "a 新abel z\n",
+            "a 新abel z",
         ),
     ] {
         let directory = tempfile::tempdir().unwrap();
@@ -360,6 +360,32 @@ fn hybrid_replacing_text_at_formatting_boundaries_keeps_visible_text() {
             expected
         );
     }
+}
+
+#[test]
+fn hybrid_typing_before_trailing_reference_definitions_keeps_the_link_and_history() {
+    let source = "a [label][ref] z\n\n[ref]: /x";
+    let cursor = source[..source.find('\n').unwrap()].chars().count();
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = app_at(directory.path(), source, cursor..cursor);
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    frame(&mut app, &ctx, true, vec![]);
+    assert_eq!(VisualProjection::from_markdown(source).text(), "a label z");
+
+    frame(&mut app, &ctx, true, vec![egui::Event::Text("X".into())]);
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "a label zX"
+    );
+    assert!(app.session[0].content.contains("\n\n[ref]: /x"));
+    app.undo_active();
+    assert_eq!(app.session[0].content, source);
+    app.redo_active();
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "a label zX"
+    );
 }
 
 #[test]

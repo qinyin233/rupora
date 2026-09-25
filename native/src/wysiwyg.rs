@@ -138,9 +138,11 @@ impl VisualProjection {
             .map(|selection| selection.start);
         let mut cursor_in_literal_syntax = false;
         let standalone_footnotes = standalone_footnote_references(source, &references);
+        let mut last_event_end = 0;
 
         let mut events = crate::markdown::events_with_references(source, &references).peekable();
         while let Some((event, range)) = events.next() {
+            last_event_end = last_event_end.max(range.end);
             if collapsed_source_cursor.is_some_and(|cursor| range.contains(&cursor))
                 && matches!(
                     &event,
@@ -502,8 +504,14 @@ impl VisualProjection {
 
         drop(events);
         builder.append_trailing_container_line(source);
-        let mut projection =
-            builder.finish(source, trailing_container_block, trailing_fenced_code_block);
+        let hidden_reference_tail =
+            trailing_reference_definition_tail(source, last_event_end).then_some(last_event_end);
+        let mut projection = builder.finish(
+            source,
+            trailing_container_block,
+            trailing_fenced_code_block,
+            hidden_reference_tail,
+        );
         projection.references = references;
         if let Some(selection) = source_selection.as_ref()
             && selection.is_empty()
@@ -1447,6 +1455,18 @@ fn append_literal_inline_text(output: &mut String, text: &str) {
     }
 }
 
+fn trailing_reference_definition_tail(source: &str, last_event_end: usize) -> bool {
+    let Some(tail) = source.get(last_event_end..) else {
+        return false;
+    };
+    if tail.trim().is_empty() {
+        return false;
+    }
+    let parser = Parser::new_ext(tail, parser_options());
+    let has_definitions = parser.reference_definitions().iter().next().is_some();
+    has_definitions && parser.into_offset_iter().next().is_none()
+}
+
 fn implicit_reference_expansion<'a>(
     source: &'a str,
     wrapper: &InlineWrapper,
@@ -2140,6 +2160,7 @@ impl ProjectionBuilder {
         source: &str,
         trailing_container_block: bool,
         trailing_fenced_code_block: bool,
+        hidden_reference_tail: Option<usize>,
     ) -> VisualProjection {
         while self.text.ends_with('\n') {
             let newline = self.char_count() - 1;
@@ -2216,6 +2237,19 @@ impl ProjectionBuilder {
             );
         }
         self.append_trailing_editable_whitespace(source);
+        if let Some(tail_start) = hidden_reference_tail {
+            // The blank line before trailing reference definitions exists
+            // only to keep their Markdown syntax separate. Showing it as an
+            // editable final line lets Backspace merge the definition into
+            // the paragraph and expose raw link syntax.
+            while self.text.chars().next_back().is_some_and(char::is_whitespace)
+                && self.source_boundaries.last().copied().unwrap_or_default() >= tail_start
+            {
+                self.text.pop();
+                self.source_left_boundaries.pop();
+                self.source_boundaries.pop();
+            }
+        }
         let length = self.char_count();
         self.runs.retain_mut(|run| {
             run.range.end = run.range.end.min(length);
