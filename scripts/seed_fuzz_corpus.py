@@ -71,6 +71,9 @@ SEEDS = {
         "table-separator-input": trace(
             "| a | b |\n| - | - |\n| c | d |", [(0, 3, 3, "X"), (1, 2, 2, " ")]
         ),
+        "container-marker-input": trace(
+            "> - hello\n- [ ] task\n1) item", [(0, 1, 1, "X"), (1, 5, 5, " ")]
+        ),
         "long-unicode-offset": trace("a" * 1024 + "中文🙂尾", [(0, 1024, 1027, "新🙂")]),
     },
 }

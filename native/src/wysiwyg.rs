@@ -42,6 +42,7 @@ pub struct VisualProjection {
 struct AtomicVisualRange {
     visual: Range<usize>,
     source: Range<usize>,
+    container_marker: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,7 +211,7 @@ impl VisualProjection {
                             if let Some((prefix_range, prefix)) =
                                 item_prefix(source, range.start, mapped_until, content_start)
                             {
-                                builder.append_marker(
+                                builder.append_container_marker(
                                     source,
                                     &prefix,
                                     prefix_range,
@@ -536,6 +537,15 @@ impl VisualProjection {
                 })
             })
             .flatten();
+        let container_marker_insertion = insertion
+            .then(|| {
+                self.atomic_ranges.iter().find(|atomic| {
+                    atomic.container_marker
+                        && atomic.visual.start < change.old.start
+                        && change.old.start < atomic.visual.end
+                })
+            })
+            .flatten();
         if let Some(separator) = table_separator_insertion {
             // The five visible separator characters all represent one pipe.
             // Typing between them must not replace that pipe and collapse two
@@ -559,6 +569,12 @@ impl VisualProjection {
                     source_end += 1;
                 }
             }
+        } else if let Some(marker) = container_marker_insertion {
+            // A quote line or list marker is one structural unit even though
+            // it occupies multiple visual characters. Typing inside it
+            // starts the item body instead of replacing the Markdown syntax.
+            source_start = marker.source.end;
+            source_end = source_start;
         }
         if insertion
             && self.runs.iter().any(|run| {
@@ -589,6 +605,8 @@ impl VisualProjection {
         {
             if table_separator_insertion.is_some_and(|separator| {
                 separator.visual == atomic.visual && separator.source == atomic.source
+            }) || container_marker_insertion.is_some_and(|marker| {
+                marker.visual == atomic.visual && marker.source == atomic.source
             }) {
                 continue;
             }
@@ -675,15 +693,21 @@ impl VisualProjection {
         let mut output = source.to_owned();
         let retained = self.retained_inline_syntax(&change.old, source_start..source_end);
         let mut inserted = decoded_prefix.clone();
-        let encoded_table_replacement =
-            table_separator_insertion.map(|_| replacement.replace(' ', "&#32;"));
-        inserted.push_str(encoded_table_replacement.as_deref().unwrap_or(replacement));
+        let encoded_marker_replacement = (table_separator_insertion.is_some()
+            || container_marker_insertion.is_some())
+        .then(|| replacement.replace(' ', "&#32;"));
+        inserted.push_str(encoded_marker_replacement.as_deref().unwrap_or(replacement));
         inserted.push_str(&decoded_suffix);
         for range in &retained {
             inserted.push_str(&source[range.clone()]);
         }
-        let mut retained_offset =
-            source_start + decoded_prefix.len() + replacement.len() + decoded_suffix.len();
+        let mut retained_offset = source_start
+            + decoded_prefix.len()
+            + encoded_marker_replacement
+                .as_deref()
+                .unwrap_or(replacement)
+                .len()
+            + decoded_suffix.len();
         let mut retained_flanking_closers = Vec::new();
         let mut retained_flanking_openers = Vec::new();
         for range in &retained {
@@ -743,11 +767,11 @@ impl VisualProjection {
                 end_byte = source_start + decoded_prefix.len() + replacement.len();
             }
         }
-        if table_separator_insertion.is_some() {
-            // Source mapping for positions inside a transformed separator
-            // still points at the pipe. After snapping the insertion into a
-            // cell, anchor the selection to the inserted text instead. Spaces
-            // are encoded so Markdown cannot trim them as cell padding.
+        if table_separator_insertion.is_some() || container_marker_insertion.is_some() {
+            // Source mapping inside a transformed marker still points at its
+            // syntax. After snapping the insertion into editable text, anchor
+            // the selection to that text. Encode spaces so Markdown retains
+            // them at the start of a cell or container body.
             let source_byte_for_replacement_char = |index: usize| {
                 let prefix = &replacement[..char_to_byte(replacement, index)];
                 source_start
@@ -2168,7 +2192,7 @@ impl ProjectionBuilder {
             }
             if raw[cursor..].starts_with("> ") || raw[cursor..].starts_with(">\t") {
                 let segment = range.start + cursor..range.start + cursor + 2;
-                self.append_marker(source, "│ ", segment, style);
+                self.append_container_marker(source, "│ ", segment, style);
                 cursor += 2;
             } else {
                 break;
@@ -2436,6 +2460,17 @@ impl ProjectionBuilder {
         source_range: Range<usize>,
         style: VisualStyle,
     ) {
+        self.append_transformed_with_kind(source, rendered, source_range, style, false);
+    }
+
+    fn append_transformed_with_kind(
+        &mut self,
+        source: &str,
+        rendered: &str,
+        source_range: Range<usize>,
+        style: VisualStyle,
+        container_marker: bool,
+    ) {
         self.record_inline_content(source_range.clone());
         if rendered.is_empty() {
             self.set_current_boundary(source_range.end);
@@ -2464,6 +2499,7 @@ impl ProjectionBuilder {
             self.atomic_ranges.push(AtomicVisualRange {
                 visual: visual_start..visual_end,
                 source: source_range,
+                container_marker,
             });
         }
         push_run(&mut self.runs, visual_start..visual_end, style);
@@ -2478,6 +2514,17 @@ impl ProjectionBuilder {
     ) {
         style.marker = true;
         self.append_transformed(source, rendered, source_range, style);
+    }
+
+    fn append_container_marker(
+        &mut self,
+        source: &str,
+        rendered: &str,
+        source_range: Range<usize>,
+        mut style: VisualStyle,
+    ) {
+        style.marker = true;
+        self.append_transformed_with_kind(source, rendered, source_range, style, true);
     }
 
     fn append_virtual(&mut self, rendered: &str, source_byte: usize, style: VisualStyle) {
@@ -2932,6 +2979,47 @@ fn shift_index(index: usize, delta: isize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typing_inside_visual_container_markers_keeps_the_markdown_structure() {
+        for (source, typed, expected_source, expected_visual, cursor) in [
+            ("> hello", "X", "> Xhello", "│ Xhello", 3),
+            ("- hello", "X", "- Xhello", "• Xhello", 3),
+            ("- [ ] hello", "X", "- [ ] Xhello", "☐ Xhello", 3),
+            ("1) hello", "X", "1) Xhello", "1. Xhello", 4),
+            ("> - hello", "X", "> - Xhello", "│ • Xhello", 5),
+            ("> hello", " ", "> &#32;hello", "│  hello", 3),
+            ("- hello", " ", "- &#32;hello", "•  hello", 3),
+            ("- [ ] hello", " ", "- [ ] &#32;hello", "☐  hello", 3),
+            ("> hello", "🙂", "> 🙂hello", "│ 🙂hello", 3),
+        ] {
+            let projection = VisualProjection::from_markdown(source);
+            let mut edited = projection.text().to_owned();
+            edited.insert_str(char_to_byte(&edited, 1), typed);
+            let edit = projection.apply_edit(source, &edited, 2..2).unwrap();
+            assert_eq!(
+                edit.source, expected_source,
+                "source={source:?}, typed={typed:?}"
+            );
+            let reparsed = VisualProjection::from_markdown(&edit.source);
+            assert_eq!(
+                reparsed.text(),
+                expected_visual,
+                "source={source:?}, typed={typed:?}"
+            );
+            assert_eq!(
+                reparsed.visual_char_range(&edit.source, edit.selection.clone()),
+                cursor..cursor,
+                "source={source:?}, typed={typed:?}"
+            );
+            let follow_up = type_visual_frame(&edit.source, edit.selection, "Y");
+            assert_eq!(
+                follow_up.source,
+                expected_source.replacen("hello", "Yhello", 1),
+                "source={source:?}, typed={typed:?}"
+            );
+        }
+    }
 
     #[test]
     fn partial_inline_deletions_preserve_hidden_syntax_on_both_sides() {
