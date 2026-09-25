@@ -2,7 +2,7 @@ use crate::editing::{char_to_byte, line_break_before};
 
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, LinkType, Parser, Tag, TagEnd};
 
 use crate::markdown::parser_options;
 
@@ -57,12 +57,14 @@ struct InlineWrapper {
     visual: Range<usize>,
     source: Range<usize>,
     content: Range<usize>,
+    implicit_reference: bool,
 }
 
 struct PendingInlineWrapper {
     visual_start: usize,
     source_start: usize,
     content: Option<Range<usize>>,
+    implicit_reference: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,8 +173,19 @@ impl VisualProjection {
                     let autolink = matches!(&tag, Tag::Link { .. })
                         && source[range.clone()].starts_with('<')
                         && source[range.clone()].ends_with('>');
+                    let implicit_reference = matches!(
+                        &tag,
+                        Tag::Link {
+                            link_type: LinkType::Collapsed
+                                | LinkType::CollapsedUnknown
+                                | LinkType::Shortcut
+                                | LinkType::ShortcutUnknown,
+                            ..
+                        }
+                    );
                     if matches!(&tag, Tag::Link { .. } | Tag::Image { .. })
                         && !autolink
+                        && !implicit_reference
                         && source_selection.as_ref().is_some_and(|selection| {
                             selection_reveals_hidden_source(selection, &range)
                         })
@@ -265,23 +278,32 @@ impl VisualProjection {
                             table_cells += 1;
                         }
                         Tag::Emphasis => {
-                            builder.begin_inline_wrapper(range.start);
+                            builder.begin_inline_wrapper(range.start, false);
                             format.emphasis += 1;
                         }
                         Tag::Strong => {
-                            builder.begin_inline_wrapper(range.start);
+                            builder.begin_inline_wrapper(range.start, false);
                             format.strong += 1;
                         }
                         Tag::Strikethrough => {
-                            builder.begin_inline_wrapper(range.start);
+                            builder.begin_inline_wrapper(range.start, false);
                             format.strikethrough += 1;
                         }
-                        Tag::Link { .. } => {
-                            builder.begin_inline_wrapper(range.start);
+                        Tag::Link { link_type, .. } => {
+                            builder.begin_inline_wrapper(
+                                range.start,
+                                matches!(
+                                    link_type,
+                                    LinkType::Collapsed
+                                        | LinkType::CollapsedUnknown
+                                        | LinkType::Shortcut
+                                        | LinkType::ShortcutUnknown
+                                ),
+                            );
                             format.link += 1;
                         }
                         Tag::Image { .. } => {
-                            builder.begin_inline_wrapper(range.start);
+                            builder.begin_inline_wrapper(range.start, false);
                             format.link += 1;
                             let marker_end = source[range.clone()]
                                 .find('[')
@@ -390,7 +412,7 @@ impl VisualProjection {
                 Event::Code(text) => {
                     let syntax = crate::markdown::inline_code_source_ranges(source, range.clone())
                         .map_or(range, |(syntax, _)| syntax);
-                    builder.begin_inline_wrapper(syntax.start);
+                    builder.begin_inline_wrapper(syntax.start, false);
                     builder.append_container_prefix(source, syntax.start, format);
                     let mut style = format.visual();
                     style.code = true;
@@ -425,7 +447,7 @@ impl VisualProjection {
                         // Treat the hidden dollar signs as one wrapper, like
                         // emphasis or inline code. Edits crossing a math edge
                         // must retain or remove its matching delimiter.
-                        builder.begin_inline_wrapper(range.start);
+                        builder.begin_inline_wrapper(range.start, false);
                         builder.append_mapped(
                             source,
                             &text,
@@ -532,6 +554,36 @@ impl VisualProjection {
     ) -> Option<VisualSourceEdit> {
         let selection = clamp_range(visual_selection, edited.chars().count());
         let mut change = text_change_anchored_at_selection(&self.text, edited, &selection)?;
+        for wrapper in &self.inline_wrappers {
+            let touches_wrapper = if change.old.is_empty() {
+                wrapper.visual.start <= change.old.start && change.old.start <= wrapper.visual.end
+            } else {
+                change.old.start < wrapper.visual.end && wrapper.visual.start < change.old.end
+            };
+            if !touches_wrapper {
+                continue;
+            }
+            let Some((insertion_byte, original_label, needs_brackets)) =
+                implicit_reference_expansion(source, wrapper)
+            else {
+                continue;
+            };
+            // A collapsed/shortcut reference uses its visible label as its
+            // lookup ID. Make that ID explicit before editing the label, so
+            // changing visible text cannot turn the link into literal syntax.
+            let mut explicit_source = source.to_owned();
+            let expansion = if needs_brackets {
+                format!("[{original_label}]")
+            } else {
+                original_label.to_owned()
+            };
+            explicit_source.insert_str(insertion_byte, &expansion);
+            let explicit =
+                Self::from_markdown_with_context(&explicit_source, None, self.references.clone());
+            if explicit.text() == self.text {
+                return explicit.apply_edit(&explicit_source, edited, selection);
+            }
+        }
         for wrapper in &self.inline_wrappers {
             if source[wrapper.source.clone()].starts_with("![")
                 && change.old.start <= wrapper.visual.start
@@ -1395,6 +1447,28 @@ fn append_literal_inline_text(output: &mut String, text: &str) {
     }
 }
 
+fn implicit_reference_expansion<'a>(
+    source: &'a str,
+    wrapper: &InlineWrapper,
+) -> Option<(usize, &'a str, bool)> {
+    if !wrapper.implicit_reference {
+        return None;
+    }
+    let syntax = source.get(wrapper.source.clone())?;
+    if !syntax.starts_with('[') || !syntax.ends_with(']') {
+        return None;
+    }
+    if let Some(label) = syntax.strip_prefix('[')?.strip_suffix("][]") {
+        return Some((wrapper.source.end - 1, label, false));
+    }
+    let label = syntax.strip_prefix('[')?.strip_suffix(']')?;
+    if source.get(wrapper.source.end..)?.starts_with("[]") {
+        Some((wrapper.source.end + 1, label, false))
+    } else {
+        Some((wrapper.source.end, label, true))
+    }
+}
+
 fn autolink_content_stays_valid(content: &str) -> bool {
     let syntax = format!("<{content}>");
     // The parser is the authority on whether an edited angle span is still
@@ -2162,11 +2236,12 @@ impl ProjectionBuilder {
         }
     }
 
-    fn begin_inline_wrapper(&mut self, source_start: usize) {
+    fn begin_inline_wrapper(&mut self, source_start: usize, implicit_reference: bool) {
         self.inline_wrapper_stack.push(PendingInlineWrapper {
             visual_start: self.char_count(),
             source_start,
             content: None,
+            implicit_reference,
         });
     }
 
@@ -2218,6 +2293,7 @@ impl ProjectionBuilder {
             visual_start,
             source_start,
             content,
+            implicit_reference,
         }) = self.inline_wrapper_stack.pop()
         else {
             return;
@@ -2232,6 +2308,7 @@ impl ProjectionBuilder {
                 visual: visual_start..visual_end,
                 source: source_start..source_end,
                 content,
+                implicit_reference,
             });
         }
     }

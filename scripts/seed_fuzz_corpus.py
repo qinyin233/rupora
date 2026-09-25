@@ -81,6 +81,12 @@ SEEDS = {
             "a <https://x.test> z", [(0, 2, 3, "新"), (1, 3, 3, "🙂")]
         ),
         "email-autolink-caret": trace("a <user@x.test> z", [(0, 5, 8, "x")]),
+        "collapsed-reference-label-edit": trace(
+            "a [label][] z\n\n[label]: https://x.test", [(0, 2, 3, "新")]
+        ),
+        "shortcut-reference-label-edit": trace(
+            "a [label] z\n\n[label]: https://x.test", [(0, 2, 3, "新")]
+        ),
         "long-unicode-offset": trace("a" * 1024 + "中文🙂尾", [(0, 1024, 1027, "新🙂")]),
     },
 }
