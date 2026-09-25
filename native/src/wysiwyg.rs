@@ -2242,7 +2242,11 @@ impl ProjectionBuilder {
             // only to keep their Markdown syntax separate. Showing it as an
             // editable final line lets Backspace merge the definition into
             // the paragraph and expose raw link syntax.
-            while self.text.chars().next_back().is_some_and(char::is_whitespace)
+            while self
+                .text
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
                 && self.source_boundaries.last().copied().unwrap_or_default() >= tail_start
             {
                 self.text.pop();
