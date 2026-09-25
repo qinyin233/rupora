@@ -463,6 +463,46 @@ fn hybrid_deleting_a_header_cell_keeps_the_caret_in_that_cell() {
 }
 
 #[test]
+fn hybrid_follow_up_typing_keeps_surviving_spaces_and_table_padding() {
+    for (source, selected, replacement, expected) in [
+        ("a b", 0..1, " ", " X b"),
+        ("| a | b |\n| - | - |", 2..3, "新", "| 新X | b |\n| - | - |"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_at(directory.path(), source, selected);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        frame(&mut app, &ctx, true, vec![]);
+        frame(
+            &mut app,
+            &ctx,
+            true,
+            vec![egui::Event::Text(replacement.into())],
+        );
+        frame(&mut app, &ctx, true, vec![egui::Event::Text("X".into())]);
+        assert_eq!(app.session[0].content, expected, "source={source:?}");
+    }
+}
+
+#[test]
+fn hybrid_typing_inside_an_indented_later_paragraph_keeps_its_separator() {
+    for (source, cursor, expected) in [
+        ("第一段\n\n  第二段", 5, "第一段\n\nX  第二段"),
+        ("第一段\n\n  第二段", 6, "第一段\n\n X 第二段"),
+        ("第一段\r\n\r\n  第二段", 7, "第一段\r\n\r\nX  第二段"),
+        ("第一段\r\n\r\n  第二段", 8, "第一段\r\n\r\n X 第二段"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_at(directory.path(), source, cursor..cursor);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        frame(&mut app, &ctx, true, vec![]);
+        frame(&mut app, &ctx, true, vec![egui::Event::Text("X".into())]);
+        assert_eq!(app.session[0].content, expected, "cursor={cursor}");
+    }
+}
+
+#[test]
 fn leading_edits_before_enter_keep_their_input_semantics_and_history() {
     let cases = [
         (

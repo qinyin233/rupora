@@ -171,6 +171,11 @@ fn wysiwyg_editor_excludes_paragraph_separators_from_the_active_range() {
     let updated_blocks = markdown::blocks(&trailing);
     let updated_range = hybrid_edit_range(&trailing, &updated_blocks, updated_blocks[0].id);
     assert_eq!(&trailing[updated_range], "换句话");
+
+    let indented = "第一段\n\n  第二段";
+    let blocks = markdown::blocks(indented);
+    let second_range = hybrid_edit_range(indented, &blocks, blocks.last().unwrap().id);
+    assert_eq!(&indented[second_range], "  第二段");
 }
 
 #[test]

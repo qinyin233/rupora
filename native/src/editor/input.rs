@@ -139,9 +139,19 @@ pub(super) fn block_for_char_index<'a>(
         .map_or(source.len(), |(index, _)| index);
     blocks
         .iter()
-        .find(|block| {
-            (block.range.start..block.range.end).contains(&byte_index)
-                || (block.range.is_empty() && block.range.start == byte_index)
+        .enumerate()
+        .find_map(|(index, block)| {
+            // A parser-excluded indent can begin at the same byte as an
+            // artificial empty block. It belongs to the following paragraph.
+            hybrid_leading_prefix_start(source, blocks, index)
+                .filter(|start| *start <= byte_index && byte_index < block.range.start)
+                .map(|_| block)
+        })
+        .or_else(|| {
+            blocks.iter().find(|block| {
+                (block.range.start..block.range.end).contains(&byte_index)
+                    || (block.range.is_empty() && block.range.start == byte_index)
+            })
         })
         .or_else(|| {
             blocks.windows(2).find_map(|pair| {
@@ -503,16 +513,39 @@ pub(super) fn scroll_ratio(scroll: PaneScroll) -> f32 {
 }
 
 pub(super) fn hybrid_edit_range(
-    _source: &str,
+    source: &str,
     blocks: &[markdown::MarkdownBlock],
     active_id: BlockId,
 ) -> std::ops::Range<usize> {
-    blocks
+    let index = blocks
         .iter()
-        .find(|block| block.id == active_id)
-        .expect("active Markdown block must still exist")
-        .range
-        .clone()
+        .position(|block| block.id == active_id)
+        .expect("active Markdown block must still exist");
+    let range = blocks[index].range.clone();
+    hybrid_leading_prefix_start(source, blocks, index).unwrap_or(range.start)..range.end
+}
+
+fn hybrid_leading_prefix_start(
+    source: &str,
+    blocks: &[markdown::MarkdownBlock],
+    index: usize,
+) -> Option<usize> {
+    let range = &blocks[index].range;
+    let line_start = source[..range.start]
+        .rfind(['\r', '\n'])
+        .map_or(0, |index| index + 1);
+    let prefix = &source[line_start..range.start];
+    if !prefix.is_empty()
+        && prefix.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+        && index
+            .checked_sub(1)
+            .and_then(|previous| blocks.get(previous))
+            .is_none_or(|previous| previous.range.end <= line_start)
+    {
+        Some(line_start)
+    } else {
+        None
+    }
 }
 
 pub(super) fn empty_paragraph_separators(

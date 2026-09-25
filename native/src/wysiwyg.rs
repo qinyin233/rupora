@@ -507,6 +507,23 @@ impl VisualProjection {
         } else {
             self.source_left_boundaries[change.old.end]
         };
+        if insertion
+            && self.runs.iter().any(|run| {
+                run.style.table && !run.style.marker && run.range.end == change.old.start
+            })
+        {
+            let left = self.source_left_boundaries[change.old.start];
+            if left < source_start
+                && source[left..source_start]
+                    .bytes()
+                    .all(|byte| matches!(byte, b' ' | b'\t'))
+            {
+                // A cell's trailing padding is hidden. Insert before that
+                // padding when the caret is at the end of visible content.
+                source_start = left;
+                source_end = left;
+            }
+        }
         let replacement_start = char_to_byte(edited, change.new.start);
         let replacement_end = char_to_byte(edited, change.new.end);
         let replacement = &edited[replacement_start..replacement_end];
@@ -2305,7 +2322,10 @@ impl ProjectionBuilder {
             self.source_boundaries.push(boundary);
         }
         let visual_end = self.char_count();
-        if !source_range.is_empty() {
+        // Identity-mapped text is editable character by character, even when
+        // it is styled as a container marker (for example leading spaces).
+        // Only genuinely transformed syntax needs atomic replacement.
+        if !source_range.is_empty() && rendered != &source[source_range.clone()] {
             self.atomic_ranges.push(AtomicVisualRange {
                 visual: visual_start..visual_end,
                 source: source_range,

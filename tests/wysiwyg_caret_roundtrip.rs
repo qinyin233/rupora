@@ -62,6 +62,31 @@ fn short_content_edits_preserve_the_visible_caret() {
                                 update.source,
                             ));
                         }
+                        if active.text() == edited {
+                            // The source caret can look correct after one
+                            // edit yet sit beyond hidden syntax on the next.
+                            let mut continued = edited.clone();
+                            continued.insert(byte_at(&continued, caret), 'X');
+                            let next = active
+                                .apply_edit(&update.source, &continued, caret + 1..caret + 1)
+                                .unwrap();
+                            let active_next = VisualProjection::from_markdown_with_selection(
+                                &next.source,
+                                Some(next.selection.clone()),
+                            );
+                            if active_next.text() != continued
+                                || active_next
+                                    .visual_char_range(&next.source, next.selection.clone())
+                                    != (caret + 1..caret + 1)
+                            {
+                                failures.push(format!(
+                                    "source={source:?} edit={start}..{end} replacement={replacement:?} follow_up={continued:?} actual={:?} actual_caret={:?} new_source={:?}",
+                                    active_next.text(),
+                                    active_next.visual_char_range(&next.source, next.selection),
+                                    next.source,
+                                ));
+                            }
+                        }
                     }
                 }
             }
