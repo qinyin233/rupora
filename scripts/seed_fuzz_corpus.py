@@ -77,6 +77,10 @@ SEEDS = {
         "multiline-inline-code-input": trace(
             "`中\n🙂`", [(0, 1, 1, "X"), (1, 2, 3, "Y")]
         ),
+        "autolink-invalid-edit": trace(
+            "a <https://x.test> z", [(0, 2, 3, "新"), (1, 3, 3, "🙂")]
+        ),
+        "email-autolink-caret": trace("a <user@x.test> z", [(0, 5, 8, "x")]),
         "long-unicode-offset": trace("a" * 1024 + "中文🙂尾", [(0, 1024, 1027, "新🙂")]),
     },
 }

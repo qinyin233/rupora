@@ -168,7 +168,11 @@ impl VisualProjection {
                         builder.set_current_boundary(range.start);
                     }
                     builder.append_source_line_breaks_until(source, range.start, format.visual());
+                    let autolink = matches!(&tag, Tag::Link { .. })
+                        && source[range.clone()].starts_with('<')
+                        && source[range.clone()].ends_with('>');
                     if matches!(&tag, Tag::Link { .. } | Tag::Image { .. })
+                        && !autolink
                         && source_selection.as_ref().is_some_and(|selection| {
                             selection_reveals_hidden_source(selection, &range)
                         })
@@ -685,11 +689,11 @@ impl VisualProjection {
                 }
             }
         }
-        let mut unwrapped_math = Vec::new();
-        for wrapper in self.inline_wrappers.iter().filter(|wrapper| {
-            source[wrapper.source.clone()].starts_with('$')
-                && source[wrapper.source.clone()].ends_with('$')
-        }) {
+        let mut unwrapped_inline = Vec::new();
+        for wrapper in &self.inline_wrappers {
+            let syntax = &source[wrapper.source.clone()];
+            let is_math = syntax.starts_with('$') && syntax.ends_with('$');
+            let is_autolink = syntax.starts_with('<') && syntax.ends_with('>');
             let leading_space = replacement.chars().next().is_some_and(char::is_whitespace);
             let trailing_space = replacement.chars().last().is_some_and(char::is_whitespace);
             let touches_start = (change.old.start <= wrapper.visual.start
@@ -698,12 +702,33 @@ impl VisualProjection {
             let touches_end = (change.old.start < wrapper.visual.end
                 && wrapper.visual.end <= change.old.end)
                 || (insertion && change.old.start == wrapper.visual.end);
-            if !(leading_space && touches_start || trailing_space && touches_end) {
+            let invalid_math =
+                is_math && (leading_space && touches_start || trailing_space && touches_end);
+            let intersects_autolink = (change.old.start < wrapper.visual.end
+                && wrapper.visual.start < change.old.end)
+                || (insertion
+                    && wrapper.visual.start <= change.old.start
+                    && change.old.start <= wrapper.visual.end);
+            let invalid_autolink = is_autolink
+                && intersects_autolink
+                && (change.old.start < wrapper.visual.start
+                    || change.old.end > wrapper.visual.end
+                    || {
+                        let mut content = self.text[char_to_byte(&self.text, wrapper.visual.start)
+                            ..char_to_byte(&self.text, change.old.start)]
+                            .to_owned();
+                        content.push_str(replacement);
+                        content.push_str(
+                            &self.text[char_to_byte(&self.text, change.old.end)
+                                ..char_to_byte(&self.text, wrapper.visual.end)],
+                        );
+                        !autolink_content_stays_valid(&content)
+                    });
+            if !(invalid_math || invalid_autolink) {
                 continue;
             }
-            // A math span with whitespace just inside its dollar delimiter
-            // becomes literal Markdown, exposing both delimiters. Unwrap the
-            // affected span and keep any unselected visible formula text.
+            // Invalid math and autolinks expose or reinterpret hidden
+            // delimiters. Unwrap the span and keep unselected visible text.
             source_start = source_start.min(wrapper.source.start);
             source_end = source_end.max(wrapper.source.end);
             if wrapper.visual.start < change.old.start {
@@ -716,7 +741,7 @@ impl VisualProjection {
                     ..char_to_byte(&self.text, wrapper.visual.end)];
                 append_literal_inline_text(&mut decoded_suffix, suffix);
             }
-            unwrapped_math.push(wrapper.source.clone());
+            unwrapped_inline.push(wrapper.source.clone());
         }
         for wrapper in self.inline_wrappers.iter().filter(|wrapper| {
             change.old.start <= wrapper.visual.start && change.old.end >= wrapper.visual.end
@@ -781,9 +806,9 @@ impl VisualProjection {
             .retained_inline_syntax(&change.old, source_start..source_end)
             .into_iter()
             .filter(|range| {
-                !unwrapped_math
+                !unwrapped_inline
                     .iter()
-                    .any(|math| math.start <= range.start && range.end <= math.end)
+                    .any(|wrapper| wrapper.start <= range.start && range.end <= wrapper.end)
             })
             .collect::<Vec<_>>();
         let mut inserted = decoded_prefix.clone();
@@ -969,6 +994,22 @@ impl VisualProjection {
             {
                 start_byte = reparsed.source_boundaries[selection.start];
                 end_byte = start_byte;
+            }
+        }
+
+        if !unwrapped_inline.is_empty() {
+            // Common-prefix/suffix shrinking can place a requested caret in
+            // preserved text outside the minimal edit. Its old source offset
+            // no longer applies after removing the wrapper and re-encoding
+            // that text, so anchor it in the completed projection.
+            let reparsed = Self::from_markdown_with_context(&output, None, self.references.clone());
+            if reparsed.text() == edited {
+                if reparsed.visual_char_for_source_byte(start_byte) != selection.start {
+                    start_byte = reparsed.source_boundaries[selection.start];
+                }
+                if reparsed.visual_char_for_source_byte(end_byte) != selection.end {
+                    end_byte = reparsed.source_boundaries[selection.end];
+                }
             }
         }
 
@@ -1352,6 +1393,17 @@ fn append_literal_inline_text(output: &mut String, text: &str) {
         }
         output.push(character);
     }
+}
+
+fn autolink_content_stays_valid(content: &str) -> bool {
+    let syntax = format!("<{content}>");
+    // The parser is the authority on whether an edited angle span is still
+    // an autolink. A partial link or HTML tag must not keep hidden brackets.
+    Parser::new_ext(&syntax, parser_options())
+        .into_offset_iter()
+        .any(|(event, range)| {
+            matches!(event, Event::Start(Tag::Link { .. })) && range == (0..syntax.len())
+        })
 }
 
 fn inline_flanking_wrapper(source: &str, range: &Range<usize>) -> bool {
