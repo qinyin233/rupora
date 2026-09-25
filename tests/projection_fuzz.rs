@@ -2,6 +2,16 @@
 mod projection_fuzz;
 
 #[test]
+fn projection_trace_replays_table_divider_cursor_reversal() {
+    // GitHub Actions run 36096006716, libFuzzer artifact crash-5add8fe6a57da1ab0c815abd0b0a58c3aa65ccc0.
+    let input = [
+        29, 124, 32, 97, 32, 124, 32, 98, 32, 124, 10, 124, 32, 45, 32, 124, 32, 45, 32, 124, 10,
+        124, 32, 7, 0, 0, 0, 0, 0, 3, 3, 1, 88, 1, 2, 2, 2, 2, 1, 32,
+    ];
+    assert!(projection_fuzz::run(&input).is_some());
+}
+
+#[test]
 fn projection_trace_replays_ci_backward_mapping_crash() {
     // GitHub Actions run 36040333784, libFuzzer artifact crash-d23ba72e1046248e0eea47c001034ef708ed6145.
     let input = [

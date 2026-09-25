@@ -2904,11 +2904,14 @@ fn text_change_anchored_at_selection(
     after_selection: &Range<usize>,
 ) -> Option<TextChange> {
     let fallback = text_change(before, after)?;
-    if !after_selection.is_empty() {
-        return Some(fallback);
-    }
     let old_length = fallback.old.len();
     let new_length = fallback.new.len();
+    // Repeated characters make the minimal diff ambiguous even when the
+    // inserted text remains selected. Anchor that selection to its actual
+    // visual position only when it spans the complete replacement.
+    if !after_selection.is_empty() && after_selection.len() != new_length {
+        return Some(fallback);
+    }
     let new_end = after_selection.end;
     let Some(new_start) = new_end.checked_sub(new_length) else {
         return Some(fallback);

@@ -118,3 +118,28 @@ fn typing_on_the_hidden_table_divider_keeps_the_table_and_input() {
         );
     }
 }
+
+#[test]
+fn selected_space_inserted_among_repeated_table_spaces_keeps_an_ordered_selection() {
+    let source = "X | b |\n| - | - |\n| x | y |";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "X  │  b\n\nx  │  y");
+    let edited = "X   │  b\n\nx  │  y";
+    let update = projection.apply_edit(source, edited, 2..3).unwrap();
+    assert!(update.selection.start <= update.selection.end);
+    let active = VisualProjection::from_markdown_with_selection(
+        &update.source,
+        Some(update.selection.clone()),
+    );
+    let selected_source = &update.source[byte_at(&update.source, update.selection.start)
+        ..byte_at(&update.source, update.selection.end)];
+    assert_eq!(selected_source, "&#32;");
+    assert_eq!(active.text(), edited);
+    let visible_selection = active.visual_char_range(&update.source, update.selection);
+    assert_eq!(visible_selection.len(), 1);
+    assert_eq!(
+        &active.text()[byte_at(active.text(), visible_selection.start)
+            ..byte_at(active.text(), visible_selection.end)],
+        " "
+    );
+}
