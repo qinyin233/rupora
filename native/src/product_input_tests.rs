@@ -317,6 +317,8 @@ fn hybrid_replacing_text_at_formatting_boundaries_keeps_visible_text() {
             "新",
             "prefix strong新em suffix",
         ),
+        ("a $x+y$ tail", 0..4, "新", "新+y tail"),
+        ("a $x+y$ tail", 4..8, "新", "a x新tail"),
     ] {
         let directory = tempfile::tempdir().unwrap();
         let mut app = app_at(directory.path(), source, selection);

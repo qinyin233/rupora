@@ -409,7 +409,29 @@ impl VisualProjection {
                     builder.append_container_prefix(source, range.start, format);
                     let mut style = format.visual();
                     style.code = true;
-                    builder.append_mapped(source, &text, range, style);
+                    let syntax = &source[range.clone()];
+                    let delimiter = if syntax.starts_with("$$") && syntax.ends_with("$$") {
+                        2
+                    } else if syntax.starts_with('$') && syntax.ends_with('$') {
+                        1
+                    } else {
+                        0
+                    };
+                    if delimiter > 0 && range.len() >= delimiter * 2 {
+                        // Treat the hidden dollar signs as one wrapper, like
+                        // emphasis or inline code. Edits crossing a math edge
+                        // must retain or remove its matching delimiter.
+                        builder.begin_inline_wrapper(range.start);
+                        builder.append_mapped(
+                            source,
+                            &text,
+                            range.start + delimiter..range.end - delimiter,
+                            style,
+                        );
+                        builder.end_inline_wrapper(range.end);
+                    } else {
+                        builder.append_mapped(source, &text, range, style);
+                    }
                 }
                 Event::Html(_) => {
                     builder.append_container_prefix(source, range.start, format);
