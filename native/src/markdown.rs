@@ -242,6 +242,38 @@ pub fn parser_options() -> Options {
         | Options::ENABLE_HEADING_ATTRIBUTES
 }
 
+/// Locate the actual code-span delimiters inside a parser-reported range.
+/// An offset can extend past the closing backticks when a bare CR follows
+/// the span, so the reported end is not always a delimiter boundary.
+pub(crate) fn inline_code_source_ranges(
+    source: &str,
+    reported: Range<usize>,
+) -> Option<(Range<usize>, Range<usize>)> {
+    let fragment = source.get(reported.clone())?;
+    let bytes = fragment.as_bytes();
+    let opening = bytes.iter().take_while(|byte| **byte == b'`').count();
+    if opening == 0 {
+        return None;
+    }
+    let mut cursor = opening;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'`' {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        while cursor < bytes.len() && bytes[cursor] == b'`' {
+            cursor += 1;
+        }
+        if cursor - start == opening {
+            let body = reported.start + opening..reported.start + start;
+            let syntax = reported.start..reported.start + cursor;
+            return Some((syntax, body));
+        }
+    }
+    None
+}
+
 pub fn analyze(source: &str) -> MarkdownAnalysis {
     MarkdownAnalysis {
         headings: parse_headings(source)

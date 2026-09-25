@@ -227,6 +227,14 @@ impl VisualProjection {
                         Tag::TableCell => {
                             if table_cells > 0 {
                                 if let Some(separator) = table_separator_range(source, range.start)
+                                    .filter(|separator| {
+                                        separator.start
+                                            >= builder
+                                                .source_boundaries
+                                                .last()
+                                                .copied()
+                                                .unwrap_or_default()
+                                    })
                                 {
                                     builder.append_marker(
                                         source,
@@ -368,20 +376,26 @@ impl VisualProjection {
                     }
                 }
                 Event::Code(text) => {
-                    let syntax_end = range.end;
-                    builder.begin_inline_wrapper(range.start);
-                    builder.append_container_prefix(source, range.start, format);
+                    let syntax = crate::markdown::inline_code_source_ranges(source, range.clone())
+                        .map_or(range, |(syntax, _)| syntax);
+                    builder.begin_inline_wrapper(syntax.start);
+                    builder.append_container_prefix(source, syntax.start, format);
                     let mut style = format.visual();
                     style.code = true;
-                    let content_range = inline_code_content_range(source, &text, range.clone());
+                    let content_range = inline_code_content_range(source, &text, syntax.clone());
                     if source_selection.as_ref().is_some_and(|selection| {
                         selection_reveals_inline_code(selection, &content_range)
                     }) {
-                        builder.append_revealed_inline_code(source, range, content_range, style);
+                        builder.append_revealed_inline_code(
+                            source,
+                            syntax.clone(),
+                            content_range,
+                            style,
+                        );
                     } else {
                         builder.append_mapped(source, &text, content_range, style);
                     }
-                    builder.end_inline_wrapper(syntax_end);
+                    builder.end_inline_wrapper(syntax.end);
                 }
                 Event::InlineMath(text) | Event::DisplayMath(text) => {
                     builder.append_container_prefix(source, range.start, format);
@@ -1735,7 +1749,8 @@ pub fn move_across_hidden_inline_code_boundary(
             if !matches!(event, Event::Code(_)) {
                 return None;
             }
-            let content_range = inline_code_delimited_content_range(source, syntax_range.clone())?;
+            let (syntax_range, content_range) =
+                crate::markdown::inline_code_source_ranges(source, syntax_range)?;
             let target_byte = if move_left && cursor_byte == syntax_range.end {
                 content_range.end
             } else if move_right && cursor_byte == syntax_range.start {
@@ -2504,8 +2519,8 @@ fn inline_code_content_range(
     rendered: &str,
     syntax_range: Range<usize>,
 ) -> Range<usize> {
-    let content =
-        inline_code_delimited_content_range(source, syntax_range.clone()).unwrap_or(syntax_range);
+    let content = crate::markdown::inline_code_source_ranges(source, syntax_range.clone())
+        .map_or(syntax_range, |(_, body)| body);
     let fragment = &source[content.clone()];
     fragment.find(rendered).map_or(content.clone(), |start| {
         content.start + start..content.start + start + rendered.len()
@@ -2574,23 +2589,6 @@ fn standalone_footnote_references(
         .zip(covered_until)
         .filter_map(|(reference, covered)| (covered >= reference.end).then_some(reference))
         .collect()
-}
-
-fn inline_code_delimited_content_range(
-    source: &str,
-    syntax_range: Range<usize>,
-) -> Option<Range<usize>> {
-    let fragment = source.get(syntax_range.clone())?;
-    let opening = fragment.bytes().take_while(|byte| *byte == b'`').count();
-    let closing = fragment
-        .bytes()
-        .rev()
-        .take_while(|byte| *byte == b'`')
-        .count();
-    if opening == 0 || closing < opening || fragment.len() < opening.saturating_mul(2) {
-        return None;
-    }
-    Some(syntax_range.start + opening..syntax_range.end - opening)
 }
 
 fn selection_reveals_inline_code(

@@ -704,11 +704,7 @@ fn toggle_inline_code(text: &mut String, selection: Range<usize>) -> Range<usize
             if !matches!(event, pulldown_cmark::Event::Code(_)) {
                 return None;
             }
-            let marker_len = text[syntax.clone()]
-                .bytes()
-                .take_while(|byte| *byte == b'`')
-                .count();
-            let mut body = syntax.start + marker_len..syntax.end - marker_len;
+            let (syntax, mut body) = crate::markdown::inline_code_source_ranges(text, syntax)?;
             let raw = &text[body.clone()];
             // CommonMark strips one padding space only when both ends are
             // spaces and the body contains a non-space character.

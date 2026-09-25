@@ -147,3 +147,14 @@ fn source_audit_math_output_budget_accounts_for_embedded_glyphs() {
     assert!(html.contains("<svg"));
     assert!(html.len() <= source.len() * 128 + 4096 + MAX_GENERATED_DOCUMENT_BYTES);
 }
+
+#[test]
+fn inline_code_toggle_handles_unicode_after_backslash_cr() {
+    let original = "# a 00a¡  A¡\\\r ¡A¡¡";
+    let mut text = original.to_owned();
+    let selection = 2..12;
+    let next = apply_markdown_command(&mut text, selection, MarkdownCommand::InlineCode);
+    assert_eq!(text, "# `a 00a¡  A¡`\\\r ¡A¡¡");
+    apply_markdown_command(&mut text, next, MarkdownCommand::InlineCode);
+    assert_eq!(text, original);
+}

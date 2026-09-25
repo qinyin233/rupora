@@ -1,6 +1,47 @@
 use rupora::wysiwyg::VisualProjection;
 
 #[test]
+fn incomplete_long_table_row_keeps_source_ranges_ordered() {
+    let source = "| a | b |\n| - | - |\n| uuuuuuu";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "a  │  b\n\nuuuuuuu  │  ");
+    let length = projection.text().chars().count();
+    for point in 0..=length {
+        for range in [0..point, point..length] {
+            let mapped = projection.source_char_range(source, range.clone());
+            assert!(
+                mapped.start <= mapped.end,
+                "visual={:?} range={range:?} mapped={mapped:?}",
+                projection.text()
+            );
+        }
+    }
+}
+
+#[test]
+fn oversized_inline_code_parser_range_does_not_delete_following_unicode() {
+    let source = "# `a 00a¡  A¡`\\\r ¡A¡¡";
+    let projection = VisualProjection::from_markdown(source);
+    assert!(projection.text().contains("a 00a¡  A¡"));
+    let edited = projection.text().replacen("a 00a¡  A¡", "", 1);
+    let update = projection.apply_edit(source, &edited, 0..0).unwrap();
+    assert!(update.source.ends_with("\\\r ¡A¡¡"), "{:?}", update.source);
+
+    let after_closer_byte = source.find("`\\").unwrap() + 1;
+    let after_closer = source[..after_closer_byte].chars().count();
+    let body_end = source[..after_closer_byte - 1].chars().count();
+    assert_eq!(
+        rupora::wysiwyg::move_across_hidden_inline_code_boundary(
+            source,
+            after_closer..after_closer,
+            true,
+            false,
+        ),
+        Some(body_end..body_end)
+    );
+}
+
+#[test]
 fn tab_after_quote_marker_keeps_quote_and_nested_list_visible() {
     for (source, expected) in [
         (">\ta  b", "│ a  b"),
