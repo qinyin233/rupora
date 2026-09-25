@@ -789,8 +789,23 @@ impl DocumentLock {
             .truncate(false)
             .open(&lock_path)
             .map_err(|error| format!("无法创建文档锁 {}：{error}", lock_path.display()))?;
-        fs2::FileExt::try_lock_exclusive(&file)
-            .map_err(|_| format!("文档已由另一个 RUPORA 实例编辑：{}", path.display()))?;
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
+                    return Err(format!(
+                        "文档已由另一个 RUPORA 实例编辑：{}",
+                        path.display()
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!("无法锁定文档 {}：{error}", path.display()));
+                }
+            }
+        }
         Ok(Self { _file: file })
     }
 }
