@@ -238,3 +238,83 @@ fn typing_multiple_spaces_at_a_table_cell_end_keeps_every_space() {
         );
     }
 }
+
+#[test]
+fn replacing_the_last_cell_character_preserves_preceding_spaces() {
+    let source = "| a  b | c |\n| - | - |\n| d | e |";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "a  b  │  c\n\nd  │  e");
+    for replacement in ["", " ", "  "] {
+        let edited = projection.text().replacen('b', replacement, 1);
+        let cursor = 3 + replacement.chars().count();
+        let update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+        let reparsed = VisualProjection::from_markdown(&update.source);
+        assert_eq!(
+            reparsed.text(),
+            edited,
+            "replacement={replacement:?}, source={:?}",
+            update.source
+        );
+        let active = VisualProjection::from_markdown_with_selection(
+            &update.source,
+            Some(update.selection.clone()),
+        );
+        assert_eq!(
+            active.visual_char_range(&update.source, update.selection),
+            cursor..cursor
+        );
+    }
+}
+
+#[test]
+fn deleting_final_table_cell_character_before_a_paragraph_keeps_caret_in_cell() {
+    let source = "a\n\n| x | y |\n| - | - |\n| p | q |\n\nz";
+    let projection = VisualProjection::from_markdown(source);
+    assert_eq!(projection.text(), "a\n\nx  │  y\n\np  │  q\n\nz");
+    let edited = "a\n\nx  │  y\n\np  │  \n\nz";
+    let update = projection.apply_edit(source, edited, 18..18).unwrap();
+    assert_eq!(
+        VisualProjection::from_markdown(&update.source).text(),
+        edited
+    );
+    let active = VisualProjection::from_markdown_with_selection(
+        &update.source,
+        Some(update.selection.clone()),
+    );
+    assert_eq!(
+        active.visual_char_range(&update.source, update.selection),
+        18..18
+    );
+}
+
+#[test]
+fn replacing_last_column_character_with_spaces_keeps_caret_before_row_break() {
+    let source = "| a | b |\n| - | - |\n| c | d |";
+    let projection = VisualProjection::from_markdown(source);
+    for count in 1..=2 {
+        let edited = format!("a  │  {}\n\nc  │  d", " ".repeat(count));
+        let cursor = 6 + count;
+        let update = projection
+            .apply_edit(source, &edited, cursor..cursor)
+            .unwrap();
+        let active = VisualProjection::from_markdown_with_selection(
+            &update.source,
+            Some(update.selection.clone()),
+        );
+        assert_eq!(active.text(), edited);
+        assert_eq!(
+            active.visual_char_range(&update.source, update.selection.clone()),
+            cursor..cursor
+        );
+        let next = format!("a  │  {}X\n\nc  │  d", " ".repeat(count));
+        let follow_up = active
+            .apply_edit(&update.source, &next, cursor + 1..cursor + 1)
+            .unwrap();
+        assert_eq!(
+            VisualProjection::from_markdown(&follow_up.source).text(),
+            next
+        );
+    }
+}

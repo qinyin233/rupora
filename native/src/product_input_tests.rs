@@ -431,6 +431,53 @@ fn hybrid_deleting_table_cell_tail_keeps_the_surviving_space() {
 }
 
 #[test]
+fn hybrid_deleting_table_cell_tail_keeps_multiple_surviving_spaces() {
+    let source = "| a  b | c |\n| - | - |\n| d | e |";
+    let directory = tempfile::tempdir().unwrap();
+    let b = source.find('b').unwrap();
+    let mut app = app_at(directory.path(), source, b..b + 1);
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    frame(&mut app, &ctx, true, vec![]);
+    frame(
+        &mut app,
+        &ctx,
+        true,
+        vec![key(Key::Backspace, egui::Modifiers::NONE)],
+    );
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "a    │  c\n\nd  │  e"
+    );
+    frame(&mut app, &ctx, true, vec![egui::Event::Text("X".into())]);
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "a  X  │  c\n\nd  │  e"
+    );
+}
+
+#[test]
+fn hybrid_replacing_last_column_character_with_space_keeps_follow_up_input_in_cell() {
+    let source = "| a | b |\n| - | - |\n| c | d |";
+    let directory = tempfile::tempdir().unwrap();
+    let b = source.find('b').unwrap();
+    let mut app = app_at(directory.path(), source, b..b + 1);
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    frame(&mut app, &ctx, true, vec![]);
+    frame(&mut app, &ctx, true, vec![egui::Event::Text(" ".into())]);
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "a  │   \n\nc  │  d"
+    );
+    frame(&mut app, &ctx, true, vec![egui::Event::Text("X".into())]);
+    assert_eq!(
+        VisualProjection::from_markdown(&app.session[0].content).text(),
+        "a  │   X\n\nc  │  d"
+    );
+}
+
+#[test]
 fn hybrid_deleting_a_header_cell_keeps_the_caret_in_that_cell() {
     let source = "| a | b |\n| - | - |\n| c | d |";
     let directory = tempfile::tempdir().unwrap();

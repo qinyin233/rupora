@@ -747,17 +747,22 @@ impl VisualProjection {
             }
         }
 
-        if replacement.is_empty()
+        if !change.old.is_empty()
             && selection.is_empty()
-            && self
-                .runs
-                .iter()
-                .any(|run| run.style.table && !run.style.marker && run.range == change.old)
+            && self.runs.iter().any(|run| {
+                run.style.table
+                    && !run.style.marker
+                    && run.range.start <= change.old.start
+                    && change.old.end <= run.range.end
+            })
+            && !self.text[char_to_byte(&self.text, change.old.start)
+                ..char_to_byte(&self.text, change.old.end)]
+                .contains('\n')
         {
-            // The last character of a padded cell can be deleted at a source
-            // byte that becomes hidden cell padding. With a following row,
-            // that byte may then project past the row break. Anchor the caret
-            // to the requested visual boundary in the completed source.
+            // Replacing the last character of a padded cell can leave the
+            // source caret on hidden padding. With a following row, that byte
+            // may project past the row break. Anchor the caret to the requested
+            // visual boundary in the completed source.
             let reparsed = Self::from_markdown_with_context(&output, None, self.references.clone());
             if reparsed.text() == edited
                 && reparsed.visual_char_for_source_byte(start_byte) != selection.start
@@ -834,13 +839,11 @@ impl VisualProjection {
         // A list can consume the first surviving space as marker whitespace;
         // a table cell can trim inserted spaces as cell padding. Encoding the
         // missing visible spaces keeps them in editable content.
-        for position in [
-            Some(source_start),
-            in_table_cell.then(|| source_start.checked_sub(1)).flatten(),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        // Replacing the last character in a cell can leave several spaces
+        // immediately before the edit. The parser trims the entire suffix,
+        // so include those preceding spaces when looking for an encoding.
+        let backtrack = if in_table_cell { missing } else { 0 };
+        for position in (0..=backtrack).filter_map(|offset| source_start.checked_sub(offset)) {
             if output.get(position..).map_or(0, |tail| {
                 tail.bytes().take_while(|byte| *byte == b' ').count()
             }) < missing
