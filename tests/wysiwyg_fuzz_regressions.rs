@@ -1,6 +1,40 @@
 use rupora::wysiwyg::VisualProjection;
 
 #[test]
+fn deleting_across_an_opener_preserves_leading_space_and_style() {
+    for delimiter in ["*", "**", "_", "__", "~~"] {
+        for (prefix, first, rest) in [("A", "a", "b"), ("甲", "乙", "丙🙂")] {
+            let source = format!("{prefix} {delimiter}{first} {rest}{delimiter}");
+            let projection = VisualProjection::from_markdown(&source);
+            let edited = format!("{prefix} {rest}");
+            let update = projection.apply_edit(&source, &edited, 1..1).unwrap();
+            let active = VisualProjection::from_markdown_with_selection(
+                &update.source,
+                Some(update.selection.clone()),
+            );
+            assert_eq!(
+                active.text(),
+                edited,
+                "source={source:?}, update={update:?}"
+            );
+            assert_eq!(
+                active.visual_char_range(&update.source, update.selection),
+                1..1
+            );
+            let runs = active.runs_for(active.text());
+            let style = runs
+                .iter()
+                .find(|run| run.range.contains(&2))
+                .unwrap()
+                .style;
+            assert_eq!(style.emphasis, matches!(delimiter, "*" | "_"));
+            assert_eq!(style.strong, matches!(delimiter, "**" | "__"));
+            assert_eq!(style.strikethrough, delimiter == "~~");
+        }
+    }
+}
+
+#[test]
 fn incomplete_long_table_row_keeps_source_ranges_ordered() {
     let source = "| a | b |\n| - | - |\n| uuuuuuu";
     let projection = VisualProjection::from_markdown(source);

@@ -1153,6 +1153,55 @@ fn partial_inline_delete_and_batched_backspace_keep_markup_and_history() {
 }
 
 #[test]
+fn deleting_across_emphasis_opener_keeps_rendering_cursor_and_history() {
+    for delimiter in ["*", "**", "_", "__", "~~"] {
+        let source = format!("甲 {delimiter}乙 丙🙂{delimiter}");
+        let projection = crate::wysiwyg::VisualProjection::from_markdown(&source);
+        let selection = projection.source_char_range(&source, 1..3);
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_at(directory.path(), &source, selection);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        frame(&mut app, &ctx, true, vec![]);
+        frame(
+            &mut app,
+            &ctx,
+            true,
+            vec![key(Key::Backspace, egui::Modifiers::NONE)],
+        );
+        let deleted = app.session[0].content.to_string();
+        let active = crate::wysiwyg::VisualProjection::from_markdown_with_selection(
+            &deleted,
+            Some(app.active_selection(0)),
+        );
+        assert_eq!(
+            active.text(),
+            "甲 丙🙂",
+            "source={source:?}, deleted={deleted:?}"
+        );
+        assert_eq!(
+            active.visual_char_range(&deleted, app.active_selection(0)),
+            1..1
+        );
+        app.undo_active();
+        assert_eq!(app.session[0].content, source);
+        app.redo_active();
+        assert_eq!(app.session[0].content, deleted);
+        frame(&mut app, &ctx, true, vec![egui::Event::Text("新".into())]);
+        let after = &app.session[0].content;
+        let active = crate::wysiwyg::VisualProjection::from_markdown_with_selection(
+            after,
+            Some(app.active_selection(0)),
+        );
+        assert_eq!(active.text(), "甲新 丙🙂");
+        assert_eq!(
+            active.visual_char_range(after, app.active_selection(0)),
+            2..2
+        );
+    }
+}
+
+#[test]
 fn ime_cancel_preserves_following_input_and_history() {
     for empty_preedit in [false, true] {
         for batched in [false, true] {

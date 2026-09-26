@@ -31,6 +31,7 @@
 | [进程中断后的保存与恢复 #7](https://github.com/qinyin233/rupora/issues/7) | 可控子进程终止；与真实断电、设备故障的证据明确区分 |
 | [并发进程启动时的恢复锁 #19](https://github.com/qinyin233/rupora/issues/19) | 文档关闭时显式解锁；重复句柄回归及 Linux 并行进程中断复测 |
 | [主实例关闭后的锁释放 #20](https://github.com/qinyin233/rupora/issues/20) | 保留旧描述符时立即接管主实例；排队请求保留及新所有者排他性 |
+| [删除强调开头后暴露标记 #21](https://github.com/qinyin233/rupora/issues/21) | 保留空格和五种强调标记的样式；中文/emoji 光标、Backspace、撤销重做和继续输入 |
 
 ## 证据分层
 

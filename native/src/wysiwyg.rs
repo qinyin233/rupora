@@ -1246,6 +1246,11 @@ impl VisualProjection {
             if output.is_char_boundary(end) {
                 candidates.push(vec![end]);
             }
+            if output.is_char_boundary(start) && output.is_char_boundary(end) {
+                // An opener left between a word and a retained space needs
+                // both sides isolated to remain an opening delimiter.
+                candidates.push(vec![start, end]);
+            }
         }
         for adjacent in self
             .inline_wrappers
