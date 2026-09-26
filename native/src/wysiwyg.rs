@@ -172,6 +172,23 @@ impl VisualProjection {
                         builder.set_current_boundary(range.start);
                     }
                     builder.append_source_line_breaks_until(source, range.start, format.visual());
+                    if matches!(
+                        &tag,
+                        Tag::Emphasis
+                            | Tag::Strong
+                            | Tag::Strikethrough
+                            | Tag::Link { .. }
+                            | Tag::Image { .. }
+                    ) && builder.inline_wrapper_stack.last().is_none_or(|wrapper| {
+                        wrapper.visual_start < builder.char_count()
+                            || source[wrapper.source_start..range.start].contains(['\r', '\n'])
+                    }) {
+                        // Leading indentation belongs to the enclosing state.
+                        // A parent at this visual position already checked the
+                        // same source line. Hidden HTML can cross a source line
+                        // without advancing the visual position, so check again.
+                        builder.append_container_prefix(source, range.start, format);
+                    }
                     let autolink = matches!(&tag, Tag::Link { .. })
                         && source[range.clone()].starts_with('<')
                         && source[range.clone()].ends_with('>');

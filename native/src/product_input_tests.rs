@@ -1262,11 +1262,18 @@ fn deleting_after_a_formatted_hard_break_preserves_input_and_history() {
     }
 }
 
-fn assert_nested_emphasis_input_history(
+fn assert_inline_edit_input_history(
     source: &str,
     range: std::ops::Range<usize>,
     replacement: &str,
+    allow_indent_marker: bool,
 ) {
+    let normalize = |mut style: crate::wysiwyg::VisualStyle| {
+        if allow_indent_marker {
+            style.marker = false;
+        }
+        style
+    };
     let projection = crate::wysiwyg::VisualProjection::from_markdown(source);
     let chars: Vec<_> = projection.text().chars().collect();
     let mut expected = chars[..range.start].iter().collect::<String>()
@@ -1284,7 +1291,7 @@ fn assert_nested_emphasis_input_history(
             } else {
                 caret + index - range.end
             };
-            (after, style)
+            (after, normalize(style))
         })
         .collect();
     let directory = tempfile::tempdir().unwrap();
@@ -1312,10 +1319,12 @@ fn assert_nested_emphasis_input_history(
     let runs = active.runs_for(active.text());
     for &(index, style) in &surviving_styles {
         assert_eq!(
-            runs.iter()
-                .find(|run| run.range.contains(&index))
-                .unwrap()
-                .style,
+            normalize(
+                runs.iter()
+                    .find(|run| run.range.contains(&index))
+                    .unwrap()
+                    .style
+            ),
             style
         );
     }
@@ -1336,10 +1345,12 @@ fn assert_nested_emphasis_input_history(
     for (index, style) in surviving_styles {
         let index = if index < caret { index } else { index + 1 };
         assert_eq!(
-            runs.iter()
-                .find(|run| run.range.contains(&index))
-                .unwrap()
-                .style,
+            normalize(
+                runs.iter()
+                    .find(|run| run.range.contains(&index))
+                    .unwrap()
+                    .style
+            ),
             style
         );
     }
@@ -1348,7 +1359,7 @@ fn assert_nested_emphasis_input_history(
 #[test]
 fn nested_emphasis_edits_keep_rendering_caret_and_history() {
     for (range, replacement) in [(1..3, ""), (4..6, ""), (1..4, "新🙂"), (3..6, "新🙂")] {
-        assert_nested_emphasis_input_history("A __甲_🙂_乙__ Z", range, replacement);
+        assert_inline_edit_input_history("A __甲_🙂_乙__ Z", range, replacement, false);
     }
 }
 
@@ -1359,7 +1370,7 @@ fn whitespace_at_nested_emphasis_boundaries_keeps_input_and_history() {
         ("A ***甲 🙂*** Z", 1..3, ""),
         ("A ***甲 🙂*** Z", 4..6, ""),
     ] {
-        assert_nested_emphasis_input_history(source, range, replacement);
+        assert_inline_edit_input_history(source, range, replacement, false);
     }
 }
 
@@ -1374,7 +1385,31 @@ fn literal_underscore_whitespace_keeps_input_and_history() {
         "**_甲_乙🙂_**",
     ] {
         for caret in [1, 2] {
-            assert_nested_emphasis_input_history(source, caret..caret, " ");
+            assert_inline_edit_input_history(source, caret..caret, " ", false);
+        }
+    }
+}
+
+#[test]
+fn leading_indentation_keeps_inline_styles_caret_and_history() {
+    for source in [
+        "A **甲🙂乙**",
+        "A *甲🙂乙*",
+        "A ~~甲🙂乙~~",
+        "A [甲🙂乙](u)",
+        "A __甲_🙂_乙__",
+        "A `甲🙂乙`",
+        "A 甲🙂乙",
+        "A  **甲🙂乙**",
+        "**甲\nA *乙* 丙**",
+        "> A **甲🙂乙**",
+    ] {
+        let projection = crate::wysiwyg::VisualProjection::from_markdown(source);
+        let start = projection.text().chars().position(|ch| ch == 'A').unwrap();
+        for replacement in ["", " "] {
+            // A surviving ordinary space becomes an indentation marker, but
+            // its inline style and all surrounding text must remain intact.
+            assert_inline_edit_input_history(source, start..start + 1, replacement, true);
         }
     }
 }
