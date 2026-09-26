@@ -1364,6 +1364,76 @@ fn whitespace_at_nested_emphasis_boundaries_keeps_input_and_history() {
 }
 
 #[test]
+fn partial_entity_selection_keeps_formatting_caret_and_history() {
+    for (source, selected_chars, expected) in [
+        ("x **&fjlig;y**", 3, "jy"),
+        ("x *&fjlig;y*", 3, "jy"),
+        ("x ~~&fjlig;y~~", 3, "jy"),
+        ("x[&fjlig;][]\n\n[&fjlig;]: u", 2, "j"),
+    ] {
+        for batched in [false, true] {
+            let projection = crate::wysiwyg::VisualProjection::from_markdown(source);
+            let expected_style = projection.runs_for(projection.text()).last().unwrap().style;
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_at(directory.path(), source, 0..0);
+            let ctx = Context::default();
+            install_fonts(&ctx);
+            frame(&mut app, &ctx, true, vec![]);
+            let select = key(Key::ArrowRight, egui::Modifiers::SHIFT);
+            if batched {
+                frame(&mut app, &ctx, true, vec![select; selected_chars]);
+            } else {
+                for _ in 0..selected_chars {
+                    frame(&mut app, &ctx, true, vec![select.clone()]);
+                }
+            }
+            frame(
+                &mut app,
+                &ctx,
+                true,
+                vec![key(Key::Backspace, egui::Modifiers::NONE)],
+            );
+            let edited = app.session[0].content.to_string();
+            let active = crate::wysiwyg::VisualProjection::from_markdown(&edited);
+            assert_eq!(
+                active.text(),
+                expected,
+                "{source:?}, batched={batched}, {edited:?}"
+            );
+            assert!(
+                active
+                    .runs_for(active.text())
+                    .iter()
+                    .all(|run| run.style == expected_style)
+            );
+            assert_eq!(
+                active.visual_char_range(&edited, app.active_selection(0)),
+                0..0
+            );
+            app.undo_active();
+            assert_eq!(app.session[0].content, source);
+            app.redo_active();
+            assert_eq!(app.session[0].content, edited);
+            frame(&mut app, &ctx, true, vec![egui::Event::Text("后".into())]);
+            let after = &app.session[0].content;
+            let active = crate::wysiwyg::VisualProjection::from_markdown(after);
+            assert_eq!(active.text(), format!("后{expected}"));
+            assert_eq!(
+                active.visual_char_range(after, app.active_selection(0)),
+                1..1
+            );
+            assert!(
+                active
+                    .runs_for(active.text())
+                    .iter()
+                    .filter(|run| run.range.end > 1)
+                    .all(|run| run.style == expected_style)
+            );
+        }
+    }
+}
+
+#[test]
 fn ime_cancel_preserves_following_input_and_history() {
     for empty_preedit in [false, true] {
         for batched in [false, true] {

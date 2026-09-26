@@ -877,17 +877,18 @@ impl VisualProjection {
             || container_marker_insertion.is_some())
         .then(|| replacement.replace(' ', "&#32;"));
         inserted.push_str(encoded_marker_replacement.as_deref().unwrap_or(replacement));
-        inserted.push_str(&decoded_suffix);
         for range in &retained {
             inserted.push_str(&source[range.clone()]);
         }
+        // Retained openers surround the unselected entity remainder too.
+        // Putting it before those markers silently drops its original style.
+        inserted.push_str(&decoded_suffix);
         let mut retained_offset = source_start
             + decoded_prefix.len()
             + encoded_marker_replacement
                 .as_deref()
                 .unwrap_or(replacement)
-                .len()
-            + decoded_suffix.len();
+                .len();
         let mut retained_flanking_closers = Vec::new();
         let mut retained_flanking_openers = Vec::new();
         for range in &retained {
