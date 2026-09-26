@@ -768,7 +768,7 @@ impl Document {
 
 #[derive(Debug)]
 struct DocumentLock {
-    _file: File,
+    file: File,
 }
 
 impl DocumentLock {
@@ -806,7 +806,20 @@ impl DocumentLock {
                 }
             }
         }
-        Ok(Self { _file: file })
+        Ok(Self { file })
+    }
+}
+
+impl Drop for DocumentLock {
+    fn drop(&mut self) {
+        // A concurrently spawned Unix child can retain this file description
+        // until exec, even with CLOEXEC set. Closing only our descriptor would
+        // leave its flock alive and make an immediate reopen/recovery fail.
+        while let Err(error) = fs2::FileExt::unlock(&self.file) {
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
     }
 }
 
@@ -1481,6 +1494,40 @@ impl TextPatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_document_releases_lock_while_a_duplicate_handle_survives() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("note.md");
+        fs::write(&path, "saved").unwrap();
+        let document = Document::open(&path).unwrap();
+        // dup and fork share the open file description. Retain that reference
+        // deterministically instead of racing another test's fork/exec window.
+        let inherited = document.lock.as_ref().unwrap().file.try_clone().unwrap();
+        assert!(Document::open(&path).is_err());
+        drop(document);
+
+        let recovered = Document::recover(
+            Some(path.clone()),
+            "draft".into(),
+            Some("saved".into()),
+            None,
+            None,
+            1,
+        );
+        assert_eq!(recovered.warning, None);
+        assert_eq!(recovered.document.path, Some(path.canonicalize().unwrap()));
+        assert_eq!(recovered.document.content, "draft");
+        assert!(recovered.document.dirty);
+        drop(inherited);
+        assert!(
+            Document::open(&path).is_err(),
+            "the new owner keeps its lock"
+        );
+        drop(recovered);
+        assert_eq!(Document::open(&path).unwrap().content, "saved");
+    }
 
     #[test]
     fn document_locks_resolve_parent_aliases_before_file_creation() {

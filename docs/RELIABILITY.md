@@ -29,6 +29,7 @@
 | [可重放 projection fuzz #5](https://github.com/qinyin233/rupora/issues/5) | 长源码、完整位置范围、多步编辑、资源预算、最小失败样例留存 |
 | [真实输入法及最终安装包 #6](https://github.com/qinyin233/rupora/issues/6) | 系统 IME 和实际安装/解包产物，记录 OS、架构、版本、资产哈希 |
 | [进程中断后的保存与恢复 #7](https://github.com/qinyin233/rupora/issues/7) | 可控子进程终止；与真实断电、设备故障的证据明确区分 |
+| [并发进程启动时的恢复锁 #19](https://github.com/qinyin233/rupora/issues/19) | 文档关闭时显式解锁；重复句柄回归及 Linux 并行进程中断复测 |
 
 ## 证据分层
 

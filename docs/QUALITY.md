@@ -69,6 +69,19 @@ Document 保存、另存为和 RecoveryStore 写入。两个父测试覆盖 3 �
 从操作系统名称推断。这些测试不模拟断电、写缓存丢失或设备故障；Windows 的目录同步
 函数当前为空操作，其最后一个阶段只表示到达保存流程结尾。
 
+2026-09-26 在 WSL2 Linux x86_64（6.18.33.2、测试目录 `/tmp` 为 tmpfs、Rust 1.92.0）
+补充了 [#19](https://github.com/qinyin233/rupora/issues/19) 的并行复测。基线 `16cea82`
+的三个 `process_termination` 父测试并行运行 20 轮失败 4 轮，串行 50 轮通过。
+文档锁增加显式析构解锁后，原并行测试连续 200 轮通过，未将测试改成串行。
+Unix 回归 `closing_document_releases_lock_while_a_duplicate_handle_survives` 保留同一
+文件描述的副本，稳定重现关闭后恢复仍误报占用；修复后验证草稿重新关联成功，且新所有者
+仍保持排他锁。该测试修复前失败、修复后通过。
+
+原因是 [flock 的释放规则](https://man7.org/linux/man-pages/man2/flock.2.html)：
+并发启动的子进程在 exec 前可能保留文件描述的副本，仅关闭父进程的句柄不足以立即释放锁。
+回归通过 `File::try_clone` 固定这个窗口，避免依赖进程调度概率；进程终止矩阵仍覆盖真实子进程。
+可用 `cargo test --lib --locked process_termination` 重跑原矩阵；重复此命令时保留默认并行度。
+
 ## 依赖策略
 
 `deny.toml` 检查 RustSec 公告、许可证、来源和重复依赖。重复版本保持警告级别，因为图形、
