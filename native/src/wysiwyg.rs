@@ -987,6 +987,21 @@ impl VisualProjection {
             removed_closer_bytes += removed.len();
         }
         delta -= removed_closer_bytes as isize;
+        let line_break_boundary = self.repair_closer_after_line_break(
+            source,
+            edited,
+            &(source_start..source_end),
+            delta,
+            &mut output,
+        );
+        if let Some((position, length)) = line_break_boundary {
+            for caret in [&mut start_byte, &mut end_byte] {
+                if *caret >= position {
+                    *caret += length;
+                }
+            }
+            delta += length as isize;
+        }
         let repair_bytes = self.repair_inline_flanking_boundaries(
             source,
             edited,
@@ -1057,11 +1072,12 @@ impl VisualProjection {
             }
         }
 
-        if !unwrapped_inline.is_empty() {
+        if !unwrapped_inline.is_empty() || line_break_boundary.is_some() {
             // Common-prefix/suffix shrinking can place a requested caret in
             // preserved text outside the minimal edit. Its old source offset
-            // no longer applies after removing the wrapper and re-encoding
-            // that text, so anchor it in the completed projection.
+            // no longer applies after unwrapping/re-encoding that text or
+            // adding an invisible line boundary. Anchor it in the completed
+            // projection instead.
             let reparsed = Self::from_markdown_with_context(&output, None, self.references.clone());
             if reparsed.text() == edited {
                 if reparsed.visual_char_for_source_byte(start_byte) != selection.start {
@@ -1108,6 +1124,59 @@ impl VisualProjection {
         ranges
     }
 
+    fn repair_closer_after_line_break(
+        &self,
+        original: &str,
+        edited: &str,
+        removed: &Range<usize>,
+        delta: isize,
+        output: &mut String,
+    ) -> Option<(usize, usize)> {
+        const BOUNDARY: &str = "<span></span>";
+        if !edited.contains('\n') {
+            return None;
+        }
+        for wrapper in self.inline_wrappers.iter().filter(|wrapper| {
+            wrapper.content.start <= removed.start
+                && removed.end <= wrapper.content.end
+                && inline_flanking_wrapper(original, &wrapper.source)
+        }) {
+            let closer =
+                shift_index(wrapper.content.end, delta)..shift_index(wrapper.source.end, delta);
+            if output.get(closer.clone()) != original.get(wrapper.content.end..wrapper.source.end) {
+                continue;
+            }
+            let Some(line_start) = output[..closer.start]
+                .rfind(['\r', '\n'])
+                .map(|index| index + 1)
+            else {
+                continue;
+            };
+            if !output[line_start..closer.start]
+                .bytes()
+                .all(|byte| matches!(byte, b' ' | b'\t' | b'>'))
+            {
+                continue;
+            }
+            if Self::from_markdown_with_context(output, None, self.references.clone()).text()
+                == edited
+            {
+                return None;
+            }
+            // A line-start closer cannot close emphasis. A comment here would
+            // start an HTML block; an empty inline span preserves the break,
+            // container prefix and enclosing styles without adding text.
+            let mut candidate = output.clone();
+            candidate.insert_str(closer.start, BOUNDARY);
+            if Self::from_markdown_with_context(&candidate, None, self.references.clone()).text()
+                == edited
+            {
+                *output = candidate;
+                return Some((closer.start, BOUNDARY.len()));
+            }
+        }
+        None
+    }
     fn repair_collapsed_structural_space(
         &self,
         edited_visual: &str,

@@ -1202,6 +1202,67 @@ fn deleting_across_emphasis_opener_keeps_rendering_cursor_and_history() {
 }
 
 #[test]
+fn deleting_after_a_formatted_hard_break_preserves_input_and_history() {
+    for newline in ["\n", "\r\n"] {
+        for source in [
+            format!("**甲\\{newline}🙂**"),
+            format!("> **甲\\{newline}> 🙂**"),
+            format!("- **甲\\{newline}  🙂**"),
+            format!("**甲\\{newline}🙂**{newline}{newline}尾"),
+        ] {
+            let projection = crate::wysiwyg::VisualProjection::from_markdown(&source);
+            let caret = projection.text().chars().position(|ch| ch == '🙂').unwrap();
+            let mut expected = projection.text().replace('🙂', "");
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_at(
+                directory.path(),
+                &source,
+                projection.source_char_range(&source, caret..caret + 1),
+            );
+            let ctx = Context::default();
+            install_fonts(&ctx);
+            frame(&mut app, &ctx, true, vec![]);
+            frame(
+                &mut app,
+                &ctx,
+                true,
+                vec![key(Key::Backspace, egui::Modifiers::NONE)],
+            );
+            let deleted = app.session[0].content.to_string();
+            let active = crate::wysiwyg::VisualProjection::from_markdown(&deleted);
+            assert_eq!(active.text(), expected, "{deleted:?}");
+            assert_eq!(
+                active.visual_char_range(&deleted, app.active_selection(0)),
+                caret..caret
+            );
+            app.undo_active();
+            assert_eq!(app.session[0].content, source);
+            app.redo_active();
+            assert_eq!(app.session[0].content, deleted);
+            frame(&mut app, &ctx, true, vec![egui::Event::Text("新🙂".into())]);
+            let after = &app.session[0].content;
+            let active = crate::wysiwyg::VisualProjection::from_markdown(after);
+            let byte = crate::editing::char_to_byte(&expected, caret);
+            expected.insert_str(byte, "新🙂");
+            assert_eq!(active.text(), expected);
+            assert!(
+                active
+                    .runs_for(active.text())
+                    .iter()
+                    .find(|run| run.range.contains(&caret))
+                    .unwrap()
+                    .style
+                    .strong
+            );
+            assert_eq!(
+                active.visual_char_range(after, app.active_selection(0)),
+                caret + 2..caret + 2
+            );
+        }
+    }
+}
+
+#[test]
 fn ime_cancel_preserves_following_input_and_history() {
     for empty_preedit in [false, true] {
         for batched in [false, true] {

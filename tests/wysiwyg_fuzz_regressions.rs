@@ -1,6 +1,43 @@
 use rupora::wysiwyg::VisualProjection;
 
 #[test]
+fn deleting_the_last_formatted_character_after_a_break_keeps_the_break() {
+    for delimiter in ["*", "**", "_", "__", "~~"] {
+        for newline in ["\n", "\r\n", "\r"] {
+            for break_marker in ["\\", "  ", ""] {
+                let source = format!("{delimiter}甲{break_marker}{newline}🙂{delimiter}");
+                let projection = VisualProjection::from_markdown(&source);
+                assert_eq!(projection.text(), "甲\n🙂");
+                let update = projection.apply_edit(&source, "甲\n", 2..2).unwrap();
+                let reparsed = VisualProjection::from_markdown(&update.source);
+                assert_eq!(
+                    reparsed.text(),
+                    "甲\n",
+                    "source={source:?}, update={update:?}"
+                );
+                assert_eq!(
+                    reparsed.visual_char_range(&update.source, update.selection.clone()),
+                    2..2
+                );
+                assert!(
+                    update.source.contains(&format!("{break_marker}{newline}")),
+                    "{update:?}"
+                );
+                let runs = reparsed.runs_for(reparsed.text());
+                let style = runs
+                    .iter()
+                    .find(|run| run.range.contains(&0))
+                    .unwrap()
+                    .style;
+                assert_eq!(style.emphasis, matches!(delimiter, "*" | "_"));
+                assert_eq!(style.strong, matches!(delimiter, "**" | "__"));
+                assert_eq!(style.strikethrough, delimiter == "~~");
+            }
+        }
+    }
+}
+
+#[test]
 fn deleting_across_an_opener_preserves_leading_space_and_style() {
     for delimiter in ["*", "**", "_", "__", "~~"] {
         for (prefix, first, rest) in [("A", "a", "b"), ("甲", "乙", "丙🙂")] {
@@ -31,6 +68,64 @@ fn deleting_across_an_opener_preserves_leading_space_and_style() {
             assert_eq!(style.strong, matches!(delimiter, "**" | "__"));
             assert_eq!(style.strikethrough, delimiter == "~~");
         }
+    }
+}
+
+#[test]
+fn deleting_after_a_break_keeps_nested_closers_and_literal_backslashes() {
+    for (open, close) in [("***", "***"), ("__*", "*__"), ("~~**", "**~~")] {
+        for slashes in ["", "\\", "\\\\", "\\\\\\"] {
+            for suffix in ["", "."] {
+                let source = format!("{open}甲{slashes}\n🙂{close}{suffix}");
+                let projection = VisualProjection::from_markdown(&source);
+                let edited = projection.text().replace('🙂', "");
+                let caret = edited.chars().position(|ch| ch == '\n').unwrap() + 1;
+                let update = projection
+                    .apply_edit(&source, &edited, caret..caret)
+                    .unwrap();
+                let reparsed = VisualProjection::from_markdown(&update.source);
+                assert_eq!(
+                    reparsed.text(),
+                    edited,
+                    "source={source:?}, update={update:?}"
+                );
+                assert_eq!(
+                    reparsed.visual_char_range(&update.source, update.selection),
+                    caret..caret
+                );
+                let before = projection.runs_for(projection.text());
+                let after = reparsed.runs_for(reparsed.text());
+                assert_eq!(before[0].style, after[0].style, "source={source:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn deleting_after_a_break_preserves_container_prefixes_and_following_paragraphs() {
+    for source in [
+        "**甲\\\n🙂** tail",
+        "> **甲\\\n> 🙂**",
+        "- **甲\\\n  🙂**",
+        "A **甲\\\n🙂** Z",
+        "**甲\\\n🙂**\n\n尾",
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        let caret = projection.text().chars().position(|ch| ch == '🙂').unwrap();
+        let edited = projection.text().replace('🙂', "");
+        let update = projection
+            .apply_edit(source, &edited, caret..caret)
+            .unwrap();
+        let reparsed = VisualProjection::from_markdown(&update.source);
+        assert_eq!(
+            reparsed.text(),
+            edited,
+            "source={source:?}, update={update:?}"
+        );
+        assert_eq!(
+            reparsed.visual_char_range(&update.source, update.selection),
+            caret..caret
+        );
     }
 }
 
