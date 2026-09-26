@@ -1387,3 +1387,110 @@ fn line_end_input_preserves_hidden_whitespace_and_break_syntax() {
         }
     }
 }
+
+#[test]
+fn typed_line_end_whitespace_remains_visible_and_keeps_existing_breaks() {
+    for newline in ["\n", "\r\n", "\r"] {
+        for padding in ["", " ", "\t", "  ", "\\"] {
+            for replacement in [" ", "  ", "\t", " \t ", "新🙂 ", "新🙂\t "] {
+                let source = format!("甲🙂{padding}{newline}尾");
+                let passive = VisualProjection::from_markdown(&source);
+                let selection = passive.source_char_range(&source, 2..2);
+                let projection =
+                    VisualProjection::from_markdown_with_selection(&source, Some(selection));
+                let caret = 2 + replacement.chars().count();
+                let expected = format!("甲🙂{replacement}\n尾");
+                let update = projection
+                    .apply_edit(&source, &expected, caret..caret)
+                    .unwrap();
+                let reparsed = VisualProjection::from_markdown(&update.source);
+                assert_eq!(
+                    reparsed.text(),
+                    expected,
+                    "{source:?}, {replacement:?}: {update:?}"
+                );
+                let breaks = |text: &str| {
+                    pulldown_cmark::Parser::new(text)
+                        .filter_map(|event| match event {
+                            pulldown_cmark::Event::SoftBreak => Some(false),
+                            pulldown_cmark::Event::HardBreak => Some(true),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(breaks(&source), breaks(&update.source));
+                assert!(
+                    update.source.ends_with(&format!("{padding}{newline}尾")),
+                    "{update:?}"
+                );
+                assert_eq!(
+                    reparsed.visual_char_range(&update.source, update.selection.clone()),
+                    caret..caret
+                );
+                assert_all_caret_boundaries_are_ordered(&update.source, &reparsed);
+                let selected = projection.apply_edit(&source, &expected, 2..caret).unwrap();
+                assert_eq!(
+                    VisualProjection::from_markdown(&selected.source)
+                        .visual_char_range(&selected.source, selected.selection),
+                    2..caret
+                );
+                let active = VisualProjection::from_markdown_with_selection(
+                    &update.source,
+                    Some(update.selection),
+                );
+                let continued = active
+                    .apply_edit(
+                        &update.source,
+                        &format!("甲🙂{replacement}后\n尾"),
+                        caret + 1..caret + 1,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    VisualProjection::from_markdown(&continued.source).text(),
+                    format!("甲🙂{replacement}后\n尾")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn partial_entity_line_end_whitespace_keeps_surviving_text_and_styles() {
+    for (entity, first) in [("&fjlig;", "f"), ("&NotEqualTilde;", "≂")] {
+        for newline in ["\n", "\r\n", "\r"] {
+            for padding in ["", " ", "\t", "  ", "\\"] {
+                for delimiter in ["", "*", "**"] {
+                    for replacement in [" ", "\t", "新🙂 \t"] {
+                        let source =
+                            format!("甲 {delimiter}{entity}{delimiter}{padding}{newline}尾");
+                        let projection = VisualProjection::from_markdown(&source);
+                        let expected = format!("甲 {first}{replacement}\n尾");
+                        let caret = 3 + replacement.chars().count();
+                        for selection in [caret..caret, 3..caret] {
+                            let update = projection
+                                .apply_edit(&source, &expected, selection.clone())
+                                .unwrap();
+                            let reparsed = VisualProjection::from_markdown(&update.source);
+                            assert_eq!(reparsed.text(), expected, "{source:?}: {update:?}");
+                            assert_eq!(
+                                reparsed.visual_char_range(&update.source, update.selection),
+                                selection,
+                                "{source:?}"
+                            );
+                            let styles = |p: &VisualProjection| {
+                                p.runs_for(p.text())
+                                    .into_iter()
+                                    .flat_map(|run| std::iter::repeat_n(run.style, run.range.len()))
+                                    .collect::<Vec<_>>()
+                            };
+                            assert_eq!(styles(&projection)[..3], styles(&reparsed)[..3]);
+                            assert_eq!(styles(&projection)[5..], styles(&reparsed)[caret + 1..]);
+                            assert!(update.source.ends_with(&format!("{padding}{newline}尾")));
+                            assert_all_caret_boundaries_are_ordered(&update.source, &reparsed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

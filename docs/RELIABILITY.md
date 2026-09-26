@@ -41,6 +41,7 @@
 | [缩进后的字面引用符号 #28](https://github.com/qinyin233/rupora/issues/28) | CI 原始 fuzz 工件、逐光标映射、Unicode 继续输入和历史；真实引用、列表及空尾行对照 |
 | [CR 换行的空引用尾行 #29](https://github.com/qinyin233/rupora/issues/29) | LF、CRLF、CR 及混合换行的文字、样式和逐光标映射；文件打开归一化路径对照 |
 | [行尾输入揭露隐藏空白 #30](https://github.com/qinyin233/rupora/issues/30) | 保留空白和软/硬换行的源码对照；App 输入、样式、光标、撤销重做和继续输入；表格分隔行与代码块对照 |
+| [行尾新输入空白消失 #31](https://github.com/qinyin233/rupora/issues/31) | 空格、Tab、混合文字及连续粘贴；实体部分替换、三种换行、软/硬换行、样式、选区与历史，覆盖文末及代码块对照 |
 
 ## 证据分层
 

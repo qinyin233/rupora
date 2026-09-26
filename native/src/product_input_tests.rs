@@ -2771,3 +2771,153 @@ fn line_end_input_keeps_hidden_whitespace_and_history() {
         assert_inline_edit_input_history(source, caret..caret, "新🙂", false);
     }
 }
+
+#[test]
+fn typed_line_end_whitespace_keeps_text_styles_caret_and_history() {
+    for source in [
+        "甲🙂\n尾",
+        "甲🙂 \n尾",
+        "甲🙂\t\n尾",
+        "甲🙂  \n尾",
+        "甲🙂\\\n尾",
+        "**甲🙂** \n尾",
+        "*甲🙂 \n尾*",
+        "> 甲🙂 \n> 尾",
+        "- 甲🙂 \n  尾",
+        "```text\n甲🙂 \n尾\n```",
+        "甲🙂",
+    ] {
+        let projection = crate::wysiwyg::VisualProjection::from_markdown(source);
+        let caret = projection
+            .text()
+            .chars()
+            .position(|c| c == '\n')
+            .unwrap_or(projection.text().chars().count());
+        for replacement in [" ", "  ", "\t", " \t ", "新🙂 ", "新🙂\t ", "\u{a0}"] {
+            assert_inline_edit_input_history(source, caret..caret, replacement, false);
+        }
+    }
+}
+
+#[test]
+fn consecutive_line_end_spaces_pasted_tabs_and_text_keep_the_caret() {
+    let source = "甲🙂 \n尾";
+    let directory = tempfile::tempdir().unwrap();
+    let projection = crate::wysiwyg::VisualProjection::from_markdown(source);
+    let mut app = app_at(
+        directory.path(),
+        source,
+        projection.source_char_range(source, 2..2),
+    );
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    frame(&mut app, &ctx, true, vec![]);
+    let mut inserted = String::new();
+    for (text, paste) in [
+        (" ", false),
+        ("\t", true),
+        (" ", false),
+        ("新🙂 \t", true),
+        ("后", false),
+    ] {
+        inserted.push_str(text);
+        let event = if paste {
+            egui::Event::Paste(text.into())
+        } else {
+            egui::Event::Text(text.into())
+        };
+        frame(&mut app, &ctx, true, vec![event]);
+        let after = &app.session[0].content;
+        let active = crate::wysiwyg::VisualProjection::from_markdown(after);
+        assert_eq!(active.text(), format!("甲🙂{inserted}\n尾"), "{after:?}");
+        let caret = 2 + inserted.chars().count();
+        assert_eq!(
+            active.visual_char_range(after, app.active_selection(0)),
+            caret..caret
+        );
+        assert!(after.ends_with(" \n尾"));
+    }
+    let edited = app.session[0].content.to_string();
+    for _ in 0..8 {
+        app.undo_active();
+    }
+    assert_eq!(app.session[0].content, source);
+    for _ in 0..8 {
+        app.redo_active();
+    }
+    assert_eq!(app.session[0].content, edited);
+}
+
+#[test]
+fn partial_entity_line_end_whitespace_input_keeps_caret_styles_and_history() {
+    for delimiter in ["", "*", "**"] {
+        for padding in ["", " ", "  ", "\\"] {
+            for replacement in [" ", "\t", "新🙂 \t"] {
+                let source = format!("甲 {delimiter}&fjlig;{delimiter}{padding}\n尾");
+                let original = crate::wysiwyg::VisualProjection::from_markdown(&source);
+                let styles = |p: &crate::wysiwyg::VisualProjection| {
+                    p.runs_for(p.text())
+                        .into_iter()
+                        .flat_map(|run| std::iter::repeat_n(run.style, run.range.len()))
+                        .collect::<Vec<_>>()
+                };
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = app_at(directory.path(), &source, 0..0);
+                let ctx = Context::default();
+                install_fonts(&ctx);
+                frame(&mut app, &ctx, true, vec![]);
+                // Select only the second decoded character through real visual
+                // navigation: a source range cannot address half an entity.
+                for _ in 0..3 {
+                    frame(
+                        &mut app,
+                        &ctx,
+                        true,
+                        vec![key(Key::ArrowRight, egui::Modifiers::NONE)],
+                    );
+                }
+                frame(
+                    &mut app,
+                    &ctx,
+                    true,
+                    vec![key(Key::ArrowRight, egui::Modifiers::SHIFT)],
+                );
+                frame(
+                    &mut app,
+                    &ctx,
+                    true,
+                    vec![egui::Event::Text(replacement.into())],
+                );
+                let edited = app.session[0].content.to_string();
+                let projection = crate::wysiwyg::VisualProjection::from_markdown(&edited);
+                let caret = 3 + replacement.chars().count();
+                assert_eq!(
+                    projection.text(),
+                    format!("甲 f{replacement}\n尾"),
+                    "{source:?}, {edited:?}"
+                );
+                assert_eq!(
+                    projection.visual_char_range(&edited, app.active_selection(0)),
+                    caret..caret
+                );
+                assert_eq!(styles(&original)[..3], styles(&projection)[..3]);
+                assert_eq!(styles(&original)[5..], styles(&projection)[caret + 1..]);
+                assert!(edited.ends_with(&format!("{padding}\n尾")));
+                app.undo_active();
+                assert_eq!(app.session[0].content, source);
+                app.redo_active();
+                assert_eq!(app.session[0].content, edited);
+                frame(&mut app, &ctx, true, vec![egui::Event::Text("后".into())]);
+                let after = &app.session[0].content;
+                let projection = crate::wysiwyg::VisualProjection::from_markdown(after);
+                assert_eq!(projection.text(), format!("甲 f{replacement}后\n尾"));
+                assert_eq!(
+                    projection.visual_char_range(after, app.active_selection(0)),
+                    caret + 1..caret + 1
+                );
+                assert_eq!(styles(&original)[..3], styles(&projection)[..3]);
+                assert_eq!(styles(&original)[5..], styles(&projection)[caret + 2..]);
+            }
+        }
+    }
+}

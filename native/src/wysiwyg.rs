@@ -919,6 +919,8 @@ impl VisualProjection {
             || container_marker_insertion.is_some())
         .then(|| replacement.replace(' ', "&#32;"));
         inserted.push_str(encoded_marker_replacement.as_deref().unwrap_or(replacement));
+        // Decoded entity content precedes the replacement in the rewritten source.
+        let replacement_content_len = inserted.len();
         for range in &retained {
             inserted.push_str(&source[range.clone()]);
         }
@@ -1045,17 +1047,19 @@ impl VisualProjection {
             }
             delta += length as isize;
         }
-        let (repair_bytes, repair_text) = self.repair_inline_flanking_boundaries(
-            source,
-            edited,
-            &change.old,
-            source_start,
-            source_end,
-            delta,
-            &retained_flanking_closers,
-            &retained_flanking_openers,
-            &mut output,
-        );
+        let (repair_bytes, repair_text, mut whitespace_repair) = self
+            .repair_inline_flanking_boundaries(
+                source,
+                edited,
+                &change.old,
+                source_start,
+                source_end,
+                delta,
+                &retained_flanking_closers,
+                &retained_flanking_openers,
+                &inserted[..replacement_content_len],
+                &mut output,
+            );
         if !repair_bytes.is_empty() {
             // An escape belongs to the following visible character. A caret
             // on its boundary stays before the escape, not inside `\_`.
@@ -1080,12 +1084,16 @@ impl VisualProjection {
                     .filter(|repair| **repair <= source_start)
                     .count()
                     * repair_text.len();
-            if let Some((position, count)) = self.repair_collapsed_structural_space(
-                edited,
-                &change.old,
-                adjusted_source_start,
-                &mut output,
-            ) {
+            whitespace_repair = whitespace_repair.or_else(|| {
+                self.repair_collapsed_structural_space(
+                    edited,
+                    &change.old,
+                    adjusted_source_start,
+                    &inserted[..replacement_content_len],
+                    &mut output,
+                )
+            });
+            if let Some((position, count)) = whitespace_repair {
                 for caret in [&mut start_byte, &mut end_byte] {
                     if *caret > position {
                         *caret += (*caret - position).min(count) * ("&#32;".len() - 1);
@@ -1119,7 +1127,10 @@ impl VisualProjection {
             }
         }
 
-        if !unwrapped_inline.is_empty() || line_break_boundary.is_some() {
+        if !unwrapped_inline.is_empty()
+            || line_break_boundary.is_some()
+            || whitespace_repair.is_some()
+        {
             // Common-prefix/suffix shrinking can place a requested caret in
             // preserved text outside the minimal edit. Its old source offset
             // no longer applies after unwrapping/re-encoding that text or
@@ -1229,6 +1240,7 @@ impl VisualProjection {
         edited_visual: &str,
         changed_visual: &Range<usize>,
         source_start: usize,
+        replacement: &str,
         output: &mut String,
     ) -> Option<(usize, usize)> {
         let at_list_prefix_end = self
@@ -1244,12 +1256,39 @@ impl VisualProjection {
         let at_heading_content_start = self.runs.iter().any(|run| {
             run.style.heading > 0 && !run.style.marker && run.range.start == changed_visual.start
         });
-        if !(at_list_prefix_end || in_table_cell || at_heading_content_start) {
+        let whitespace_start = replacement.trim_end_matches([' ', '\t']).len();
+        let at_line_end = changed_visual.end == self.char_count()
+            || self.text.chars().nth(changed_visual.end) == Some('\n');
+        let line_end_whitespace = at_line_end && whitespace_start < replacement.len();
+        if !(at_list_prefix_end || in_table_cell || at_heading_content_start || line_end_whitespace)
+        {
             return None;
         }
         let actual = Self::from_markdown_with_context(output, None, self.references.clone());
         if actual.text() == edited_visual {
             return None;
+        }
+        if line_end_whitespace {
+            let whitespace = &replacement[whitespace_start..];
+            let position = source_start + whitespace_start;
+            let end = position + whitespace.len();
+            if output.get(position..end) == Some(whitespace) {
+                let mut candidate = output.clone();
+                // Both entities occupy five bytes, so the shared caret
+                // adjustment in the caller also applies to literal tabs.
+                let encoded = whitespace
+                    .bytes()
+                    .map(|byte| if byte == b' ' { "&#32;" } else { "&#09;" })
+                    .collect::<String>();
+                candidate.replace_range(position..end, &encoded);
+                if Self::from_markdown_with_context(&candidate, None, self.references.clone())
+                    .text()
+                    == edited_visual
+                {
+                    *output = candidate;
+                    return Some((position, whitespace.len()));
+                }
+            }
         }
         let missing = edited_visual
             .chars()
@@ -1296,8 +1335,9 @@ impl VisualProjection {
         delta: isize,
         retained_flanking_closers: &[(usize, usize)],
         retained_flanking_openers: &[(usize, usize)],
+        replacement: &str,
         output: &mut String,
-    ) -> (Vec<usize>, &'static str) {
+    ) -> (Vec<usize>, &'static str, Option<(usize, usize)>) {
         const REPAIR: &str = "<!---->";
         let wrapper = self
             .inline_wrappers
@@ -1559,7 +1599,7 @@ impl VisualProjection {
             candidates.extend(combined);
         }
         if candidates.is_empty() && literal_underscores.is_empty() {
-            return (Vec::new(), REPAIR);
+            return (Vec::new(), REPAIR, None);
         }
         preserve_surviving_styles |= candidates.len() > paired_candidates_start;
         let matches_edit = |candidate: &str| {
@@ -1578,8 +1618,32 @@ impl VisualProjection {
                     .eq(actual.styles_in_visual_range(suffix_start..actual.char_count()))
         };
         if matches_edit(output) {
-            return (Vec::new(), REPAIR);
+            return (Vec::new(), REPAIR, None);
         }
+        let repair_candidate_whitespace =
+            |candidate: &mut String, positions: &[usize], syntax: &str| {
+                // A single input can invalidate an adjacent delimiter and
+                // lose its trailing whitespace. Validate both repairs together.
+                if !replacement.ends_with([' ', '\t'])
+                    || !(changed_visual.end == self.char_count()
+                        || self.text.chars().nth(changed_visual.end) == Some('\n'))
+                {
+                    return None;
+                }
+                let adjusted_start = source_start
+                    + positions
+                        .iter()
+                        .filter(|position| **position <= source_start)
+                        .count()
+                        * syntax.len();
+                self.repair_collapsed_structural_space(
+                    edited_visual,
+                    changed_visual,
+                    adjusted_start,
+                    replacement,
+                    candidate,
+                )
+            };
         if !literal_underscores.is_empty() {
             let mut candidate = String::with_capacity(output.len() + literal_underscores.len());
             let mut copied = 0;
@@ -1589,9 +1653,11 @@ impl VisualProjection {
                 copied = position;
             }
             candidate.push_str(&output[copied..]);
+            let whitespace =
+                repair_candidate_whitespace(&mut candidate, &literal_underscores, "\\");
             if matches_edit(&candidate) {
                 *output = candidate;
-                return (literal_underscores, "\\");
+                return (literal_underscores, "\\", whitespace);
             }
         }
         for positions in candidates {
@@ -1599,12 +1665,13 @@ impl VisualProjection {
             for position in positions.iter().copied().rev() {
                 candidate.insert_str(position, REPAIR);
             }
+            let whitespace = repair_candidate_whitespace(&mut candidate, &positions, REPAIR);
             if matches_edit(&candidate) {
                 *output = candidate;
-                return (positions, REPAIR);
+                return (positions, REPAIR, whitespace);
             }
         }
-        (Vec::new(), REPAIR)
+        (Vec::new(), REPAIR, None)
     }
 
     fn styles_in_visual_range(

@@ -66,6 +66,8 @@ SEEDS = {
         "literal-indented-quote-cr": trace("甲🙂\r    >\t", [(0, 7, 7, "新")]),
         "empty-quote-tail-cr": trace("> 甲🙂\r> ", [(0, 7, 7, "尾")]),
         "soft-break-hidden-space-input": trace("甲🙂 \n尾", [(0, 2, 2, "新🙂"), (0, 4, 4, "后")]),
+        "line-end-whitespace-input": trace("**甲🙂** \n尾", [(0, 2, 2, "新🙂 \t"), (1, 6, 6, "后")]),
+        "partial-entity-line-end-space": trace("甲 &NotEqualTilde;\n尾", [(0, 3, 4, " "), (0, 4, 4, "后")]),
         "heading-leading-space-follow-up": trace(
             "## a  b", [(0, 0, 1, ""), (1, 0, 0, "X")]
         ),
