@@ -1264,6 +1264,7 @@ impl VisualProjection {
             .filter(|wrapper| inline_flanking_wrapper(original_source, &wrapper.source))
             .min_by_key(|wrapper| wrapper.source.end - wrapper.source.start);
         let mut candidates = Vec::new();
+        let mut preserve_surviving_styles = false;
         if let Some(wrapper) = wrapper {
             let start = wrapper.source.start;
             let end = shift_index(wrapper.source.end, delta);
@@ -1274,19 +1275,36 @@ impl VisualProjection {
                 && source_start == wrapper.content.start
                 && output
                     .get(source_start..)
-                    .is_some_and(|tail| tail.starts_with(' '))
+                    .and_then(|tail| tail.chars().next())
+                    .is_some_and(char::is_whitespace)
             {
                 // A leading replacement space can turn `* word*` into a
                 // list item, or make an emphasis delimiter literal. An
                 // invisible inline boundary lets the opening delimiter keep
                 // its Markdown role while preserving the visible space.
                 candidates.push(vec![source_start]);
+                if source_start < end && output.is_char_boundary(end) {
+                    // A nested opener beside whitespace can also change
+                    // which delimiter closes at the opposite edge.
+                    candidates.push(vec![source_start, end]);
+                    preserve_surviving_styles = true;
+                }
             }
             let closer_start = end.saturating_sub(wrapper.source.end - wrapper.content.end);
             if output.get(closer_start..end)
                 == original_source.get(wrapper.content.end..wrapper.source.end)
             {
                 candidates.push(vec![closer_start]);
+                if start < closer_start
+                    && output.is_char_boundary(start)
+                    && output[..closer_start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace)
+                {
+                    candidates.push(vec![start, closer_start]);
+                    preserve_surviving_styles = true;
+                }
             }
         }
         for &(start, end) in retained_flanking_closers {
@@ -1319,6 +1337,28 @@ impl VisualProjection {
                 // An opener left between a word and a retained space needs
                 // both sides isolated to remain an opening delimiter.
                 candidates.push(vec![start, end]);
+            }
+        }
+        for retained in [retained_flanking_openers, retained_flanking_closers] {
+            for (index, &(start, mut end)) in retained.iter().enumerate() {
+                if index > 0 && retained[index - 1].1 == start {
+                    continue;
+                }
+                let mut combined = false;
+                for &(next_start, next_end) in &retained[index + 1..] {
+                    if end != next_start {
+                        break;
+                    }
+                    end = next_end;
+                    combined = true;
+                }
+                if combined && output.is_char_boundary(start) && output.is_char_boundary(end) {
+                    // Nested delimiters such as `***` form one retained run.
+                    // Whitespace can invalidate the whole run, so also try
+                    // its outer edges without splitting the nested syntax.
+                    candidates.extend([vec![start], vec![end], vec![start, end]]);
+                    preserve_surviving_styles = true;
+                }
             }
         }
         let mut adjacent_flanking_boundaries = Vec::new();
@@ -1432,13 +1472,13 @@ impl VisualProjection {
         if candidates.is_empty() {
             return Vec::new();
         }
-        let preserve_nested_styles = candidates.len() > paired_candidates_start;
+        preserve_surviving_styles |= candidates.len() > paired_candidates_start;
         let matches_edit = |candidate: &str| {
             let actual = Self::from_markdown_with_context(candidate, None, self.references.clone());
             if actual.text() != edited_visual {
                 return false;
             }
-            if !preserve_nested_styles {
+            if !preserve_surviving_styles {
                 return true;
             }
             let suffix_start = actual.char_count() - (self.char_count() - changed_visual.end);

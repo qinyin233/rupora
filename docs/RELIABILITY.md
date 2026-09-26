@@ -34,6 +34,7 @@
 | [删除强调开头后暴露标记 #21](https://github.com/qinyin233/rupora/issues/21) | 保留空格和五种强调标记的样式；中文/emoji 光标、Backspace、撤销重做和继续输入 |
 | [强调结尾的换行编辑 #22](https://github.com/qinyin233/rupora/issues/22) | 五种标记、三种换行、软/硬换行及嵌套；引用、列表、后续段落和继续输入的样式 |
 | [嵌套强调边界编辑 #23](https://github.com/qinyin233/rupora/issues/23) | 开头/结尾删除与替换、未选中文字的样式、重复字符光标及产品历史；跨行内元素的全选区回放 |
+| [嵌套强调边界的空白编辑 #24](https://github.com/qinyin233/rupora/issues/24) | 空格、Tab、不换行空格和相邻混合标记；两端删除、样式保留、光标及继续输入 |
 
 ## 证据分层
 

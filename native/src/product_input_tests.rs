@@ -1262,51 +1262,104 @@ fn deleting_after_a_formatted_hard_break_preserves_input_and_history() {
     }
 }
 
+fn assert_nested_emphasis_input_history(
+    source: &str,
+    range: std::ops::Range<usize>,
+    replacement: &str,
+) {
+    let projection = crate::wysiwyg::VisualProjection::from_markdown(source);
+    let chars: Vec<_> = projection.text().chars().collect();
+    let mut expected = chars[..range.start].iter().collect::<String>()
+        + replacement
+        + &chars[range.end..].iter().collect::<String>();
+    let caret = range.start + replacement.chars().count();
+    let surviving_styles: Vec<_> = projection
+        .runs_for(projection.text())
+        .into_iter()
+        .flat_map(|run| (run.range).map(move |index| (index, run.style)))
+        .filter(|(index, _)| !range.contains(index))
+        .map(|(index, style)| {
+            let after = if index < range.start {
+                index
+            } else {
+                caret + index - range.end
+            };
+            (after, style)
+        })
+        .collect();
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = app_at(
+        directory.path(),
+        source,
+        projection.source_char_range(source, range),
+    );
+    let ctx = Context::default();
+    install_fonts(&ctx);
+    frame(&mut app, &ctx, true, vec![]);
+    let event = if replacement.is_empty() {
+        key(Key::Backspace, egui::Modifiers::NONE)
+    } else {
+        egui::Event::Text(replacement.into())
+    };
+    frame(&mut app, &ctx, true, vec![event]);
+    let edited = app.session[0].content.to_string();
+    let active = crate::wysiwyg::VisualProjection::from_markdown(&edited);
+    assert_eq!(active.text(), expected, "{edited:?}");
+    assert_eq!(
+        active.visual_char_range(&edited, app.active_selection(0)),
+        caret..caret
+    );
+    let runs = active.runs_for(active.text());
+    for &(index, style) in &surviving_styles {
+        assert_eq!(
+            runs.iter()
+                .find(|run| run.range.contains(&index))
+                .unwrap()
+                .style,
+            style
+        );
+    }
+    app.undo_active();
+    assert_eq!(app.session[0].content, source);
+    app.redo_active();
+    assert_eq!(app.session[0].content, edited);
+    frame(&mut app, &ctx, true, vec![egui::Event::Text("后".into())]);
+    let after = &app.session[0].content;
+    let active = crate::wysiwyg::VisualProjection::from_markdown(after);
+    expected.insert(crate::editing::char_to_byte(&expected, caret), '后');
+    assert_eq!(active.text(), expected);
+    assert_eq!(
+        active.visual_char_range(after, app.active_selection(0)),
+        caret + 1..caret + 1
+    );
+    let runs = active.runs_for(active.text());
+    for (index, style) in surviving_styles {
+        let index = if index < caret { index } else { index + 1 };
+        assert_eq!(
+            runs.iter()
+                .find(|run| run.range.contains(&index))
+                .unwrap()
+                .style,
+            style
+        );
+    }
+}
+
 #[test]
 fn nested_emphasis_edits_keep_rendering_caret_and_history() {
-    let source = "A __甲_🙂_乙__ Z";
     for (range, replacement) in [(1..3, ""), (4..6, ""), (1..4, "新🙂"), (3..6, "新🙂")] {
-        let projection = crate::wysiwyg::VisualProjection::from_markdown(source);
-        let chars: Vec<_> = projection.text().chars().collect();
-        let mut expected = chars[..range.start].iter().collect::<String>()
-            + replacement
-            + &chars[range.end..].iter().collect::<String>();
-        let caret = range.start + replacement.chars().count();
-        let directory = tempfile::tempdir().unwrap();
-        let mut app = app_at(
-            directory.path(),
-            source,
-            projection.source_char_range(source, range),
-        );
-        let ctx = Context::default();
-        install_fonts(&ctx);
-        frame(&mut app, &ctx, true, vec![]);
-        let event = if replacement.is_empty() {
-            key(Key::Backspace, egui::Modifiers::NONE)
-        } else {
-            egui::Event::Text(replacement.into())
-        };
-        frame(&mut app, &ctx, true, vec![event]);
-        let edited = app.session[0].content.to_string();
-        let active = crate::wysiwyg::VisualProjection::from_markdown(&edited);
-        assert_eq!(active.text(), expected, "{edited:?}");
-        assert_eq!(
-            active.visual_char_range(&edited, app.active_selection(0)),
-            caret..caret
-        );
-        app.undo_active();
-        assert_eq!(app.session[0].content, source);
-        app.redo_active();
-        assert_eq!(app.session[0].content, edited);
-        frame(&mut app, &ctx, true, vec![egui::Event::Text("后".into())]);
-        let after = &app.session[0].content;
-        let active = crate::wysiwyg::VisualProjection::from_markdown(after);
-        expected.insert(crate::editing::char_to_byte(&expected, caret), '后');
-        assert_eq!(active.text(), expected);
-        assert_eq!(
-            active.visual_char_range(after, app.active_selection(0)),
-            caret + 1..caret + 1
-        );
+        assert_nested_emphasis_input_history("A __甲_🙂_乙__ Z", range, replacement);
+    }
+}
+
+#[test]
+fn whitespace_at_nested_emphasis_boundaries_keeps_input_and_history() {
+    for (source, range, replacement) in [
+        ("__甲_🙂_乙__", 2..2, " "),
+        ("A ***甲 🙂*** Z", 1..3, ""),
+        ("A ***甲 🙂*** Z", 4..6, ""),
+    ] {
+        assert_nested_emphasis_input_history(source, range, replacement);
     }
 }
 
