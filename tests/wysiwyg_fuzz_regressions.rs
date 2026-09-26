@@ -1157,3 +1157,105 @@ fn selections_across_trailing_block_whitespace_keep_source_order() {
         }
     }
 }
+
+fn assert_all_caret_boundaries_are_ordered(source: &str, projection: &VisualProjection) {
+    let mut previous = 0;
+    for point in 0..=projection.text().chars().count() {
+        let mapped = projection.source_char_range(source, point..point);
+        assert_eq!(mapped.start, mapped.end);
+        assert!(mapped.end <= source.chars().count());
+        assert!(
+            mapped.start >= previous,
+            "source={source:?}, point={point}, previous={previous}, mapped={mapped:?}"
+        );
+        previous = mapped.start;
+    }
+}
+
+#[test]
+fn indented_literal_quote_markers_preserve_text_mapping_and_follow_up_edits() {
+    for first in ["x", "甲🙂"] {
+        for newline in ["\n", "\r\n", "\r"] {
+            for indent in ["\t", "    ", " \t", "\t\t"] {
+                for trailing in [" ", "\t", "\t\t\t\t"] {
+                    for with_tail in [false, true] {
+                        let tail = if with_tail {
+                            format!("{newline}尾")
+                        } else {
+                            String::new()
+                        };
+                        let source = format!("{first}{newline}{indent}>{trailing}{tail}");
+                        let expected = format!(
+                            "{first}\n{indent}>{}",
+                            if with_tail { "\n尾" } else { trailing }
+                        );
+                        let source_marker = source[..source.find('>').unwrap()].chars().count();
+                        for selection in [
+                            None,
+                            Some(0..0),
+                            Some(source_marker..source_marker),
+                            Some(source.chars().count()..source.chars().count()),
+                        ] {
+                            let projection =
+                                VisualProjection::from_markdown_with_selection(&source, selection);
+                            assert_eq!(projection.text(), expected, "{source:?}");
+                            assert_all_caret_boundaries_are_ordered(&source, &projection);
+                            let marker =
+                                projection.text().chars().position(|ch| ch == '>').unwrap();
+                            let runs = projection.runs_for(projection.text());
+                            assert_eq!(
+                                runs.iter()
+                                    .find(|run| run.range.contains(&marker))
+                                    .unwrap()
+                                    .style,
+                                rupora::wysiwyg::VisualStyle::default()
+                            );
+                            let mut edited = expected.clone();
+                            let marker_byte = edited.find('>').unwrap();
+                            edited.insert_str(marker_byte, "新🙂");
+                            let caret = marker + 2;
+                            let update = projection
+                                .apply_edit(&source, &edited, caret..caret)
+                                .unwrap();
+                            let reparsed = VisualProjection::from_markdown(&update.source);
+                            assert_eq!(reparsed.text(), edited, "{source:?}, {update:?}");
+                            assert_eq!(
+                                reparsed.visual_char_range(&update.source, update.selection),
+                                caret..caret
+                            );
+                            assert_all_caret_boundaries_are_ordered(&update.source, &reparsed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn genuine_quote_prefixes_survive_breaks_and_empty_trailing_lines() {
+    for (source, expected) in [
+        ("> x\n> ", "│ x\n│ "),
+        ("> x\n> \n", "│ x\n│ \n"),
+        ("> x\n> > ", "│ x\n│ │ "),
+        ("> x\\\n> y", "│ x\n│ y"),
+        ("> x\n> - y", "│ x\n│ • y"),
+        ("> x\n> > y", "│ x\n│ │ y"),
+    ] {
+        for newline in ["\n", "\r\n"] {
+            let source = source.replace('\n', newline);
+            let projection = VisualProjection::from_markdown(&source);
+            assert_eq!(projection.text(), expected, "{source:?}");
+            assert_all_caret_boundaries_are_ordered(&source, &projection);
+        }
+    }
+    for (source, expected) in [
+        ("> x\\\r> y", "│ x\n│ y"),
+        ("> x\r> - y", "│ x\n│ • y"),
+        ("> x\r> > y", "│ x\n│ │ y"),
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        assert_eq!(projection.text(), expected, "{source:?}");
+        assert_all_caret_boundaries_are_ordered(source, &projection);
+    }
+}

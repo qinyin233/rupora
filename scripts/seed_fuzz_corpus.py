@@ -62,6 +62,8 @@ SEEDS = {
             ">\t- a  b", [(0, 4, 5, ""), (1, 4, 4, "X")]
         ),
         "quote-tab-indented-code": trace(">\t\ta", [(0, 4, 4, "X")]),
+        "literal-indented-quote": trace("x\n\t> ", [(0, 4, 4, "新🙂")]),
+        "literal-indented-quote-cr": trace("甲🙂\r    >\t", [(0, 7, 7, "新")]),
         "heading-leading-space-follow-up": trace(
             "## a  b", [(0, 0, 1, ""), (1, 0, 0, "X")]
         ),

@@ -298,3 +298,15 @@ fn projection_trace_replays_fixed_seed_markdown_edit_sequences() {
         }
     }
 }
+
+#[test]
+fn projection_trace_replays_literal_quote_backward_mapping_crash() {
+    // GitHub Actions run 36232955012, artifact crash-37e28d0582adcce19928b853ee6301dc10c9a187.
+    let input = [
+        12, 120, 10, 9, 9, 42, 9, 9, 62, 9, 9, 9, 9, 120, 96, 42, 0, 0, 255, 255, 255, 253, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9, 9, 19, 9, 35, 42, 0, 1, 2, 116, 0, 0, 0,
+        130,
+    ];
+    assert!(projection_fuzz::run(&input).is_some());
+}

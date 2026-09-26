@@ -500,7 +500,15 @@ impl VisualProjection {
                 Event::SoftBreak | Event::HardBreak => {
                     let next_line_start = range.end;
                     builder.append_transformed(source, "\n", range, format.visual());
-                    builder.append_container_prefix_at_line_start(source, next_line_start, format);
+                    let next_content_start = events.peek().and_then(|(next, next_range)| {
+                        (!matches!(next, Event::End(_))).then_some(next_range.start)
+                    });
+                    builder.append_container_prefix_at_line_start(
+                        source,
+                        next_line_start,
+                        next_content_start,
+                        format,
+                    );
                 }
                 Event::Rule => {
                     if block_depth == 0 {
@@ -2670,6 +2678,7 @@ impl ProjectionBuilder {
         &mut self,
         source: &str,
         line_start: usize,
+        next_content_start: Option<usize>,
         format: FormatState,
     ) {
         if line_start >= source.len() || !self.text.ends_with('\n') {
@@ -2678,7 +2687,11 @@ impl ProjectionBuilder {
         let line_end = source[line_start..]
             .find('\n')
             .map_or(source.len(), |offset| line_start + offset);
-        let (consumed, _) = container_prefix(&source[line_start..line_end]);
+        // Prefixes cannot consume source owned by the next parser event. In a
+        // lazy paragraph continuation, an indented `>` may be literal text.
+        let prefix_end =
+            next_content_start.map_or(line_end, |start| start.clamp(line_start, line_end));
+        let (consumed, _) = container_prefix(&source[line_start..prefix_end]);
         if consumed > 0 {
             self.append_container_prefix_segments(
                 source,

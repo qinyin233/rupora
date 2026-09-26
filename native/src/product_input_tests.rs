@@ -2738,3 +2738,16 @@ fn product_input_newline_empty_code_removal_preserves_later_paragraphs() {
         assert!(!app.session[0].content.contains("```"));
     }
 }
+
+#[test]
+fn literal_indented_quote_input_preserves_text_caret_and_history() {
+    for indent in ["\t", "    ", " \t", "\t\t"] {
+        let source = format!("甲🙂\n{indent}> ");
+        let projection = crate::wysiwyg::VisualProjection::from_markdown(&source);
+        assert_eq!(projection.text(), source);
+        let marker = source.chars().position(|ch| ch == '>').unwrap();
+        for range in [marker..marker + 1, marker + 1..marker + 1] {
+            assert_inline_edit_input_history(&source, range, "新🙂", false);
+        }
+    }
+}
