@@ -36,6 +36,7 @@
 | [嵌套强调边界编辑 #23](https://github.com/qinyin233/rupora/issues/23) | 开头/结尾删除与替换、未选中文字的样式、重复字符光标及产品历史；跨行内元素的全选区回放 |
 | [嵌套强调边界的空白编辑 #24](https://github.com/qinyin233/rupora/issues/24) | 空格、Tab、不换行空格和相邻混合标记；两端删除、样式保留、光标及继续输入 |
 | [实体残余字符的样式 #25](https://github.com/qinyin233/rupora/issues/25) | 跨格式边界选择实体的一部分；保留样式、链接目标、光标及键盘选区的输入历史 |
+| [可见下划线旁的空白输入 #26](https://github.com/qinyin233/rupora/issues/26) | 两侧及连续下划线、嵌套格式和 Unicode；保留文字、样式、光标与输入历史，兼容直接输入 Markdown |
 
 ## 证据分层
 

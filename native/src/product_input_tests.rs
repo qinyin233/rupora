@@ -1364,6 +1364,22 @@ fn whitespace_at_nested_emphasis_boundaries_keeps_input_and_history() {
 }
 
 #[test]
+fn literal_underscore_whitespace_keeps_input_and_history() {
+    for source in [
+        "_a_b_",
+        "__a_b__",
+        "_甲_乙🙂_",
+        "__甲_乙🙂__",
+        "_**甲_乙🙂**_",
+        "**_甲_乙🙂_**",
+    ] {
+        for caret in [1, 2] {
+            assert_nested_emphasis_input_history(source, caret..caret, " ");
+        }
+    }
+}
+
+#[test]
 fn partial_entity_selection_keeps_formatting_caret_and_history() {
     for (source, selected_chars, expected) in [
         ("x **&fjlig;y**", 3, "jy"),

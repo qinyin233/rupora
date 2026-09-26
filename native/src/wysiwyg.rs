@@ -1003,7 +1003,7 @@ impl VisualProjection {
             }
             delta += length as isize;
         }
-        let repair_bytes = self.repair_inline_flanking_boundaries(
+        let (repair_bytes, repair_text) = self.repair_inline_flanking_boundaries(
             source,
             edited,
             &change.old,
@@ -1015,17 +1015,21 @@ impl VisualProjection {
             &mut output,
         );
         if !repair_bytes.is_empty() {
-            const REPAIR: &str = "<!---->";
+            // An escape belongs to the following visible character. A caret
+            // on its boundary stays before the escape, not inside `\_`.
+            let precedes_caret = |repair: usize, caret: usize| {
+                repair < caret || (repair == caret && repair_text != "\\")
+            };
             start_byte += repair_bytes
                 .iter()
-                .filter(|repair| start_byte >= **repair)
+                .filter(|repair| precedes_caret(**repair, start_byte))
                 .count()
-                * REPAIR.len();
+                * repair_text.len();
             end_byte += repair_bytes
                 .iter()
-                .filter(|repair| end_byte >= **repair)
+                .filter(|repair| precedes_caret(**repair, end_byte))
                 .count()
-                * REPAIR.len();
+                * repair_text.len();
         }
         if !removed_image_closer {
             let adjusted_source_start = source_start
@@ -1033,7 +1037,7 @@ impl VisualProjection {
                     .iter()
                     .filter(|repair| **repair <= source_start)
                     .count()
-                    * "<!---->".len();
+                    * repair_text.len();
             if let Some((position, count)) = self.repair_collapsed_structural_space(
                 edited,
                 &change.old,
@@ -1251,7 +1255,7 @@ impl VisualProjection {
         retained_flanking_closers: &[(usize, usize)],
         retained_flanking_openers: &[(usize, usize)],
         output: &mut String,
-    ) -> Vec<usize> {
+    ) -> (Vec<usize>, &'static str) {
         const REPAIR: &str = "<!---->";
         let wrapper = self
             .inline_wrappers
@@ -1264,8 +1268,50 @@ impl VisualProjection {
             })
             .filter(|wrapper| inline_flanking_wrapper(original_source, &wrapper.source))
             .min_by_key(|wrapper| wrapper.source.end - wrapper.source.start);
+        let mut literal_underscores = Vec::new();
+        if wrapper.is_some()
+            && changed_visual.is_empty()
+            && source_start == source_end
+            && delta > 0
+            && output
+                .get(source_start..shift_index(source_end, delta))
+                .is_some_and(|inserted| {
+                    inserted
+                        .chars()
+                        .all(|ch| ch.is_whitespace() && !matches!(ch, '\r' | '\n'))
+                })
+        {
+            // Whitespace can make an old intraword underscore become an
+            // emphasis delimiter. Only preserve already-visible raw markers
+            // next to this insertion; newly typed Markdown keeps its role.
+            let byte = char_to_byte(&self.text, changed_visual.start);
+            let before = self.text[..byte]
+                .chars()
+                .rev()
+                .take_while(|&ch| ch == '_')
+                .count();
+            let after = self.text[byte..]
+                .chars()
+                .take_while(|&ch| ch == '_')
+                .count();
+            for index in changed_visual.start - before..changed_visual.end + after {
+                let start = self.source_boundaries[index];
+                let end = self.source_left_boundaries[index + 1];
+                if original_source.get(start..end) != Some("_") {
+                    continue;
+                }
+                let position = if start >= source_end {
+                    shift_index(start, delta)
+                } else {
+                    start
+                };
+                if output.as_bytes().get(position) == Some(&b'_') {
+                    literal_underscores.push(position);
+                }
+            }
+        }
         let mut candidates = Vec::new();
-        let mut preserve_surviving_styles = false;
+        let mut preserve_surviving_styles = !literal_underscores.is_empty();
         if let Some(wrapper) = wrapper {
             let start = wrapper.source.start;
             let end = shift_index(wrapper.source.end, delta);
@@ -1470,8 +1516,8 @@ impl VisualProjection {
                 .collect();
             candidates.extend(combined);
         }
-        if candidates.is_empty() {
-            return Vec::new();
+        if candidates.is_empty() && literal_underscores.is_empty() {
+            return (Vec::new(), REPAIR);
         }
         preserve_surviving_styles |= candidates.len() > paired_candidates_start;
         let matches_edit = |candidate: &str| {
@@ -1490,7 +1536,21 @@ impl VisualProjection {
                     .eq(actual.styles_in_visual_range(suffix_start..actual.char_count()))
         };
         if matches_edit(output) {
-            return Vec::new();
+            return (Vec::new(), REPAIR);
+        }
+        if !literal_underscores.is_empty() {
+            let mut candidate = String::with_capacity(output.len() + literal_underscores.len());
+            let mut copied = 0;
+            for &position in &literal_underscores {
+                candidate.push_str(&output[copied..position]);
+                candidate.push('\\');
+                copied = position;
+            }
+            candidate.push_str(&output[copied..]);
+            if matches_edit(&candidate) {
+                *output = candidate;
+                return (literal_underscores, "\\");
+            }
         }
         for positions in candidates {
             let mut candidate = output.clone();
@@ -1499,10 +1559,10 @@ impl VisualProjection {
             }
             if matches_edit(&candidate) {
                 *output = candidate;
-                return positions;
+                return (positions, REPAIR);
             }
         }
-        Vec::new()
+        (Vec::new(), REPAIR)
     }
 
     fn styles_in_visual_range(
