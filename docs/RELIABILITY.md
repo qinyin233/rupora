@@ -30,6 +30,7 @@
 | [真实输入法及最终安装包 #6](https://github.com/qinyin233/rupora/issues/6) | 系统 IME 和实际安装/解包产物，记录 OS、架构、版本、资产哈希 |
 | [进程中断后的保存与恢复 #7](https://github.com/qinyin233/rupora/issues/7) | 可控子进程终止；与真实断电、设备故障的证据明确区分 |
 | [并发进程启动时的恢复锁 #19](https://github.com/qinyin233/rupora/issues/19) | 文档关闭时显式解锁；重复句柄回归及 Linux 并行进程中断复测 |
+| [主实例关闭后的锁释放 #20](https://github.com/qinyin233/rupora/issues/20) | 保留旧描述符时立即接管主实例；排队请求保留及新所有者排他性 |
 
 ## 证据分层
 

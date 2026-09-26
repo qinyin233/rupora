@@ -27,7 +27,7 @@ pub enum InstanceRole {
 
 #[derive(Debug)]
 pub struct InstanceCoordinator {
-    _lock: File,
+    lock: File,
     inbox_path: PathBuf,
     last_poll: Instant,
 }
@@ -85,7 +85,7 @@ impl InstanceCoordinator {
 
         match lock.try_lock_exclusive() {
             Ok(()) => Ok(InstanceRole::Primary(Self {
-                _lock: lock,
+                lock,
                 inbox_path,
                 last_poll: Instant::now() - POLL_INTERVAL,
             })),
@@ -155,6 +155,19 @@ impl InstanceCoordinator {
             );
         }
         Ok(found_request.then_some(OpenRequest { paths }))
+    }
+}
+
+impl Drop for InstanceCoordinator {
+    fn drop(&mut self) {
+        // CLOEXEC does not prevent a concurrent Unix child from retaining the
+        // lock between fork and exec. End primary ownership before closing our
+        // descriptor so new launches cannot forward to a stopped coordinator.
+        while let Err(error) = FileExt::unlock(&self.lock) {
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
     }
 }
 
@@ -329,6 +342,43 @@ fn absolute_forwarded_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_primary_releases_lock_while_a_duplicate_handle_survives() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = match InstanceCoordinator::acquire_at(directory.path(), &[]).unwrap() {
+            InstanceRole::Primary(primary) => primary,
+            InstanceRole::Secondary => panic!("first instance must be primary"),
+        };
+        // Keep the open file description alive as a concurrently spawned child
+        // can do between fork and exec, without a scheduling-dependent test.
+        let inherited = primary.lock.try_clone().unwrap();
+        let pending = directory.path().join("queued.md");
+        assert!(matches!(
+            InstanceCoordinator::acquire_at(directory.path(), std::slice::from_ref(&pending))
+                .unwrap(),
+            InstanceRole::Secondary
+        ));
+        drop(primary);
+        let replacement = match InstanceCoordinator::acquire_at(directory.path(), &[]).unwrap() {
+            InstanceRole::Primary(primary) => primary,
+            InstanceRole::Secondary => panic!("a released primary must not receive new requests"),
+        };
+        assert_eq!(replacement.read_inbox().unwrap().unwrap().paths, [pending]);
+        drop(inherited);
+        let next = directory.path().join("next.md");
+        assert!(matches!(
+            InstanceCoordinator::acquire_at(directory.path(), std::slice::from_ref(&next)).unwrap(),
+            InstanceRole::Secondary
+        ));
+        assert_eq!(replacement.read_inbox().unwrap().unwrap().paths, [next]);
+        drop(replacement);
+        assert!(matches!(
+            InstanceCoordinator::acquire_at(directory.path(), &[]).unwrap(),
+            InstanceRole::Primary(_)
+        ));
+    }
 
     #[test]
     fn forwards_files_to_the_primary_instance() {

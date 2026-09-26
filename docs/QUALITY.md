@@ -82,6 +82,12 @@ Unix 回归 `closing_document_releases_lock_while_a_duplicate_handle_survives` �
 回归通过 `File::try_clone` 固定这个窗口，避免依赖进程调度概率；进程终止矩阵仍覆盖真实子进程。
 可用 `cargo test --lib --locked process_termination` 重跑原矩阵；重复此命令时保留默认并行度。
 
+同一释放规则也适用于主实例协调器。Unix 回归
+`closing_primary_releases_lock_while_a_duplicate_handle_survives` 在旧描述符仍存活时
+释放主实例并重新取得主角色，同时验证原排队请求仍可读取、关闭旧副本不影响新主实例的
+排他性、后续启动继续正确转交请求。该回归在 `38f595a` 上失败；协调器显式解锁后通过。
+跟踪与跨平台验证记录见 [#20](https://github.com/qinyin233/rupora/issues/20)。
+
 ## 依赖策略
 
 `deny.toml` 检查 RustSec 公告、许可证、来源和重复依赖。重复版本保持警告级别，因为图形、
