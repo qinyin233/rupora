@@ -1321,6 +1321,7 @@ impl VisualProjection {
                 candidates.push(vec![start, end]);
             }
         }
+        let mut adjacent_flanking_boundaries = Vec::new();
         for adjacent in self
             .inline_wrappers
             .iter()
@@ -1332,6 +1333,7 @@ impl VisualProjection {
                 let opener = shift_index(adjacent.source.start, delta);
                 if output.is_char_boundary(opener) {
                     candidates.push(vec![opener]);
+                    adjacent_flanking_boundaries.push(opener);
                 }
             }
             if adjacent.visual.end == changed_visual.start
@@ -1341,6 +1343,7 @@ impl VisualProjection {
                 // Likewise, removing the separator after `_em_` can make
                 // the closer literal beside the next word.
                 candidates.push(vec![adjacent.source.end]);
+                adjacent_flanking_boundaries.push(adjacent.source.end);
             }
         }
         let joins_formatted_spans = !changed_visual.is_empty()
@@ -1358,12 +1361,94 @@ impl VisualProjection {
             // Keep both surrounding styles, with an invisible parsing boundary.
             candidates.push(vec![source_start]);
         }
+        let paired_candidates_start = candidates.len();
+        for wrapper in self
+            .inline_wrappers
+            .iter()
+            .filter(|wrapper| inline_flanking_wrapper(original_source, &wrapper.source))
+        {
+            if changed_visual.start <= wrapper.visual.start
+                && wrapper.visual.start < changed_visual.end
+                && changed_visual.end < wrapper.visual.end
+            {
+                let closer =
+                    shift_index(wrapper.content.end, delta)..shift_index(wrapper.source.end, delta);
+                if output.get(closer.clone())
+                    != original_source.get(wrapper.content.end..wrapper.source.end)
+                {
+                    continue;
+                }
+                for &(start, end) in retained_flanking_openers {
+                    if end < closer.start
+                        && output.is_char_boundary(start)
+                        && output.is_char_boundary(end)
+                    {
+                        // The new opener flank and a nested closer run can
+                        // both become ambiguous after the same edit.
+                        candidates.extend([
+                            vec![start, closer.start],
+                            vec![end, closer.start],
+                            vec![start, end, closer.start],
+                        ]);
+                    }
+                }
+            } else if wrapper.visual.start < changed_visual.start
+                && changed_visual.start < wrapper.visual.end
+                && wrapper.visual.end <= changed_visual.end
+            {
+                let opener = wrapper.source.start..wrapper.content.start;
+                if output.get(opener.clone()) != original_source.get(opener.clone()) {
+                    continue;
+                }
+                for &(start, end) in retained_flanking_closers {
+                    if opener.end < start
+                        && output.is_char_boundary(start)
+                        && output.is_char_boundary(end)
+                    {
+                        candidates.extend([
+                            vec![opener.end, end],
+                            vec![opener.end, start],
+                            vec![opener.end, start, end],
+                        ]);
+                    }
+                }
+            }
+        }
+        if !adjacent_flanking_boundaries.is_empty() {
+            let combined: Vec<_> = candidates[paired_candidates_start..]
+                .iter()
+                .map(|positions| {
+                    // The same replacement can also change the flank of an
+                    // untouched child span bordering the edited text.
+                    let mut positions = positions.clone();
+                    positions.extend_from_slice(&adjacent_flanking_boundaries);
+                    positions.sort_unstable();
+                    positions.dedup();
+                    positions
+                })
+                .collect();
+            candidates.extend(combined);
+        }
         if candidates.is_empty() {
             return Vec::new();
         }
-        if Self::from_markdown_with_context(output, None, self.references.clone()).text()
-            == edited_visual
-        {
+        let preserve_nested_styles = candidates.len() > paired_candidates_start;
+        let matches_edit = |candidate: &str| {
+            let actual = Self::from_markdown_with_context(candidate, None, self.references.clone());
+            if actual.text() != edited_visual {
+                return false;
+            }
+            if !preserve_nested_styles {
+                return true;
+            }
+            let suffix_start = actual.char_count() - (self.char_count() - changed_visual.end);
+            self.styles_in_visual_range(0..changed_visual.start)
+                .eq(actual.styles_in_visual_range(0..changed_visual.start))
+                && self
+                    .styles_in_visual_range(changed_visual.end..self.char_count())
+                    .eq(actual.styles_in_visual_range(suffix_start..actual.char_count()))
+        };
+        if matches_edit(output) {
             return Vec::new();
         }
         for positions in candidates {
@@ -1371,14 +1456,23 @@ impl VisualProjection {
             for position in positions.iter().copied().rev() {
                 candidate.insert_str(position, REPAIR);
             }
-            if Self::from_markdown_with_context(&candidate, None, self.references.clone()).text()
-                == edited_visual
-            {
+            if matches_edit(&candidate) {
                 *output = candidate;
                 return positions;
             }
         }
         Vec::new()
+    }
+
+    fn styles_in_visual_range(
+        &self,
+        range: Range<usize>,
+    ) -> impl Iterator<Item = VisualStyle> + '_ {
+        self.runs.iter().flat_map(move |run| {
+            let start = run.range.start.max(range.start);
+            let end = run.range.end.min(range.end);
+            std::iter::repeat_n(run.style, end.saturating_sub(start))
+        })
     }
 
     pub fn runs_for(&self, edited: &str) -> Vec<VisualRun> {

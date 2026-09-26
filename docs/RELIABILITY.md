@@ -33,6 +33,7 @@
 | [主实例关闭后的锁释放 #20](https://github.com/qinyin233/rupora/issues/20) | 保留旧描述符时立即接管主实例；排队请求保留及新所有者排他性 |
 | [删除强调开头后暴露标记 #21](https://github.com/qinyin233/rupora/issues/21) | 保留空格和五种强调标记的样式；中文/emoji 光标、Backspace、撤销重做和继续输入 |
 | [强调结尾的换行编辑 #22](https://github.com/qinyin233/rupora/issues/22) | 五种标记、三种换行、软/硬换行及嵌套；引用、列表、后续段落和继续输入的样式 |
+| [嵌套强调边界编辑 #23](https://github.com/qinyin233/rupora/issues/23) | 开头/结尾删除与替换、未选中文字的样式、重复字符光标及产品历史；跨行内元素的全选区回放 |
 
 ## 证据分层
 

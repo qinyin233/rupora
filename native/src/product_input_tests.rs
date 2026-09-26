@@ -1263,6 +1263,54 @@ fn deleting_after_a_formatted_hard_break_preserves_input_and_history() {
 }
 
 #[test]
+fn nested_emphasis_edits_keep_rendering_caret_and_history() {
+    let source = "A __甲_🙂_乙__ Z";
+    for (range, replacement) in [(1..3, ""), (4..6, ""), (1..4, "新🙂"), (3..6, "新🙂")] {
+        let projection = crate::wysiwyg::VisualProjection::from_markdown(source);
+        let chars: Vec<_> = projection.text().chars().collect();
+        let mut expected = chars[..range.start].iter().collect::<String>()
+            + replacement
+            + &chars[range.end..].iter().collect::<String>();
+        let caret = range.start + replacement.chars().count();
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_at(
+            directory.path(),
+            source,
+            projection.source_char_range(source, range),
+        );
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        frame(&mut app, &ctx, true, vec![]);
+        let event = if replacement.is_empty() {
+            key(Key::Backspace, egui::Modifiers::NONE)
+        } else {
+            egui::Event::Text(replacement.into())
+        };
+        frame(&mut app, &ctx, true, vec![event]);
+        let edited = app.session[0].content.to_string();
+        let active = crate::wysiwyg::VisualProjection::from_markdown(&edited);
+        assert_eq!(active.text(), expected, "{edited:?}");
+        assert_eq!(
+            active.visual_char_range(&edited, app.active_selection(0)),
+            caret..caret
+        );
+        app.undo_active();
+        assert_eq!(app.session[0].content, source);
+        app.redo_active();
+        assert_eq!(app.session[0].content, edited);
+        frame(&mut app, &ctx, true, vec![egui::Event::Text("后".into())]);
+        let after = &app.session[0].content;
+        let active = crate::wysiwyg::VisualProjection::from_markdown(after);
+        expected.insert(crate::editing::char_to_byte(&expected, caret), '后');
+        assert_eq!(active.text(), expected);
+        assert_eq!(
+            active.visual_char_range(after, app.active_selection(0)),
+            caret + 1..caret + 1
+        );
+    }
+}
+
+#[test]
 fn ime_cancel_preserves_following_input_and_history() {
     for empty_preedit in [false, true] {
         for batched in [false, true] {

@@ -7,6 +7,60 @@ fn byte_at(text: &str, index: usize) -> usize {
 }
 
 #[test]
+fn selected_plain_inline_edits_round_trip_in_all_ranges() {
+    for source in [
+        "A **x&fjlig;y** Z",
+        "A [x&fjlig;y](url) Z",
+        "A ~~x&NotEqualTilde;y~~ Z",
+        "A <https://example.com?a=&amp;> Z",
+        "A *a **b** c* Z",
+        "~~a *b* c~~",
+        "A <span>中文🙂</span> Z",
+        "**a**\n**b**",
+        "**a\\\nb**",
+        "A [**x&fjlig;y**](url) Z",
+        "[a *b* c][]\n\n[a *b* c]: /url",
+        "A `x y` Z",
+        "A $x+y$ Z",
+        "A ***甲🙂乙*** Z",
+        "A __甲_🙂_乙__ Z",
+        "A &nvlt;甲**乙** Z",
+        "A &NotEqualTilde;&fjlig; Z",
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        let visual = projection.text();
+        let length = visual.chars().count();
+        for start in 0..=length {
+            for end in start..=length {
+                for replacement in ["新🙂", ""] {
+                    let mut edited = visual.to_owned();
+                    edited.replace_range(byte_at(visual, start)..byte_at(visual, end), replacement);
+                    if edited == visual {
+                        continue;
+                    }
+                    let caret = start + replacement.chars().count();
+                    let update = projection
+                        .apply_edit(source, &edited, caret..caret)
+                        .unwrap();
+                    let after = VisualProjection::from_markdown(&update.source);
+                    assert_eq!(
+                        after.text(),
+                        edited,
+                        "source={source:?}, range={start}..{end}, update={update:?}"
+                    );
+                    assert_eq!(
+                        after.visual_char_range(&update.source, update.selection),
+                        caret..caret,
+                        "source={source:?}, range={start}..{end}, output={:?}",
+                        update.source
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn short_edits_across_inline_styles_and_list_content_preserve_visible_text() {
     let sources = [
         "a *em* b",
