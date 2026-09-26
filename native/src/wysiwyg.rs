@@ -2704,7 +2704,7 @@ impl ProjectionBuilder {
     fn append_trailing_container_line(&mut self, source: &str) {
         let mut line_start = 0usize;
         let mut candidate = None;
-        for line in source.split_inclusive('\n') {
+        for line in source.split_inclusive(['\r', '\n']) {
             let content = line.trim_end_matches(['\r', '\n']);
             if !content.is_empty() {
                 candidate = Some((line_start, content));

@@ -1259,3 +1259,73 @@ fn genuine_quote_prefixes_survive_breaks_and_empty_trailing_lines() {
         assert_all_caret_boundaries_are_ordered(source, &projection);
     }
 }
+
+#[test]
+fn empty_quote_tails_preserve_text_styles_and_mapping_for_all_line_endings() {
+    for (source, expected) in [
+        ("> 甲🙂\n> ", "│ 甲🙂\n│ "),
+        ("> 甲🙂\n> > ", "│ 甲🙂\n│ │ "),
+        ("> 甲🙂\n> \n", "│ 甲🙂\n│ \n"),
+    ] {
+        let reference = VisualProjection::from_markdown(source);
+        assert_eq!(reference.text(), expected);
+        for newline in ["\n", "\r\n", "\r"] {
+            let source = source.replace('\n', newline);
+            for cursor in 0..=source.chars().count() {
+                let projection =
+                    VisualProjection::from_markdown_with_selection(&source, Some(cursor..cursor));
+                assert_eq!(projection.text(), expected, "{source:?}, cursor={cursor}");
+                assert_eq!(projection.runs_for(expected), reference.runs_for(expected));
+                assert_all_caret_boundaries_are_ordered(&source, &projection);
+            }
+        }
+    }
+
+    for source in [
+        "> 甲🙂\n>\t",
+        "> 甲🙂\n> >\t\n\n",
+        "> 甲🙂\n> \n> > \n",
+        "> 甲🙂\n> 乙",
+        "> 甲🙂\n> - 乙",
+        "甲🙂\n  ",
+        "甲🙂\n\t> ",
+        "甲🙂\n\n> ",
+        "> 甲🙂\n> \n\n",
+        "甲\n乙\n丙\n> ",
+    ] {
+        let reference = VisualProjection::from_markdown(source);
+        for endings in [
+            ["\r", "\r", "\r"],
+            ["\r\n", "\r\n", "\r\n"],
+            ["\r", "\r\n", "\n"],
+        ] {
+            let mut converted = String::new();
+            for (index, line) in source.split_inclusive('\n').enumerate() {
+                converted.push_str(line.strip_suffix('\n').unwrap_or(line));
+                if line.ends_with('\n') {
+                    converted.push_str(endings[index % endings.len()]);
+                }
+            }
+            let projection = VisualProjection::from_markdown(&converted);
+            assert_eq!(projection.text(), reference.text(), "{converted:?}");
+            assert_eq!(
+                projection.runs_for(projection.text()),
+                reference.runs_for(reference.text())
+            );
+            assert_all_caret_boundaries_are_ordered(&converted, &projection);
+        }
+    }
+}
+
+#[test]
+fn opening_cr_quote_tail_normalizes_before_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("quote.md");
+    std::fs::write(&path, "> 甲🙂\r> ").unwrap();
+    let document = rupora::document::Document::open(&path).unwrap();
+    assert_eq!(document.content, "> 甲🙂\n> ");
+    assert_eq!(
+        VisualProjection::from_markdown(&document.content).text(),
+        "│ 甲🙂\n│ "
+    );
+}

@@ -39,6 +39,7 @@
 | [可见下划线旁的空白输入 #26](https://github.com/qinyin233/rupora/issues/26) | 两侧及连续下划线、嵌套格式和 Unicode；保留文字、样式、光标与输入历史，兼容直接输入 Markdown |
 | [段首缩进的行内样式 #27](https://github.com/qinyin233/rupora/issues/27) | 全选区编辑的文字、样式与光标；缩进保留外层语义，覆盖标题、引用、换行、历史及继续输入 |
 | [缩进后的字面引用符号 #28](https://github.com/qinyin233/rupora/issues/28) | CI 原始 fuzz 工件、逐光标映射、Unicode 继续输入和历史；真实引用、列表及空尾行对照 |
+| [CR 换行的空引用尾行 #29](https://github.com/qinyin233/rupora/issues/29) | LF、CRLF、CR 及混合换行的文字、样式和逐光标映射；文件打开归一化路径对照 |
 
 ## 证据分层
 
