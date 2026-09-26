@@ -1329,3 +1329,61 @@ fn opening_cr_quote_tail_normalizes_before_projection() {
         "│ 甲🙂\n│ "
     );
 }
+
+#[test]
+fn line_end_input_preserves_hidden_whitespace_and_break_syntax() {
+    for newline in ["\n", "\r\n", "\r"] {
+        for padding in [
+            "", " ", "\t", " \t", "\t\t", "  ", "   ", "\t  ", "  \t", "\\",
+        ] {
+            for (prefix, suffix) in [
+                ("甲🙂", "尾"),
+                ("*甲🙂", "尾*"),
+                ("> 甲🙂", "> 尾"),
+                ("- 甲🙂", "  尾"),
+            ] {
+                let source = format!("{prefix}{padding}{newline}{suffix}");
+                let passive = VisualProjection::from_markdown(&source);
+                let caret = passive.text().chars().position(|c| c == '\n').unwrap();
+                let selection = passive.source_char_range(&source, caret..caret);
+                for anchor in [None, Some(selection)] {
+                    let projection =
+                        VisualProjection::from_markdown_with_selection(&source, anchor);
+                    let mut expected = projection.text().to_owned();
+                    expected.insert_str(expected.char_indices().nth(caret).unwrap().0, "新🙂");
+                    let update = projection
+                        .apply_edit(&source, &expected, caret + 2..caret + 2)
+                        .unwrap();
+                    assert_eq!(
+                        update.source,
+                        format!("{prefix}新🙂{padding}{newline}{suffix}"),
+                        "{source:?}"
+                    );
+                    let reparsed = VisualProjection::from_markdown(&update.source);
+                    assert_eq!(reparsed.text(), expected, "{source:?}");
+                    assert_eq!(
+                        reparsed.visual_char_range(&update.source, update.selection.clone()),
+                        caret + 2..caret + 2
+                    );
+                    assert_all_caret_boundaries_are_ordered(&update.source, &reparsed);
+                    let active = VisualProjection::from_markdown_with_selection(
+                        &update.source,
+                        Some(update.selection),
+                    );
+                    expected.insert(expected.char_indices().nth(caret + 2).unwrap().0, '后');
+                    let continued = active
+                        .apply_edit(&update.source, &expected, caret + 3..caret + 3)
+                        .unwrap();
+                    assert_eq!(
+                        continued.source,
+                        format!("{prefix}新🙂后{padding}{newline}{suffix}")
+                    );
+                    assert_eq!(
+                        VisualProjection::from_markdown(&continued.source).text(),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+}

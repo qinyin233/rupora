@@ -40,6 +40,7 @@
 | [段首缩进的行内样式 #27](https://github.com/qinyin233/rupora/issues/27) | 全选区编辑的文字、样式与光标；缩进保留外层语义，覆盖标题、引用、换行、历史及继续输入 |
 | [缩进后的字面引用符号 #28](https://github.com/qinyin233/rupora/issues/28) | CI 原始 fuzz 工件、逐光标映射、Unicode 继续输入和历史；真实引用、列表及空尾行对照 |
 | [CR 换行的空引用尾行 #29](https://github.com/qinyin233/rupora/issues/29) | LF、CRLF、CR 及混合换行的文字、样式和逐光标映射；文件打开归一化路径对照 |
+| [行尾输入揭露隐藏空白 #30](https://github.com/qinyin233/rupora/issues/30) | 保留空白和软/硬换行的源码对照；App 输入、样式、光标、撤销重做和继续输入；表格分隔行与代码块对照 |
 
 ## 证据分层
 

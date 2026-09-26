@@ -2751,3 +2751,23 @@ fn literal_indented_quote_input_preserves_text_caret_and_history() {
         }
     }
 }
+
+#[test]
+fn line_end_input_keeps_hidden_whitespace_and_history() {
+    for source in [
+        "甲🙂 \n尾",
+        "甲🙂\t\n尾",
+        "甲🙂 \t\n尾",
+        "甲🙂  \n尾",
+        "甲🙂\\\n尾",
+        "**甲🙂** \n尾",
+        "*甲🙂 \n尾*",
+        "> 甲🙂 \n> 尾",
+        "- 甲🙂 \n  尾",
+        "```text\n甲🙂 \n尾\n```",
+    ] {
+        let projection = crate::wysiwyg::VisualProjection::from_markdown(source);
+        let caret = projection.text().chars().position(|c| c == '\n').unwrap();
+        assert_inline_edit_input_history(source, caret..caret, "新🙂", false);
+    }
+}

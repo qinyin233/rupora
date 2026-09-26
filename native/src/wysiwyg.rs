@@ -732,6 +732,23 @@ impl VisualProjection {
                 source_end = left;
             }
         }
+        if insertion
+            && self.text.chars().nth(change.old.start) == Some('\n')
+            // Synthetic table spacers also render as newlines, but their
+            // insertion target is cell content rather than a source break.
+            && source[source_start..]
+                .trim_start_matches([' ', '\t'])
+                .starts_with(['\r', '\n'])
+        {
+            // Keep hidden line-end whitespace after the inserted text, without
+            // crossing an inline closer or consuming Markdown hard-break syntax.
+            let left = self.source_left_boundaries[change.old.start];
+            while source_start > left && matches!(source.as_bytes()[source_start - 1], b' ' | b'\t')
+            {
+                source_start -= 1;
+            }
+            source_end = source_start;
+        }
         let mut decoded_prefix = String::new();
         let mut decoded_suffix = String::new();
         for atomic in self
