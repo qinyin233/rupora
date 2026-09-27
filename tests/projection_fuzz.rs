@@ -2,6 +2,20 @@
 mod projection_fuzz;
 
 #[test]
+fn projection_trace_replays_selected_line_end_unicode_crash() {
+    // CI run 36243016213, artifact crash-4968fe8645f5f0da2e17c7558b6b59cb62aa4642.
+    let input = [
+        16, 42, 42, 231, 148, 178, 240, 159, 153, 130, 42, 42, 32, 10, 229, 176, 190, 0, 2, 2, 9,
+        230, 150, 176, 240, 159, 153, 130, 32, 251, 254, 6, 6, 3, 229, 144, 142,
+    ];
+    let (source, selection, steps) = projection_fuzz::run(&input).unwrap();
+    let projection = rupora::wysiwyg::VisualProjection::from_markdown(&source);
+    assert_eq!(steps, 2);
+    assert_eq!(projection.text(), "甲🙂新🙂 �后\n尾");
+    assert_eq!(projection.visual_char_range(&source, selection), 6..7);
+}
+
+#[test]
 fn projection_trace_replays_table_divider_cursor_reversal() {
     // GitHub Actions run 36096006716, libFuzzer artifact crash-5add8fe6a57da1ab0c815abd0b0a58c3aa65ccc0.
     let input = [

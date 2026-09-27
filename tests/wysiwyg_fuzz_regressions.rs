@@ -1,6 +1,70 @@
 use rupora::wysiwyg::VisualProjection;
 
 #[test]
+fn selected_unicode_insertion_precedes_hidden_line_end_whitespace() {
+    for newline in ["\n", "\r\n", "\r"] {
+        for padding in ["", " ", "\t", " \t", "  ", "\\"] {
+            for (prefix, suffix) in [("甲🙂", "尾"), ("**甲🙂**", "尾"), ("*甲🙂", "尾*")]
+            {
+                let source = format!("{prefix}{padding}{newline}{suffix}");
+                let projection = VisualProjection::from_markdown(&source);
+                for replacement in ["后", "🙂", "后🙂"] {
+                    let end = 2 + replacement.chars().count();
+                    let expected = format!("甲🙂{replacement}\n尾");
+                    for selection in [2..end, 2..2, end..end, 0..end] {
+                        let update = projection
+                            .apply_edit(&source, &expected, selection.clone())
+                            .unwrap();
+                        let reparsed = VisualProjection::from_markdown(&update.source);
+                        assert_eq!(reparsed.text(), expected, "{source:?}, {selection:?}");
+                        assert_eq!(
+                            reparsed.visual_char_range(&update.source, update.selection),
+                            selection
+                        );
+                        assert!(
+                            update
+                                .source
+                                .ends_with(&format!("{padding}{newline}{suffix}"))
+                        );
+                        assert_all_caret_boundaries_are_ordered(&update.source, &reparsed);
+                        assert_eq!(
+                            projection.runs_for(projection.text())[0].style,
+                            reparsed.runs_for(reparsed.text())[0].style
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_unicode_insertion_keeps_table_and_inline_boundaries() {
+    for source in [
+        "| 甲🙂 | b |\n| - | - |\n| c | d |",
+        "`甲🙂`",
+        "[甲🙂](u)",
+        "**甲🙂**",
+    ] {
+        let projection = VisualProjection::from_markdown(source);
+        let byte = projection.text().find("甲🙂").unwrap() + "甲🙂".len();
+        let caret = projection.text()[..byte].chars().count();
+        let mut expected = projection.text().to_owned();
+        expected.insert_str(byte, "后🙂");
+        let update = projection
+            .apply_edit(source, &expected, caret..caret + 2)
+            .unwrap();
+        let reparsed = VisualProjection::from_markdown(&update.source);
+        assert_eq!(reparsed.text(), expected, "{source:?}");
+        assert_eq!(
+            reparsed.visual_char_range(&update.source, update.selection),
+            caret..caret + 2
+        );
+        assert_all_caret_boundaries_are_ordered(&update.source, &reparsed);
+    }
+}
+
+#[test]
 fn deleting_the_last_formatted_character_after_a_break_keeps_the_break() {
     for delimiter in ["*", "**", "_", "__", "~~"] {
         for newline in ["\n", "\r\n", "\r"] {

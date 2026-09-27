@@ -1796,6 +1796,11 @@ impl VisualProjection {
         source_end: usize,
         delta: isize,
     ) -> usize {
+        if change.old.is_empty() && visual_index == change.new.start {
+            // The insertion target may precede hidden line-end padding or
+            // syntax. Its old visual boundary can now fall inside inserted UTF-8.
+            return source_start;
+        }
         if visual_index <= change.new.start {
             let old_byte = self.source_boundaries[visual_index.min(change.old.start)];
             return if source_start < source_end && (source_start..source_end).contains(&old_byte) {

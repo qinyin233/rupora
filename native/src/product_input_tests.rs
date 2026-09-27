@@ -1,6 +1,51 @@
 use super::*;
 
 #[test]
+fn selected_line_end_unicode_input_keeps_history_and_follow_up() {
+    for source in [
+        "甲🙂 \n尾",
+        "甲🙂\t\n尾",
+        "甲🙂  \n尾",
+        "**甲🙂** \n尾",
+        "*甲🙂 \n尾*",
+    ] {
+        let projection = crate::wysiwyg::VisualProjection::from_markdown(source);
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_at(
+            directory.path(),
+            source,
+            projection.source_char_range(source, 2..2),
+        );
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        frame(&mut app, &ctx, true, vec![]);
+        frame(
+            &mut app,
+            &ctx,
+            true,
+            vec![
+                egui::Event::Text("后🙂".into()),
+                key(Key::ArrowLeft, egui::Modifiers::SHIFT),
+                key(Key::ArrowLeft, egui::Modifiers::SHIFT),
+            ],
+        );
+        let edited = app.session[0].content.to_string();
+        let p = crate::wysiwyg::VisualProjection::from_markdown(&edited);
+        assert_eq!(p.text(), "甲🙂后🙂\n尾", "{source:?}");
+        assert_eq!(p.visual_char_range(&edited, app.active_selection(0)), 2..4);
+        app.undo_active();
+        assert_eq!(app.session[0].content, source);
+        app.redo_active();
+        assert_eq!(app.session[0].content, edited);
+        frame(&mut app, &ctx, true, vec![egui::Event::Text("新".into())]);
+        let after = &app.session[0].content;
+        let p = crate::wysiwyg::VisualProjection::from_markdown(after);
+        assert_eq!(p.text(), "甲🙂新\n尾");
+        assert_eq!(p.visual_char_range(after, app.active_selection(0)), 3..3);
+    }
+}
+
+#[test]
 fn source_ime_preedit_preserves_document_and_cancelled_selection() {
     for selection in [1..1, 1..3] {
         let directory = tempfile::tempdir().unwrap();
