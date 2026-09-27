@@ -145,12 +145,52 @@ Ctrl+S 后磁盘 SHA-256 仍为 `43248d6454f1804c9141cb59a6a620a478fdcb171270858
 SHA-256 为 `629a5d5913c3933f40f357ad9cf8b0906bff85cd61f0764f0d73dd1c50483708`。
 一次撤销并保存后，正文与哈希恢复上一段基线。已提交中文、emoji、换行均保留。
 
-这两条路径验证了返回编辑、保存和独立撤销，但本轮没有记录原生 Commit/Preedit
-事件，因此不把字面 z 直接归类为新缺陷，也不把完整 I8 标为通过。
+这两条包验收路径验证了返回编辑、保存和独立撤销，但包内没有原生 Commit/Preedit
+探针，不能仅据字面 z 归类为新缺陷。下节用同产品源码的独立诊断构建补充分类，
+仍不把完整 I8 标为通过。
 [先前的关闭事件诊断](native-acceptance-20260924.md#关闭确认时拼音提交的事件诊断)
 曾在分栏模式记录到正式 Commit；它解释此前相同现象，不能代替本轮写作模式的事件证据。
 本轮后半段写作视图的可访问树未返回正文节点，以上正文通过截图及保存文件核对，
 没有把空的可访问结果当作空文档。
+
+### 当前源码的写作模式事件诊断
+
+同一 Windows/微软拼音环境，在独立工作树基于 `0b57c41` 临时记录
+`raw_input_hook` 调度前的事件。产品源码与 `1696b07` 相同；唯一探针只对合成文件
+`focus-close-1696.md` 记录事件类型、字符数量、焦点及关闭状态，不记录正文内容。
+`cargo build --release --locked -j 1` 成功。实际诊断程序 SHA-256 为
+`6e986d8d4c3c21c0bd75e0c5e3ca9db926ef39dc562ca13d48fec77bbc849623`。
+此程序不是上述 NSIS 解包程序或发布资产，其结果仅用于事件分类。
+
+写作模式打开 `A🙂B`，在末尾逐键 z 后切到系统计算器，再返回。调度前日志为：
+
+```text
+time=106.8058175 focused=true  close=false body_chars=3 events=[Preedit(1)]
+time=114.3720321 focused=false close=false body_chars=3 events=[Focus(false), Preedit(0), Commit(1)]
+time=126.55996   focused=true  close=false body_chars=4 events=[Focus(true)]
+```
+
+随后正文为 `A🙂Bz`。诊断中断期间另一次失焦也交付了正式 Commit；恢复观察时
+正文为 `A🙂Bzz`，先撤销此次输入回到 `A🙂Bz`，没有把中断视作关闭测试。
+再按 z，确认候选可见后直接点击标题栏关闭，再选择“否”：
+
+```text
+time=485.4493479 focused=true close=false body_chars=4 events=[Preedit(1)]
+time=491.9357824 focused=true close=true  body_chars=4 events=[]
+time=511.6200674 focused=true close=false body_chars=4 events=[Focus(false), Preedit(0), Commit(1), Focus(true)]
+```
+
+返回后显示 `A🙂Bzz`，一次 Ctrl+Z 只移除本次 z，再次 Ctrl+Z 恢复 `A🙂B`。
+保存字节精确为 `41F09F998242`，SHA-256 为
+`dabeeb0b851f14d5cad4f9b871a03bb40b6dad9950aef774f7af7e7b0a518715`；随后正常退出，
+确认诊断窗口已消失。两条路径都是后端先交付正式 Commit，应用随后更新正文，
+没有证据支持丢弃该提交。此次未定位 Alt+F4 的底层按键消费位置。
+
+已有 `ime_commit_after_modal_focus_round_trip_is_one_undoable_edit` 回归重新运行通过，
+覆盖源码、分栏、写作的相同事件顺序、一次撤销/重做和继续输入；不替代原生确认框。
+探针已从工作树移除，产品源码未修改。原始日志和补丁留在本地
+`target/ime-focus-diagnostic-1696b07/`。共享 `target/release/rupora.exe` 是诊断构建，
+不可用作普通候选；上述已验证 NSIS 解包程序未被覆盖。
 
 ### 尚未覆盖
 
