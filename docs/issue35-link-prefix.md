@@ -82,3 +82,15 @@ Ctrl+Z、Ctrl+S 精确恢复原文及上文原始哈希；Ctrl+Y、Ctrl+S 恢复
 修复提交的 [push CI](https://github.com/qinyin233/rupora/actions/runs/36668027952) 和
 [手动 fuzz CI](https://github.com/qinyin233/rupora/actions/runs/36668049125) 已启动，
 最终结果仍待检查；普通 push 的 fuzz 跳过不算通过。
+
+## 后续输入覆盖
+
+追加的应用级回归分别向源码、写作、分屏交付真实 egui `Paste` 事件，确认粘贴 URL
+被解析为实际链接目标，而非 Ctrl+K 的占位地址；验证标签正文、链接范围、折叠光标，
+以及 Undo/Redo 的完整源码和选区。
+
+`tests/link_followup.rs` 从已创建链接的文档继续编辑，遍历包含文末在内的所有光标位置、
+全部连续选区，用中文/emoji、空格和删除替换，检查重新解析后的可见正文和光标。
+四组字面/转义前缀全部通过。此测试检查文字和光标，不宣称验证所有后续样式或目标 URL。
+两项针对性测试、格式检查和严格 all-target Clippy 通过；本次只增加测试，
+产品实现与上文已完整验证的 `2a734f2` 相同，不重复构建 release。
