@@ -52,5 +52,34 @@ Redo 精确恢复命令结果。HTML 导出、投影正文和逐字符样式共�
 - `cargo build --release --locked -j 1` 通过，耗时 4 分 02 秒；日志：`target/issue34-release.log`。
 - 提交后的 GitHub Actions 结果在 #34 跟踪，CI 尚未验完时保持问题开放。
 
-这些是源码及自动化验证。本问题尚没有新构建的真实桌面操作结果；完整原生矩阵仍由 #6 跟踪。
+上述是源码及自动化验证；补充的真实桌面操作见下节。完整原生矩阵仍由 #6 跟踪。
 公开 Release 和标签未改动。
+
+## Windows 原生复测（2026-09-30，UTC+8）
+
+使用 Computer Use 操作本地 release 构建，源码提交为
+`91dc4412dde5a8f5836c898909c757fa40658283`。系统为 Windows 11 家庭中文版
+10.0.22631 x86_64。程序位于 `target/acceptance-issue34-20260930/rupora.exe`，
+35,652,096 字节，Authenticode 为 NotSigned，SHA-256：
+
+`47e3ef1ce663acdfb329fd2aa0039319024474c08ec13623a1ca57a2c5b25f18`
+
+这是普通开发构建，不是安装包。上一轮窗口在开始时已不存在；没有代替用户处理旧窗口。
+新建 UTF-8 无 BOM 样例 `preceding-backslash.md`，初始源码为 `甲\🙂尾`。
+
+1. 写作模式点击正文，Ctrl+Home、两次 Right、Shift+Right，仅选中 `🙂`。
+2. Ctrl+B，Ctrl+S：选区保持，可见反斜杠仍为一个，中文邻居不变；
+   保存源码为 `甲\\<strong>🙂</strong>尾`。
+3. Ctrl+I，Ctrl+S：保存为 `甲\\<strong><em>🙂</em></strong>尾`，画面与选区保持一致。
+4. Ctrl+Z、Ctrl+S：保存源码恢复为步骤 2；再次 Ctrl+Z、Ctrl+S，
+   精确恢复原始 `甲\🙂尾`，SHA-256：
+   `fd9f7aae0639d8c3dbca6c1a56c3f6c87a036e426a6742cf2e42c4158deb0072`。
+5. 两次 Ctrl+Y、Ctrl+S：源码恢复步骤 3，SHA-256：
+   `8d0912a1950fc09688eb8c5a80074555306341c8f0b0697252606fca1df7fcd3`。
+6. 切换源码、分屏、写作视图，源码与可见正文一致，反斜杠和中文邻居未改变。
+7. 正常 Alt+F4，确认窗口消失；重启同一候选，已保存正文和格式仍正确，
+   文件哈希与步骤 5 相同。再次正常退出并确认窗口消失。
+
+画面证据位于本线程 Computer Use 输出：首轮窗口 1117596，重启窗口 10554292。
+这次使用普通快捷键，没有真实 IME 组合输入；视图切换不等于在另外两种模式重新执行
+输入矩阵。没有执行安装器、文件关联或强制终止恢复测试。
