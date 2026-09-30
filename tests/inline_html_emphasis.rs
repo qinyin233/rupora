@@ -131,6 +131,107 @@ fn fallback_formats_compose_and_toggle_without_changing_neighbors() {
 }
 
 #[test]
+fn emphasis_after_a_literal_backslash_preserves_visible_neighbors() {
+    for (original, selected) in [
+        ("x", 0..1),
+        ("\\\\x", 2..3),
+        ("\\x", 1..2),
+        ("甲\\x尾", 2..3),
+        ("\\\\\\x", 3..4),
+        ("\\\\\\\\x", 4..5),
+        ("甲\\🙂尾", 2..3),
+        ("\\甲\\尾", 1..3),
+        ("前\\甲🙂\\尾", 2..5),
+    ] {
+        for command in [MarkdownCommand::Bold, MarkdownCommand::Italic] {
+            let mut source = original.to_owned();
+            let next = apply_markdown_command(&mut source, selected.clone(), command);
+            let projection = VisualProjection::from_markdown(&source);
+            let before = VisualProjection::from_markdown(original);
+            let expected = before.visual_char_range(original, selected.clone());
+            assert_eq!(projection.text(), before.text(), "{source:?}");
+            assert_eq!(
+                projection.visual_char_range(&source, next.clone()),
+                expected
+            );
+            for run in projection.runs_for(projection.text()) {
+                for i in run.range {
+                    assert_eq!(
+                        run.style.strong,
+                        expected.contains(&i) && command == MarkdownCommand::Bold,
+                        "{original:?} => {source:?}"
+                    );
+                    assert_eq!(
+                        run.style.emphasis,
+                        expected.contains(&i) && command == MarkdownCommand::Italic,
+                        "{original:?} => {source:?}"
+                    );
+                }
+            }
+            let other = if command == MarkdownCommand::Bold {
+                MarkdownCommand::Italic
+            } else {
+                MarkdownCommand::Bold
+            };
+            let mut next = next;
+            for (toggle, strong, emphasis) in [
+                (other, true, true),
+                (
+                    command,
+                    other == MarkdownCommand::Bold,
+                    other == MarkdownCommand::Italic,
+                ),
+                (other, false, false),
+                (
+                    command,
+                    command == MarkdownCommand::Bold,
+                    command == MarkdownCommand::Italic,
+                ),
+                (command, false, false),
+            ] {
+                next = apply_markdown_command(&mut source, next, toggle);
+                let projection = VisualProjection::from_markdown(&source);
+                assert_eq!(projection.text(), before.text(), "{source:?}");
+                assert_eq!(
+                    projection.visual_char_range(&source, next.clone()),
+                    expected
+                );
+                for run in projection.runs_for(projection.text()) {
+                    for i in run.range {
+                        assert_eq!(
+                            run.style.strong,
+                            expected.contains(&i) && strong,
+                            "{source:?}"
+                        );
+                        assert_eq!(
+                            run.style.emphasis,
+                            expected.contains(&i) && emphasis,
+                            "{source:?}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                render_html_fragment(&source),
+                render_html_fragment(original)
+            );
+        }
+    }
+}
+
+#[test]
+fn preceding_backslash_repair_does_not_rewrite_code_or_partial_escapes() {
+    for (original, selected) in [("`\\x`", 2..3), ("\\!", 1..2), ("\\*", 1..2)] {
+        for command in [MarkdownCommand::Bold, MarkdownCommand::Italic] {
+            let mut source = original.to_owned();
+            let next = apply_markdown_command(&mut source, selected.clone(), command);
+            assert_eq!(source, original);
+            assert_eq!(next, selected);
+        }
+    }
+}
+
+#[test]
 fn literal_backslashes_can_be_formatted_beside_letters() {
     for (original, selected) in [
         ("\\a", 0..1),

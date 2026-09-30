@@ -391,13 +391,7 @@ fn toggle_emphasis(text: &mut String, selection: Range<usize>, marker: &str) -> 
     }
     // A source selection cutting through an existing delimiter is a syntax
     // edit, not a request to format its rendered body. Preserve its old toggle.
-    let cuts_escape = text[..selected.end]
-        .bytes()
-        .rev()
-        .take_while(|byte| *byte == b'\\')
-        .count()
-        % 2
-        == 1
+    let cuts_escape = has_odd_trailing_backslashes(&text[..selected.end])
         && text[selected.end..]
             .chars()
             .next()
@@ -434,17 +428,25 @@ fn toggle_emphasis(text: &mut String, selection: Range<usize>, marker: &str) -> 
     // A literal trailing backslash would escape the '<' in the closing tag.
     // Escape just that unmatched slash; CommonMark still displays the same
     // character, and the source selection includes its complete encoding.
-    let escape = text[start..end]
-        .bytes()
-        .rev()
-        .take_while(|byte| *byte == b'\\')
-        .count()
-        % 2;
+    let escape = usize::from(has_odd_trailing_backslashes(&text[start..end]));
     fallback.insert_str(end, close);
     if escape != 0 {
         fallback.insert(end, '\\');
     }
     fallback.insert_str(start, open);
+    // A preceding literal backslash would instead escape the opening '<'.
+    // Preserve it as an escaped backslash, without including that neighbor
+    // in the new format. A source selection inside an existing ASCII escape
+    // is a syntax edit and must not reinterpret that escape as visible text.
+    let preceding_escape = usize::from(
+        !text[start..end].starts_with(|ch: char| ch.is_ascii_punctuation())
+            && has_odd_trailing_backslashes(&text[..start]),
+    );
+    if preceding_escape != 0 {
+        fallback.insert(start, '\\');
+    }
+    let start = start + preceding_escape;
+    let end = end + preceding_escape;
     let syntax = start..end + escape + open.len() + close.len();
     if !crate::inline_format::spans(&fallback)
         .iter()
@@ -455,6 +457,10 @@ fn toggle_emphasis(text: &mut String, selection: Range<usize>, marker: &str) -> 
     let next = byte_range_to_char_range(&fallback, start + open.len()..end + escape + open.len());
     *text = fallback;
     next
+}
+
+fn has_odd_trailing_backslashes(text: &str) -> bool {
+    text.bytes().rev().take_while(|byte| *byte == b'\\').count() % 2 == 1
 }
 
 fn toggle_markdown_emphasis(

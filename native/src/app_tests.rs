@@ -536,41 +536,50 @@ fn italic_shortcut_preserves_bold_on_the_same_unicode_selection() {
 #[test]
 fn escaped_emphasis_shortcuts_restore_exact_source_on_undo() {
     for mode in [ViewMode::Hybrid, ViewMode::Edit, ViewMode::Split] {
-        let directory = tempfile::tempdir().unwrap();
-        let mut app = isolated_app(directory.path());
-        app.new_document();
-        app.state.view_mode = mode;
-        app.session[0].content = "甲\\尾".into();
-        app.session[0].update_after_edit();
-        app.queue_editor_selection(1..2);
-        let ctx = Context::default();
-        install_fonts(&ctx);
-        shortcut_editor_frame(&mut app, &ctx, vec![]);
-        let mut states = vec![app.session[0].content.clone()];
-        for key in [Key::B, Key::I] {
-            shortcut_editor_frame(&mut app, &ctx, vec![command_key(key)]);
-            drain_ordered_input(&mut app, &ctx);
-            let source = &app.session[0].content;
-            let projection = crate::wysiwyg::VisualProjection::from_markdown(source);
-            assert_eq!(projection.text(), "甲\\尾", "{mode:?}: {source}");
-            assert_eq!(
-                projection.visual_char_range(source, app.active_selection(0)),
-                1..2
-            );
-            let html = crate::markdown::render_html_fragment(source);
-            assert!(html.contains("<strong>"), "{mode:?}: {html}");
-            if key == Key::I {
-                assert!(html.contains("<em>"), "{mode:?}: {html}");
+        for (original, selection) in [
+            ("甲\\尾", 1..2),
+            ("\\x", 1..2),
+            ("甲\\🙂尾", 2..3),
+            ("\\甲\\尾", 1..3),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = isolated_app(directory.path());
+            app.new_document();
+            app.state.view_mode = mode;
+            app.session[0].content = original.into();
+            app.session[0].update_after_edit();
+            app.queue_editor_selection(selection.clone());
+            let ctx = Context::default();
+            install_fonts(&ctx);
+            shortcut_editor_frame(&mut app, &ctx, vec![]);
+            let mut states = vec![(app.session[0].content.clone(), app.active_selection(0))];
+            for key in [Key::B, Key::I] {
+                shortcut_editor_frame(&mut app, &ctx, vec![command_key(key)]);
+                drain_ordered_input(&mut app, &ctx);
+                let source = &app.session[0].content;
+                let projection = crate::wysiwyg::VisualProjection::from_markdown(source);
+                assert_eq!(projection.text(), original, "{mode:?}: {source}");
+                assert_eq!(
+                    projection.visual_char_range(source, app.active_selection(0)),
+                    selection
+                );
+                let html = crate::markdown::render_html_fragment(source);
+                assert!(html.contains("<strong>"), "{mode:?}: {html}");
+                if key == Key::I {
+                    assert!(html.contains("<em>"), "{mode:?}: {html}");
+                }
+                states.push((source.clone(), app.active_selection(0)));
             }
-            states.push(source.clone());
-        }
-        for expected in states[..2].iter().rev() {
-            app.undo_active();
-            assert_eq!(&app.session[0].content, expected, "{mode:?}");
-        }
-        for expected in &states[1..] {
-            app.redo_active();
-            assert_eq!(&app.session[0].content, expected, "{mode:?}");
+            for (expected, selected) in states[..2].iter().rev() {
+                app.undo_active();
+                assert_eq!(&app.session[0].content, expected, "{mode:?}");
+                assert_eq!(&app.active_selection(0), selected, "{mode:?}");
+            }
+            for (expected, selected) in &states[1..] {
+                app.redo_active();
+                assert_eq!(&app.session[0].content, expected, "{mode:?}");
+                assert_eq!(&app.active_selection(0), selected, "{mode:?}");
+            }
         }
     }
 }

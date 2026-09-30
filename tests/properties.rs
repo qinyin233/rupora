@@ -36,16 +36,28 @@ proptest! {
             let next = apply_markdown_command(&mut text, selection.clone(), command);
             apply_markdown_command(&mut text, next, command);
             if text != original {
-                // A trailing literal backslash needs an escape before the
-                // fallback's closing HTML tag. Removing the style retains
-                // that equivalent encoding; Undo, not a second toggle, owns
-                // byte-exact restoration. No other source rewrite is allowed.
+                // Literal backslashes at either inserted HTML boundary need
+                // escaping. Removing the style may retain those equivalent
+                // encodings; Undo owns byte-exact restoration. Only these
+                // at-most-two additions are allowed, with identical HTML.
+                let start = original.char_indices().nth(selection.start).map_or(original.len(), |(byte, _)| byte);
                 let end = original.char_indices().nth(selection.end).map_or(original.len(), |(byte, _)| byte);
-                let trimmed_end = original[..end].trim_end().len();
-                prop_assert!(trimmed_end > 0 && original.as_bytes()[trimmed_end - 1] == b'\\');
-                let mut escaped = original.clone();
-                escaped.insert(trimmed_end, '\\');
-                prop_assert_eq!(&text, &escaped, "command={:?} selection={:?}", command, selection);
+                let body = &original[start..end];
+                let trimmed_start = start + body.len() - body.trim_start().len();
+                let trimmed_end = trimmed_start + body.trim().len();
+                let odd_slashes = |before: &str| before.bytes().rev().take_while(|byte| *byte == b'\\').count() % 2 == 1;
+                let prefix = trimmed_start < trimmed_end
+                    && odd_slashes(&original[..trimmed_start])
+                    && !original[trimmed_start..].starts_with(|ch: char| ch.is_ascii_punctuation());
+                let suffix = trimmed_start < trimmed_end && odd_slashes(&original[trimmed_start..trimmed_end]);
+                let equivalent = [(true, false), (false, true), (true, true)].into_iter().any(|(left, right)| {
+                    if (left && !prefix) || (right && !suffix) { return false; }
+                    let mut escaped = original.clone();
+                    if right { escaped.insert(trimmed_end, '\\'); }
+                    if left { escaped.insert(trimmed_start, '\\'); }
+                    escaped == text
+                });
+                prop_assert!(equivalent, "command={:?} selection={:?}: {:?} => {:?}", command, selection, original, text);
                 prop_assert_eq!(render_html_fragment(&text), render_html_fragment(&original));
             }
         }
