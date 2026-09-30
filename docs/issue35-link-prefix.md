@@ -60,4 +60,25 @@ Ctrl+Z、Ctrl+S 恢复原文，SHA-256
 `b7f38e3b9f9743d7d678bdecae6a0e200d3d44e1d5deeaf3b65741b3398e741e`。
 正常关闭并确认窗口消失。截图在本线程 Computer Use 输出，窗口 3804322，
 未另存 PNG；这是普通快捷键操作，不计为输入法组合验收。
-修复版原生复测待补充，完整原生矩阵由 #6 跟踪。
+完整原生矩阵由 #6 跟踪。
+
+## 修复版原生复测
+
+修复提交 `2a734f228db4598cbc7acba2a6aa7e26c454dd37`，同一环境，普通本地 release，
+路径 `target/acceptance-issue35-20260930/rupora.exe`，35,653,120 字节，NotSigned，
+SHA-256 `8c65286b66470097ce1f4f248f1e1150a9c3f8f6b922af9e65a64376e5228ddd`。
+
+打开上文已恢复的同一文件，在 emoji 后聚焦，Shift+Left 两次反向选中 `甲🙂`。
+Ctrl+K、Ctrl+S 后源码为 `前\![甲🙂](https://)尾`，Escape 失焦后仅标签显示链接样式，
+叹号和两侧中文保留，没有图片占位符。选区包含完整中文和 emoji。
+
+Ctrl+Z、Ctrl+S 精确恢复原文及上文原始哈希；Ctrl+Y、Ctrl+S 恢复链接源码，
+哈希与第一次保存链接时相同：
+`fb6735efa32bec507281c33b040ce2c2479b5067c97224894e5b92ae851c66b4`。
+切到源码视图，内容与磁盘一致，随后正常退出。截图在本线程工具输出，窗口 9047168。
+本轮未实际测试 URL 粘贴、资源对话框或反斜杠案例的 GUI 路径；它们由上述自动回归覆盖，
+不能据此宣称三模式完整原生矩阵已经通过。公开发布资产和标签未变。
+
+修复提交的 [push CI](https://github.com/qinyin233/rupora/actions/runs/36668027952) 和
+[手动 fuzz CI](https://github.com/qinyin233/rupora/actions/runs/36668049125) 已启动，
+最终结果仍待检查；普通 push 的 fuzz 跳过不算通过。
