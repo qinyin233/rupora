@@ -585,6 +585,51 @@ fn escaped_emphasis_shortcuts_restore_exact_source_on_undo() {
 }
 
 #[test]
+fn link_prefix_shortcuts_restore_exact_source_and_selection() {
+    for mode in [ViewMode::Hybrid, ViewMode::Edit, ViewMode::Split] {
+        for (original, selection) in [
+            ("!x", 1..2),
+            ("\\x", 1..2),
+            ("前!甲🙂尾", 2..4),
+            ("前\\甲🙂尾", 2..4),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = isolated_app(directory.path());
+            app.new_document();
+            app.state.view_mode = mode;
+            app.session[0].content = original.into();
+            app.session[0].update_after_edit();
+            app.queue_editor_selection(selection.clone());
+            let ctx = Context::default();
+            install_fonts(&ctx);
+            shortcut_editor_frame(&mut app, &ctx, vec![]);
+            let original_selection = app.active_selection(0);
+            shortcut_editor_frame(&mut app, &ctx, vec![command_key(Key::K)]);
+            drain_ordered_input(&mut app, &ctx);
+            let source = app.session[0].content.clone();
+            let after_selection = app.active_selection(0);
+            let projection = crate::wysiwyg::VisualProjection::from_markdown(&source);
+            assert_eq!(projection.text(), original, "{mode:?}: {source}");
+            assert_eq!(
+                projection.visual_char_range(&source, after_selection.clone()),
+                selection
+            );
+            for run in projection.runs_for(projection.text()) {
+                for i in run.range {
+                    assert_eq!(run.style.link, selection.contains(&i), "{mode:?}: {source}");
+                }
+            }
+            app.undo_active();
+            assert_eq!(app.session[0].content, original, "{mode:?}");
+            assert_eq!(app.active_selection(0), original_selection, "{mode:?}");
+            app.redo_active();
+            assert_eq!(app.session[0].content, source, "{mode:?}");
+            assert_eq!(app.active_selection(0), after_selection, "{mode:?}");
+        }
+    }
+}
+
+#[test]
 fn multiple_format_shortcuts_match_separate_frames() {
     let events = vec![
         egui::Event::Text("中".into()),

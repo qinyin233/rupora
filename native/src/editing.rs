@@ -230,6 +230,9 @@ pub fn paste_url_as_markdown_link(
     let label = escape_link_label(&text[start..end]);
     let destination = escape_link_destination(url);
     let replacement = format!("[{label}]({destination})");
+    let selection = protect_link_prefix(text, selection, false);
+    let start = char_to_byte(text, selection.start);
+    let end = char_to_byte(text, selection.end);
     text.replace_range(start..end, &replacement);
     let cursor = selection.start + replacement.chars().count();
     Some(cursor..cursor)
@@ -250,7 +253,53 @@ pub fn insert_resource_link(
     } else {
         format!("[{label}]({destination})")
     };
+    let selection = protect_link_prefix(text, selection, image);
     replace_range(text, selection, &replacement)
+}
+
+fn protect_link_prefix(text: &mut String, selection: Range<usize>, image: bool) -> Range<usize> {
+    let start = char_to_byte(text, selection.start);
+    let prefix = &text[..start];
+    let escape_at = if !image
+        && prefix.ends_with('!')
+        && !has_odd_trailing_backslashes(&prefix[..prefix.len() - 1])
+    {
+        // Keep a literal '!' outside the new link instead of making an image.
+        Some(start - 1)
+    } else if has_odd_trailing_backslashes(prefix)
+        && !text[start..]
+            .starts_with(|ch: char| ch.is_ascii_punctuation() || matches!(ch, '\r' | '\n'))
+    {
+        // Only repair a literal backslash. A raw source selection inside an
+        // existing escape retains its previous syntax-edit behavior.
+        Some(start)
+    } else {
+        None
+    };
+    if let Some(at) = escape_at {
+        // Backslashes are literal inside code and raw HTML; adding one there
+        // would change source outside the user's selection without protection.
+        let literal_context =
+            pulldown_cmark::Parser::new_ext(text, crate::markdown::parser_options())
+                .into_offset_iter()
+                .any(|(event, range)| {
+                    range.contains(&(start - 1))
+                        && matches!(
+                            event,
+                            pulldown_cmark::Event::Code(_)
+                                | pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_))
+                                | pulldown_cmark::Event::Html(_)
+                                | pulldown_cmark::Event::InlineHtml(_)
+                        )
+                });
+        if literal_context {
+            return selection;
+        }
+        text.insert(at, '\\');
+        selection.start + 1..selection.end + 1
+    } else {
+        selection
+    }
 }
 
 pub fn apply_smart_pair(
@@ -944,6 +993,7 @@ fn toggle_code_block(text: &mut String, selection: Range<usize>) -> Range<usize>
 }
 
 fn insert_link(text: &mut String, selection: Range<usize>) -> Range<usize> {
+    let selection = protect_link_prefix(text, selection, false);
     let start_byte = char_to_byte(text, selection.start);
     let end_byte = char_to_byte(text, selection.end);
     if selection.is_empty() {
