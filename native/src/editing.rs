@@ -347,6 +347,121 @@ fn collect_byte_matches(text: &str, query: &str, match_case: bool) -> Vec<Range<
 }
 
 fn toggle_emphasis(text: &mut String, selection: Range<usize>, marker: &str) -> Range<usize> {
+    let Some(kind) = crate::inline_format::InlineFormat::for_marker(marker) else {
+        return toggle_markdown_emphasis(text, selection, marker);
+    };
+    if selection.is_empty() {
+        return toggle_markdown_emphasis(text, selection, marker);
+    }
+    let selected = char_to_byte(text, selection.start)..char_to_byte(text, selection.end);
+    if text[selected.clone()].contains(['\r', '\n']) {
+        return toggle_markdown_emphasis(text, selection, marker);
+    }
+    let spans = crate::inline_format::spans(text);
+    let matching = crate::inline_format::matching_body(&spans, &selected);
+    if matching.iter().any(|span| span.html) {
+        // Mixed Markdown/HTML wrappers describe the same selected body. Toggle
+        // their semantic styles together: removing an outer HTML tag must not
+        // invalidate an inner Markdown delimiter's flanking boundary.
+        use crate::inline_format::InlineFormat::{Emphasis, Strong};
+        let strong = matching.iter().any(|span| span.kind == Strong) ^ (kind == Strong);
+        let emphasis = matching.iter().any(|span| span.kind == Emphasis) ^ (kind == Emphasis);
+        let mut opening = String::new();
+        let mut closing = String::new();
+        for style in [strong.then_some(Strong), emphasis.then_some(Emphasis)]
+            .into_iter()
+            .flatten()
+        {
+            let (open, close) = style.html();
+            opening.push_str(open);
+            closing.insert_str(0, close);
+        }
+        let outer = &matching[0].syntax;
+        let start = outer.start + opening.len();
+        let end = start + selected.len();
+        let replacement = format!("{opening}{}{closing}", &text[selected]);
+        text.replace_range(outer.clone(), &replacement);
+        return byte_range_to_char_range(text, start..end);
+    }
+    let mut candidate = text.clone();
+    let next = toggle_markdown_emphasis(&mut candidate, selection.clone(), marker);
+    if candidate.len() <= text.len() {
+        *text = candidate;
+        return next;
+    }
+    // A source selection cutting through an existing delimiter is a syntax
+    // edit, not a request to format its rendered body. Preserve its old toggle.
+    let cuts_escape = text[..selected.end]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2
+        == 1
+        && text[selected.end..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_punctuation() || matches!(ch, '\r' | '\n'));
+    if cuts_escape
+        || spans.iter().any(|span| {
+            span.syntax.start < selected.end
+                && selected.start < span.syntax.end
+                && !(span.body.start <= selected.start && selected.end <= span.body.end)
+        })
+    {
+        *text = candidate;
+        return next;
+    }
+    let added = char_to_byte(&candidate, next.start)..char_to_byte(&candidate, next.end);
+    let candidate_spans = crate::inline_format::spans(&candidate);
+    if crate::inline_format::matching_body(&candidate_spans, &added)
+        .iter()
+        .any(|span| span.kind == kind)
+    {
+        *text = candidate;
+        return next;
+    }
+    // Standard HTML has no delimiter-flanking restriction. Use it only when
+    // the parser can recognize both tags as a balanced inline wrapper.
+    let body = &text[selected.clone()];
+    let start = selected.start + body.len() - body.trim_start().len();
+    let end = start + body.trim().len();
+    if start == end || text[start..end].contains(['\r', '\n']) {
+        return selection;
+    }
+    let (open, close) = kind.html();
+    let mut fallback = text.clone();
+    // A literal trailing backslash would escape the '<' in the closing tag.
+    // Escape just that unmatched slash; CommonMark still displays the same
+    // character, and the source selection includes its complete encoding.
+    let escape = text[start..end]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2;
+    fallback.insert_str(end, close);
+    if escape != 0 {
+        fallback.insert(end, '\\');
+    }
+    fallback.insert_str(start, open);
+    let syntax = start..end + escape + open.len() + close.len();
+    if !crate::inline_format::spans(&fallback)
+        .iter()
+        .any(|span| span.html && span.kind == kind && span.syntax == syntax)
+    {
+        return selection;
+    }
+    let next = byte_range_to_char_range(&fallback, start + open.len()..end + escape + open.len());
+    *text = fallback;
+    next
+}
+
+fn toggle_markdown_emphasis(
+    text: &mut String,
+    selection: Range<usize>,
+    marker: &str,
+) -> Range<usize> {
     if selection.is_empty() {
         return toggle_wrap(text, selection, marker, marker);
     }
@@ -1434,6 +1549,28 @@ mod tests {
             2..4,
         );
         assert_eq!(source, original);
+    }
+
+    #[test]
+    fn emphasis_renders_symbols_next_to_unselected_text() {
+        for (original, selection, selected_text, tail) in
+            [("!a", 0..1, "!", "a"), ("甲🙂尾\n\n乙", 0..2, "甲🙂", "尾")]
+        {
+            for (command, tag) in [
+                (MarkdownCommand::Bold, "strong"),
+                (MarkdownCommand::Italic, "em"),
+            ] {
+                let mut source = original.to_owned();
+                let next = apply_markdown_command(&mut source, selection.clone(), command);
+                let html = crate::markdown::render_html_fragment(&source);
+                assert!(
+                    html.contains(&format!("<{tag}>{selected_text}</{tag}>{tail}")),
+                    "{source:?} => {html}"
+                );
+                apply_markdown_command(&mut source, next, command);
+                assert_eq!(source, original);
+            }
+        }
     }
 
     #[test]

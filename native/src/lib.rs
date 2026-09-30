@@ -7,6 +7,7 @@ pub mod editing;
 pub mod editor_buffer;
 pub mod export;
 pub mod extensions;
+mod inline_format;
 pub mod instance;
 pub mod markdown;
 pub mod merge;

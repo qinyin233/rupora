@@ -140,7 +140,11 @@ impl VisualProjection {
         let standalone_footnotes = standalone_footnote_references(source, &references);
         let mut last_event_end = 0;
 
-        let mut events = crate::markdown::events_with_references(source, &references).peekable();
+        let mut events = crate::inline_format::events(
+            source,
+            crate::markdown::events_with_references(source, &references),
+        )
+        .peekable();
         while let Some((event, range)) = events.next() {
             last_event_end = last_event_end.max(range.end);
             if collapsed_source_cursor.is_some_and(|cursor| range.contains(&cursor))
@@ -795,7 +799,8 @@ impl VisualProjection {
         for wrapper in &self.inline_wrappers {
             let syntax = &source[wrapper.source.clone()];
             let is_math = syntax.starts_with('$') && syntax.ends_with('$');
-            let is_autolink = syntax.starts_with('<') && syntax.ends_with('>');
+            let is_autolink = source.get(wrapper.source.start..wrapper.content.start) == Some("<")
+                && source.get(wrapper.content.end..wrapper.source.end) == Some(">");
             let leading_space = replacement.chars().next().is_some_and(char::is_whitespace);
             let trailing_space = replacement.chars().last().is_some_and(char::is_whitespace);
             let touches_start = (change.old.start <= wrapper.visual.start
@@ -903,6 +908,39 @@ impl VisualProjection {
             }
         }
 
+        if !insertion {
+            // A visual selection beside a span must not consume its hidden
+            // edge. This matters when deleting the paragraph gap between two
+            // formatted runs: neither run is part of the selected text.
+            for wrapper in &self.inline_wrappers {
+                if wrapper.visual.end <= change.old.start && wrapper.source.end <= source_end {
+                    source_start = source_start.max(wrapper.source.end);
+                }
+                if change.old.end <= wrapper.visual.start && source_start <= wrapper.source.start {
+                    source_end = source_end.min(wrapper.source.start);
+                }
+            }
+        }
+        if insertion && replacement == "\n" {
+            // A paragraph break at an HTML format edge belongs outside the
+            // wrapper. Splitting its empty edge would strand an opening tag
+            // on a line of its own, turning it into an HTML block.
+            for wrapper in &self.inline_wrappers {
+                if !matches!(
+                    source.get(wrapper.source.start..wrapper.content.start),
+                    Some("<strong>" | "<em>")
+                ) {
+                    continue;
+                }
+                if change.old.start == wrapper.visual.start {
+                    source_start = source_start.min(wrapper.source.start);
+                    source_end = source_start;
+                } else if change.old.start == wrapper.visual.end {
+                    source_start = source_start.max(wrapper.source.end);
+                    source_end = source_start;
+                }
+            }
+        }
         let mut output = source.to_owned();
         let retained = self
             .retained_inline_syntax(&change.old, source_start..source_end)
@@ -1796,10 +1834,16 @@ impl VisualProjection {
         source_end: usize,
         delta: isize,
     ) -> usize {
-        if change.old.is_empty() && visual_index == change.new.start {
+        if change.old.is_empty() && (change.new.start..=change.new.end).contains(&visual_index) {
             // The insertion target may precede hidden line-end padding or
-            // syntax. Its old visual boundary can now fall inside inserted UTF-8.
-            return source_start;
+            // syntax. Both edges of the inserted text belong to that target,
+            // not to the old boundary on the far side of hidden format tags.
+            let replacement_start = char_to_byte(edited, change.new.start);
+            return source_start
+                + char_to_byte(
+                    &edited[replacement_start..],
+                    visual_index - change.new.start,
+                );
         }
         if visual_index <= change.new.start {
             let old_byte = self.source_boundaries[visual_index.min(change.old.start)];
@@ -2041,7 +2085,10 @@ pub fn complete_visual_enter(
         // Inline spans can cross a soft break, but Markdown cannot carry their
         // delimiters over a paragraph boundary. Close and reopen each span.
         let mut spans = Vec::new();
-        for (event, range) in Parser::new_ext(source, parser_options()).into_offset_iter() {
+        for (event, range) in crate::inline_format::events(
+            source,
+            Parser::new_ext(source, parser_options()).into_offset_iter(),
+        ) {
             if !(range.start < newline && byte < range.end) {
                 continue;
             }
@@ -2062,21 +2109,28 @@ pub fn complete_visual_enter(
                 _ => None,
             };
             if let Some(delimiter) = delimiter {
-                let inner = range.start + delimiter.len()..range.end - delimiter.len();
+                let (opening, closing) = if source[range.clone()].starts_with("<strong>") {
+                    ("<strong>".to_owned(), "</strong>".to_owned())
+                } else if source[range.clone()].starts_with("<em>") {
+                    ("<em>".to_owned(), "</em>".to_owned())
+                } else {
+                    (delimiter.clone(), delimiter)
+                };
+                let inner = range.start + opening.len()..range.end - closing.len();
                 if inner.start < newline && byte < inner.end {
-                    spans.push((range, delimiter));
+                    spans.push((range, opening, closing));
                 }
             }
         }
-        spans.sort_by_key(|(range, _)| (range.start, std::cmp::Reverse(range.end)));
+        spans.sort_by_key(|(range, _, _)| (range.start, std::cmp::Reverse(range.end)));
         let opening = spans
             .iter()
-            .map(|(_, delimiter)| delimiter.as_str())
+            .map(|(_, opening, _)| opening.as_str())
             .collect::<String>();
         let closing = spans
             .iter()
             .rev()
-            .map(|(_, delimiter)| delimiter.as_str())
+            .map(|(_, _, closing)| closing.as_str())
             .collect::<String>();
         source.insert_str(byte, &format!("\n{opening}"));
         source.insert_str(newline, &closing);

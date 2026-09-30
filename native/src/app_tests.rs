@@ -477,6 +477,105 @@ fn ime_late_preedit_after_window_focus_loss_never_changes_the_document() {
 }
 
 #[test]
+fn italic_shortcut_preserves_bold_on_the_same_unicode_selection() {
+    for mode in [ViewMode::Hybrid, ViewMode::Edit, ViewMode::Split] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.state.view_mode = mode;
+        app.session[0].content = "甲🙂尾\n\n乙".into();
+        app.session[0].update_after_edit();
+        app.queue_editor_selection(0..2);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        shortcut_editor_frame(&mut app, &ctx, vec![]);
+        shortcut_editor_frame(&mut app, &ctx, vec![command_key(Key::B)]);
+        drain_ordered_input(&mut app, &ctx);
+        let html = crate::markdown::render_html_fragment(&app.session[0].content);
+        assert!(html.contains("<strong>甲🙂</strong>尾"), "{mode:?}: {html}");
+        let bold = app.session[0].content.clone();
+        shortcut_editor_frame(&mut app, &ctx, vec![command_key(Key::I)]);
+        drain_ordered_input(&mut app, &ctx);
+        let html = crate::markdown::render_html_fragment(&app.session[0].content);
+        assert!(
+            html.contains("<strong>") && html.contains("<em>"),
+            "{mode:?}: {html}"
+        );
+        assert!(html.contains("尾</p>\n<p>乙</p>"), "{mode:?}: {html}");
+        let both = app.session[0].content.clone();
+        let selected = app.active_selection(0);
+        assert_eq!(
+            app.session[0]
+                .content
+                .chars()
+                .skip(selected.start)
+                .take(selected.len())
+                .collect::<String>(),
+            "甲🙂",
+            "{mode:?}"
+        );
+        shortcut_editor_frame(&mut app, &ctx, vec![command_key(Key::K)]);
+        drain_ordered_input(&mut app, &ctx);
+        let linked = app.session[0].content.clone();
+        let html = crate::markdown::render_html_fragment(&linked);
+        // The placeholder is not a navigable URL and is sanitized on export.
+        assert!(linked.contains("[甲🙂](https://)"), "{mode:?}: {linked}");
+        assert!(html.contains(">甲🙂</a>"), "{mode:?}: {html}");
+        assert!(html.contains("尾</p>\n<p>乙</p>"), "{mode:?}: {html}");
+        for expected in [both.as_str(), bold.as_str(), "甲🙂尾\n\n乙"] {
+            app.undo_active();
+            assert_eq!(app.session[0].content, expected, "{mode:?}");
+        }
+        for expected in [&bold, &both, &linked] {
+            app.redo_active();
+            assert_eq!(&app.session[0].content, expected, "{mode:?}");
+        }
+    }
+}
+
+#[test]
+fn escaped_emphasis_shortcuts_restore_exact_source_on_undo() {
+    for mode in [ViewMode::Hybrid, ViewMode::Edit, ViewMode::Split] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(directory.path());
+        app.new_document();
+        app.state.view_mode = mode;
+        app.session[0].content = "甲\\尾".into();
+        app.session[0].update_after_edit();
+        app.queue_editor_selection(1..2);
+        let ctx = Context::default();
+        install_fonts(&ctx);
+        shortcut_editor_frame(&mut app, &ctx, vec![]);
+        let mut states = vec![app.session[0].content.clone()];
+        for key in [Key::B, Key::I] {
+            shortcut_editor_frame(&mut app, &ctx, vec![command_key(key)]);
+            drain_ordered_input(&mut app, &ctx);
+            let source = &app.session[0].content;
+            let projection = crate::wysiwyg::VisualProjection::from_markdown(source);
+            assert_eq!(projection.text(), "甲\\尾", "{mode:?}: {source}");
+            assert_eq!(
+                projection.visual_char_range(source, app.active_selection(0)),
+                1..2
+            );
+            let html = crate::markdown::render_html_fragment(source);
+            assert!(html.contains("<strong>"), "{mode:?}: {html}");
+            if key == Key::I {
+                assert!(html.contains("<em>"), "{mode:?}: {html}");
+            }
+            states.push(source.clone());
+        }
+        for expected in states[..2].iter().rev() {
+            app.undo_active();
+            assert_eq!(&app.session[0].content, expected, "{mode:?}");
+        }
+        for expected in &states[1..] {
+            app.redo_active();
+            assert_eq!(&app.session[0].content, expected, "{mode:?}");
+        }
+    }
+}
+
+#[test]
 fn multiple_format_shortcuts_match_separate_frames() {
     let events = vec![
         egui::Event::Text("中".into()),

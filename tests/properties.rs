@@ -35,7 +35,19 @@ proptest! {
             let mut text = original.clone();
             let next = apply_markdown_command(&mut text, selection.clone(), command);
             apply_markdown_command(&mut text, next, command);
-            prop_assert_eq!(&text, &original, "command={:?} selection={:?}", command, selection);
+            if text != original {
+                // A trailing literal backslash needs an escape before the
+                // fallback's closing HTML tag. Removing the style retains
+                // that equivalent encoding; Undo, not a second toggle, owns
+                // byte-exact restoration. No other source rewrite is allowed.
+                let end = original.char_indices().nth(selection.end).map_or(original.len(), |(byte, _)| byte);
+                let trimmed_end = original[..end].trim_end().len();
+                prop_assert!(trimmed_end > 0 && original.as_bytes()[trimmed_end - 1] == b'\\');
+                let mut escaped = original.clone();
+                escaped.insert(trimmed_end, '\\');
+                prop_assert_eq!(&text, &escaped, "command={:?} selection={:?}", command, selection);
+                prop_assert_eq!(render_html_fragment(&text), render_html_fragment(&original));
+            }
         }
     }
 
