@@ -50,7 +50,13 @@ Redo 精确恢复命令结果。HTML 导出、投影正文和逐字符样式共�
   忽略项不记为通过。日志：`target/issue34-all-tests.log`。
 - `cargo clippy --all-targets --locked -j 1 -- -D warnings` 通过；日志：`target/issue34-clippy.log`。
 - `cargo build --release --locked -j 1` 通过，耗时 4 分 02 秒；日志：`target/issue34-release.log`。
-- 提交后的 GitHub Actions 结果在 #34 跟踪，CI 尚未验完时保持问题开放。
+- 修复提交 `91dc4412dde5a8f5836c898909c757fa40658283` 的
+  [push CI](https://github.com/qinyin233/rupora/actions/runs/36664940626) 与
+  [手动 CI](https://github.com/qinyin233/rupora/actions/runs/36665001643) 均已成功。
+  Windows、macOS、Ubuntu 测试及 release 编译、安全与性能门禁通过。
+  push 的 fuzz 为跳过；手动运行的 job `109727673176` 日志确认实际执行：
+  `markdown_pipeline` 40,799 次、`table_parser` 886,672 次、
+  `wysiwyg_projection` 60,866 次，各 61 秒，全部成功。
 
 上述是源码及自动化验证；补充的真实桌面操作见下节。完整原生矩阵仍由 #6 跟踪。
 公开 Release 和标签未改动。
