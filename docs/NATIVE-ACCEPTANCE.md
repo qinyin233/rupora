@@ -60,7 +60,7 @@ P3/P4 是进程终止后的产品验收，不能证明真实断电或设备故�
 
 | 平台 | 架构 | 实际资产及 SHA-256 | 执行用例与证据 | 状态 |
 | --- | --- | --- | --- | --- |
-| Windows | x86_64 | 待填写 | 未执行 | 待验收 |
+| Windows | x86_64 | 本地 0975ce9 NSIS 解包候选；完整 SHA-256 见[当前修复记录](issue33-emphasis-repair.md#本地包与补充原生检查) | [原始格式案例、Undo/Redo、保存重启及回车检查](issue33-emphasis-repair.md)；早期候选的 IME 记录见上文，不能替代当前构建完整矩阵 | 部分完成；#6 保持开放 |
 | Windows | ARM64 | 待填写 | 未执行 | 待验收 |
 | macOS | Intel | 待填写 | 未执行 | 待验收 |
 | macOS | Apple Silicon | 待填写 | 未执行 | 待验收 |
