@@ -42,7 +42,7 @@
 全量测试 728 项通过、0 失败、4 项忽略；日志为 `target/issue35-all-tests.log`
 和 `target/issue35-clippy.log`。`cargo build --release --locked -j 1` 通过，
 耗时 4 分 21 秒，日志 `target/issue35-release.log`。
-#35 在远程检查完成前保持开放。
+远程最终验证见下文。
 
 ## 原生失败复现
 
@@ -80,8 +80,13 @@ Ctrl+Z、Ctrl+S 精确恢复原文及上文原始哈希；Ctrl+Y、Ctrl+S 恢复
 不能据此宣称三模式完整原生矩阵已经通过。公开发布资产和标签未变。
 
 修复提交的 [push CI](https://github.com/qinyin233/rupora/actions/runs/36668027952) 和
-[手动 fuzz CI](https://github.com/qinyin233/rupora/actions/runs/36668049125) 已启动，
-最终结果仍待检查；普通 push 的 fuzz 跳过不算通过。
+[手动 fuzz CI](https://github.com/qinyin233/rupora/actions/runs/36668049125) 均成功完成。
+2026-10-01 核对手动作业 109736866336 的实际日志：`markdown_pipeline`、`table_parser`、
+`wysiwyg_projection` 各运行 61 秒，分别完成 30,948、905,785、69,257 次输入。
+普通 push 的 fuzz 跳过不算通过。追加测试提交 `d2db021` 的
+[CI](https://github.com/qinyin233/rupora/actions/runs/36668614954) 和验收记录提交 `31719e1` 的
+[CI](https://github.com/qinyin233/rupora/actions/runs/36669296091) 也均成功完成。
+这些结果满足 #35 的回归验收；#6 的完整原生矩阵仍未完成。
 
 ## 后续输入覆盖
 
