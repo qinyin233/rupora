@@ -187,7 +187,14 @@ Escape 结束源码显露后，可见文字为 `前]🙂b尾`，替换标签仍�
 - `cargo build --release --locked -j 1` 通过，退出码 0，5 分钟；
   `target/issue36-followup-release.log`。
 
-精确源码 CI/fuzz 尚待完成；#36 保持开放。
+性能修复提交 `a63d8e0ae5abd5bfd7f332227a19f9a5ec4546e6` 的
+[push CI 37048199131](https://github.com/qinyin233/rupora/actions/runs/37048199131)
+和 [手动 CI 37048283680](https://github.com/qinyin233/rupora/actions/runs/37048283680)
+均已完成且成功，三平台测试、严格 Clippy、release、安全和性能门禁通过。
+push 的 fuzz 跳过；手动运行的实际 fuzz job `110975037655` 成功，解码日志确认：
+`markdown_pipeline` 56,448 次、`table_parser` 948,012 次、
+`wysiwyg_projection` 63,430 次，分别实际运行 61 秒。
+这些有限运行只验证上述精确源码，不证明没有未知缺陷。
 
 ## 性能修复版原生回归
 
@@ -221,6 +228,6 @@ Escape 结束源码显露，写作与阅读画面均显示 `前]中🙂b尾`，�
 独立需求复审未发现已确认的实现缺陷或范围扩张。按起点排序后，当前范围未结束时
 覆盖当前位置；结束后跳过已失效的重叠范围，再检查下一个范围，保持原来的范围并集语义。
 转义对跳过仍保留单调的 UTF-8 字节遍历和逐字符边界表。复审时待完成的本地门禁
-已补齐于上节；剩余部分验收项是精确源码 CI/fuzz，前一提交的绿色结果不代替这些验证。
+已补齐于上节；随后也确认了精确源码 CI/fuzz 成功，前一提交的结果未被用于代替这些验证。
 
-两轴摘要：Standards 0 项硬违反、2 项可选重复整理；Spec 0 项确认缺陷、1 项验证尚待完成。
+两轴摘要：Standards 0 项硬违反、2 项可选重复整理；Spec 0 项确认缺陷，精确源码验证已完成。

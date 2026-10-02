@@ -65,6 +65,13 @@ impl EditorSurface {
                                 )),
                                 egui::Sense::click(),
                             );
+                            if matches!(&preview.mapping, NativePointerMapping::Text(_)) {
+                                set_markdown_preview_accessibility(
+                                    &response,
+                                    preview_source,
+                                    &references,
+                                );
+                            }
                             if scroll_to_block == Some(block.id) {
                                 ui.scroll_to_rect(preview.rect, Some(Align::Min));
                             }

@@ -4,6 +4,52 @@ use super::*;
 use eframe::egui::Context;
 
 #[test]
+fn reference_link_previews_expose_resolved_accessible_text() {
+    let source = "前[&#93;中🙂b][a🙂b]尾\n\n[a🙂b]: https://example.com\n";
+    for mode in [ViewMode::Preview, ViewMode::Hybrid, ViewMode::Split] {
+        let context = Context::default();
+        context.enable_accesskit();
+        let mut document = Document::untitled(1);
+        document.content = source.to_owned();
+        document.update_after_edit();
+        let mut editor = EditorSurface::default();
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                editor.show(
+                    ui,
+                    &mut document,
+                    EditorOptions {
+                        mode,
+                        dark: false,
+                        base_path: Path::new("."),
+                    },
+                );
+            },
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        let values: Vec<_> = update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.value())
+            .collect();
+        assert!(
+            values
+                .iter()
+                .any(|value| value.trim_end_matches(['\r', '\n']) == "前]中🙂b尾"),
+            "mode {mode:?}: {values:?}"
+        );
+        assert_eq!(document.content, source);
+    }
+}
+
+#[test]
 fn cross_block_ime_commit_keeps_following_text_and_history() {
     let source = "甲🙂首段\n\n乙尾段";
     let context = Context::default();

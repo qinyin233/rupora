@@ -975,7 +975,7 @@ impl EditorSurface {
                                                 if output.response.has_focus() {
                                                     let accessible_remainder =
                                                         accessible_document_remainder(
-                                                            source, blocks, block.id,
+                                                            source, blocks, block.id, &references,
                                                         );
                                                     append_accessible_text_runs(
                                                         ui,
@@ -1451,6 +1451,7 @@ impl EditorSurface {
                                             set_markdown_preview_accessibility(
                                                 &response,
                                                 preview_source,
+                                                &references,
                                             );
                                             pointer_regions.push(HybridPointerRegion {
                                                 block_id: block.id,

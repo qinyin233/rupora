@@ -824,8 +824,12 @@ pub(crate) fn is_native_quote_block(source: &str) -> bool {
     source.trim_start().starts_with('>')
 }
 
-fn accessible_markdown_block_text(source: &str) -> String {
-    let projection = VisualProjection::from_markdown(source);
+fn accessible_markdown_block_text(
+    source: &str,
+    references: &Arc<markdown::ReferenceDefinitions>,
+) -> String {
+    let projection =
+        VisualProjection::from_markdown_with_context(source, None, Arc::clone(references));
     let text = projection.text().trim_end_matches(['\r', '\n']);
     if text.trim().is_empty() {
         source.to_owned()
@@ -845,6 +849,7 @@ pub(crate) fn accessible_document_remainder(
     source: &str,
     blocks: &[markdown::MarkdownBlock],
     active_id: BlockId,
+    references: &Arc<markdown::ReferenceDefinitions>,
 ) -> String {
     const MAX_ACCESSIBLE_REMAINDER_CHARS: usize = 1_048_576;
 
@@ -854,7 +859,7 @@ pub(crate) fn accessible_document_remainder(
         if remaining == 0 {
             break;
         }
-        let text = accessible_markdown_block_text(&source[block.range.clone()]);
+        let text = accessible_markdown_block_text(&source[block.range.clone()], references);
         if text.is_empty() {
             continue;
         }
@@ -933,10 +938,15 @@ fn append_accessible_text_run(
         });
 }
 
-pub(crate) fn set_markdown_preview_accessibility(response: &egui::Response, source: &str) {
-    let accessible_text = accessible_markdown_block_text(source);
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &accessible_text));
+pub(crate) fn set_markdown_preview_accessibility(
+    response: &egui::Response,
+    source: &str,
+    references: &Arc<markdown::ReferenceDefinitions>,
+) {
+    response.widget_info(|| {
+        let accessible_text = accessible_markdown_block_text(source, references);
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &accessible_text)
+    });
 }
 
 pub(crate) fn paint_inline_code_delimiters(
@@ -1710,11 +1720,18 @@ mod tests {
 
     #[test]
     fn accessible_preview_text_covers_non_active_markdown_blocks() {
-        assert_eq!(accessible_markdown_block_text("- 项目"), "• 项目");
-        let footnote = accessible_markdown_block_text("脚注引用[^1]");
+        let references = Default::default();
+        assert_eq!(
+            accessible_markdown_block_text("- 项目", &references),
+            "• 项目"
+        );
+        let footnote = accessible_markdown_block_text("脚注引用[^1]", &references);
         assert!(footnote.contains('1'));
         assert!(!footnote.contains("[^1]"));
-        assert!(accessible_markdown_block_text("```rust\nfn main() {}\n```").contains("fn main"));
+        assert!(
+            accessible_markdown_block_text("```rust\nfn main() {}\n```", &references)
+                .contains("fn main")
+        );
     }
 
     #[test]
@@ -1731,6 +1748,7 @@ mod tests {
                 set_markdown_preview_accessibility(
                     &response,
                     "后续列表与 `code` RETEST-END-20260813",
+                    &Default::default(),
                 );
             });
         });
@@ -1752,6 +1770,26 @@ mod tests {
     }
 
     #[test]
+    fn focused_accessible_remainder_resolves_document_reference_links() {
+        for (paragraph, expected) in [
+            ("前[&#93;中🙂b][a🙂b]尾", "前]中🙂b尾"),
+            ("前[**中🙂**][id]尾", "前中🙂尾"),
+            ("前[中🙂][]尾", "前中🙂尾"),
+            ("前[中🙂]尾", "前中🙂尾"),
+            ("前[中🙂](u)尾", "前中🙂尾"),
+            ("前[未知][missing]尾", "前[未知][missing]尾"),
+        ] {
+            let source =
+                format!("开头\n\n{paragraph}\n\n[a🙂b]: https://example.com\n[id]: u\n[中🙂]: u\n");
+            let blocks = markdown::blocks(&source);
+            let references = markdown::reference_definitions(&source);
+            let remainder =
+                accessible_document_remainder(&source, &blocks, blocks[0].id, &references);
+            assert_eq!(remainder, format!("\n{expected}"));
+        }
+    }
+
+    #[test]
     fn focused_wysiwyg_editor_exposes_the_remaining_document_as_text_runs() {
         use egui::{Id, RawInput};
 
@@ -1760,7 +1798,8 @@ mod tests {
         let editor_id = Id::new("focused-wysiwyg-accessibility-regression");
         let source = "ACCESS-FINAL\n\nACCESS-FINAL-END-20260813";
         let blocks = markdown::blocks(source);
-        let remainder = accessible_document_remainder(source, &blocks, blocks[0].id);
+        let references = markdown::reference_definitions(source);
+        let remainder = accessible_document_remainder(source, &blocks, blocks[0].id, &references);
         assert!(remainder.contains("ACCESS-FINAL-END-20260813"));
         assert!(!remainder.contains("ACCESS-FINAL\n"));
 
