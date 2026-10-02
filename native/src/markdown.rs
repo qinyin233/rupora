@@ -192,27 +192,46 @@ impl BlockIndex {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceDefinitions(HashMap<unicase::UniCase<String>, (String, String)>);
 
-pub fn reference_definitions(source: &str) -> std::sync::Arc<ReferenceDefinitions> {
-    let source = parse_front_matter(source).map_or(source, |front| &source[front.body_start..]);
-    let parser = Parser::new_ext(source, parser_options());
-    std::sync::Arc::new(ReferenceDefinitions(
-        parser
-            .reference_definitions()
-            .iter()
-            .map(|(label, definition)| {
-                (
-                    unicase::UniCase::new(label.to_owned()),
+impl ReferenceDefinitions {
+    fn from_source(source: &str) -> Self {
+        let source = parse_front_matter(source).map_or(source, |front| &source[front.body_start..]);
+        let parser = Parser::new_ext(source, parser_options());
+        Self(
+            parser
+                .reference_definitions()
+                .iter()
+                .map(|(label, definition)| {
                     (
-                        definition.dest.to_string(),
-                        definition
-                            .title
-                            .as_ref()
-                            .map_or_else(String::new, ToString::to_string),
-                    ),
-                )
-            })
-            .collect(),
-    ))
+                        unicase::UniCase::new(label.to_owned()),
+                        (
+                            definition.dest.to_string(),
+                            definition
+                                .title
+                                .as_ref()
+                                .map_or_else(String::new, ToString::to_string),
+                        ),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn with_local_definitions(&self, source: &str) -> Self {
+        let mut definitions = Self::from_source(source);
+        // Match the parser: definitions in this source precede the callback's
+        // document-wide fallback definitions.
+        for (label, target) in &self.0 {
+            definitions
+                .0
+                .entry(label.clone())
+                .or_insert_with(|| target.clone());
+        }
+        definitions
+    }
+}
+
+pub fn reference_definitions(source: &str) -> std::sync::Arc<ReferenceDefinitions> {
+    std::sync::Arc::new(ReferenceDefinitions::from_source(source))
 }
 
 pub fn events_with_references<'a>(

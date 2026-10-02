@@ -951,26 +951,62 @@ impl VisualProjection {
                     .any(|wrapper| wrapper.start <= range.start && range.end <= wrapper.end)
             })
             .collect::<Vec<_>>();
-        let mut inserted = decoded_prefix.clone();
-        let encoded_marker_replacement = (table_divider_insertion.is_some()
+        let encode_marker_space = table_divider_insertion.is_some()
             || table_separator_insertion.is_some()
-            || container_marker_insertion.is_some())
-        .then(|| replacement.replace(' ', "&#32;"));
-        inserted.push_str(encoded_marker_replacement.as_deref().unwrap_or(replacement));
-        // Decoded entity content precedes the replacement in the rewritten source.
-        let replacement_content_len = inserted.len();
-        for range in &retained {
-            inserted.push_str(&source[range.clone()]);
+            || container_marker_insertion.is_some();
+        let mut encoded_replacement =
+            encode_marker_space.then(|| replacement.replace(' ', "&#32;"));
+        let mut encoded_link_boundaries = None;
+        let insert_text = |replacement: &str| {
+            let mut inserted = decoded_prefix.clone();
+            inserted.push_str(replacement);
+            for range in &retained {
+                inserted.push_str(&source[range.clone()]);
+            }
+            // Retained openers surround the unselected entity remainder too.
+            inserted.push_str(&decoded_suffix);
+            inserted
+        };
+        let mut inserted = insert_text(encoded_replacement.as_deref().unwrap_or(replacement));
+        output.replace_range(source_start..source_end, &inserted);
+        let encode_link_punctuation = replacement.contains(['[', ']', '\\'])
+            && self.hidden_link_syntax_lost_after_edit(
+                source,
+                &output,
+                &change.old,
+                &(source_start..source_end),
+            );
+        if encode_link_punctuation {
+            // A hidden label is edited as text. Encode punctuation only when
+            // its raw insertion would consume the enclosing link's syntax.
+            // Valid Markdown input and revealed source keep their normal role.
+            let references = self.references.with_local_definitions(source);
+            let (mut encoded, mut boundaries) =
+                encode_link_label_input(replacement, encode_marker_space, &references);
+            if decoded_prefix.is_empty()
+                && encoded
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_punctuation)
+                && has_odd_backslash_prefix(source, source_start)
+            {
+                // An unselected literal backslash must not escape the new
+                // entity's '&' or consume a newly typed Markdown escape.
+                encoded.insert(0, '\\');
+                for boundary in &mut boundaries {
+                    *boundary += 1;
+                }
+            }
+            encoded_replacement = Some(encoded);
+            encoded_link_boundaries = Some(boundaries);
+            let protected = insert_text(encoded_replacement.as_deref().unwrap());
+            output.replace_range(source_start..source_start + inserted.len(), &protected);
+            inserted = protected;
         }
-        // Retained openers surround the unselected entity remainder too.
-        // Putting it before those markers silently drops its original style.
-        inserted.push_str(&decoded_suffix);
-        let mut retained_offset = source_start
-            + decoded_prefix.len()
-            + encoded_marker_replacement
-                .as_deref()
-                .unwrap_or(replacement)
-                .len();
+        // Decoded entity content precedes the replacement in the rewritten source.
+        let replacement_content_len =
+            decoded_prefix.len() + encoded_replacement.as_deref().unwrap_or(replacement).len();
+        let mut retained_offset = source_start + replacement_content_len;
         let mut retained_flanking_closers = Vec::new();
         let mut retained_flanking_openers = Vec::new();
         for range in &retained {
@@ -990,7 +1026,6 @@ impl VisualProjection {
                 }
             }
         }
-        output.replace_range(source_start..source_end, &inserted);
         let mut delta = inserted.len() as isize - (source_end - source_start) as isize;
         let mut start_byte = self.edited_source_byte(
             edited,
@@ -1024,16 +1059,13 @@ impl VisualProjection {
             // Keep the insertion caret before the retained closing/opening
             // syntax, rather than counting hidden markers as inserted text.
             if selection.start == change.new.end {
-                start_byte = source_start + decoded_prefix.len() + replacement.len();
+                start_byte = source_start + replacement_content_len;
             }
             if selection.end == change.new.end {
-                end_byte = source_start + decoded_prefix.len() + replacement.len();
+                end_byte = source_start + replacement_content_len;
             }
         }
-        if table_divider_insertion.is_some()
-            || table_separator_insertion.is_some()
-            || container_marker_insertion.is_some()
-        {
+        if encode_marker_space || encode_link_punctuation {
             // Source mapping inside a transformed marker still points at its
             // syntax. After snapping the insertion into editable text, anchor
             // the selection to that text. Encode spaces so Markdown retains
@@ -1041,8 +1073,12 @@ impl VisualProjection {
             let source_byte_for_replacement_char = |index: usize| {
                 let prefix = &replacement[..char_to_byte(replacement, index)];
                 source_start
-                    + prefix.len()
-                    + prefix.bytes().filter(|byte| *byte == b' ').count() * 4
+                    + decoded_prefix.len()
+                    + if let Some(boundaries) = &encoded_link_boundaries {
+                        boundaries[index]
+                    } else {
+                        prefix.len() + prefix.bytes().filter(|byte| *byte == b' ').count() * 4
+                    }
             };
             if (change.new.start..=change.new.end).contains(&selection.start) {
                 start_byte = source_byte_for_replacement_char(selection.start - change.new.start);
@@ -1188,6 +1224,94 @@ impl VisualProjection {
         Some(VisualSourceEdit {
             selection: output[..start_byte].chars().count()..output[..end_byte].chars().count(),
             source: output,
+        })
+    }
+
+    fn hidden_link_syntax_lost_after_edit(
+        &self,
+        source: &str,
+        output: &str,
+        changed: &Range<usize>,
+        removed: &Range<usize>,
+    ) -> bool {
+        let link_at = |text: &str, start| {
+            crate::markdown::events_with_references(text, &self.references).find_map(
+                |(event, range)| match event {
+                    Event::Start(Tag::Link {
+                        dest_url, title, ..
+                    }) if range.start == start => {
+                        Some((dest_url.into_string(), title.into_string(), range.end))
+                    }
+                    _ => None,
+                },
+            )
+        };
+        self.inline_wrappers.iter().any(|wrapper| {
+            // Revealed syntax has no hidden wrapper. Cross-boundary edits,
+            // images and autolinks retain their existing editing rules.
+            wrapper.visual.start <= changed.start
+                && changed.end <= wrapper.visual.end
+                && wrapper.content.start <= removed.start
+                && removed.end <= wrapper.content.end
+                && source[wrapper.source.clone()].starts_with('[')
+                && link_at(source, wrapper.source.start).is_some_and(|(destination, title, _)| {
+                    if output
+                        .as_bytes()
+                        .get(removed.start)
+                        .is_some_and(u8::is_ascii_punctuation)
+                        && has_odd_backslash_prefix(source, removed.start)
+                    {
+                        // A preceding visible backslash would consume new
+                        // punctuation, even if the remaining prefix looks equal.
+                        return true;
+                    }
+                    let expected_end = shift_index(
+                        wrapper.source.end,
+                        output.len() as isize - source.len() as isize,
+                    );
+                    if link_at(output, wrapper.source.start)
+                        != Some((destination, title, expected_end))
+                    {
+                        return true;
+                    }
+                    // Punctuation can consume an unselected inline delimiter
+                    // while the outer link survives. Check only the unchanged
+                    // visible prefix/suffix, allowing new Markdown to render.
+                    let reparsed =
+                        Self::from_markdown_with_context(output, None, self.references.clone());
+                    if self.inline_wrappers.iter().any(|nested| {
+                        wrapper.source.start < nested.source.start
+                            && nested.source.end < wrapper.source.end
+                            && nested.content.start <= removed.start
+                            && removed.end <= nested.content.end
+                            && !reparsed.inline_wrappers.iter().any(|retained| {
+                                retained.source.start == nested.source.start
+                                    && output[retained.source.start..retained.content.start]
+                                        == source[nested.source.start..nested.content.start]
+                            })
+                    }) {
+                        return true;
+                    }
+                    let prefix = &self.text[..char_to_byte(&self.text, changed.start)];
+                    let suffix = &self.text[char_to_byte(&self.text, changed.end)..];
+                    if !reparsed.text().starts_with(prefix) || !reparsed.text().ends_with(suffix) {
+                        return true;
+                    }
+                    let old_styles = self.runs_for(&self.text);
+                    let new_styles = reparsed.runs_for(reparsed.text());
+                    let old_styles: Vec<_> = old_styles
+                        .into_iter()
+                        .flat_map(|run| std::iter::repeat_n(run.style, run.range.len()))
+                        .collect();
+                    let new_styles: Vec<_> = new_styles
+                        .into_iter()
+                        .flat_map(|run| std::iter::repeat_n(run.style, run.range.len()))
+                        .collect();
+                    let suffix_len = self.char_count() - changed.end;
+                    new_styles.len() < changed.start + suffix_len
+                        || new_styles[..changed.start] != old_styles[..changed.start]
+                        || new_styles[new_styles.len() - suffix_len..] != old_styles[changed.end..]
+                })
         })
     }
 
@@ -1871,6 +1995,70 @@ impl VisualProjection {
         );
         source_start + relative
     }
+}
+
+fn has_odd_backslash_prefix(source: &str, boundary: usize) -> bool {
+    source[..boundary]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn encode_link_label_input(
+    text: &str,
+    encode_space: bool,
+    references: &crate::markdown::ReferenceDefinitions,
+) -> (String, Vec<usize>) {
+    // Preserve complete new code, math, images and HTML. Entities are literal
+    // text in code/math bodies, and reference images need the document context.
+    let literal_ranges: Vec<_> = crate::markdown::events_with_references(text, references)
+        .filter_map(|(event, range)| {
+            matches!(
+                event,
+                Event::Code(_)
+                    | Event::InlineMath(_)
+                    | Event::DisplayMath(_)
+                    | Event::InlineHtml(_)
+                    | Event::Start(Tag::Image { .. })
+            )
+            .then_some(range)
+        })
+        .collect();
+    let mut encoded = String::with_capacity(text.len());
+    let mut boundaries = Vec::with_capacity(text.chars().count() + 1);
+    let mut input = text.char_indices().peekable();
+    while let Some((byte, ch)) = input.next() {
+        boundaries.push(encoded.len());
+        if literal_ranges.iter().any(|range| range.contains(&byte)) {
+            encoded.push(ch);
+            continue;
+        }
+        if ch == '\\'
+            && input
+                .peek()
+                .is_some_and(|(_, next)| next.is_ascii_punctuation())
+        {
+            // Complete Markdown escapes keep their existing meaning even if
+            // a later unmatched bracket requires protection of this input.
+            encoded.push(ch);
+            let (_, punctuation) = input.next().unwrap();
+            boundaries.push(encoded.len());
+            encoded.push(punctuation);
+            continue;
+        }
+        match ch {
+            '[' => encoded.push_str("&#91;"),
+            ']' => encoded.push_str("&#93;"),
+            '\\' => encoded.push_str("&#92;"),
+            ' ' if encode_space => encoded.push_str("&#32;"),
+            _ => encoded.push(ch),
+        }
+    }
+    boundaries.push(encoded.len());
+    (encoded, boundaries)
 }
 
 fn append_literal_inline_text(output: &mut String, text: &str) {
@@ -4048,6 +4236,41 @@ mod tests {
                 VisualProjection::from_markdown_with_selection(source, Some(cursor..cursor)).text(),
                 collapsed.text(),
                 "cursor: {cursor}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_reference_image_input_uses_block_and_document_definitions() {
+        let definitions = crate::markdown::reference_definitions("[p]: /external \"External\"");
+        for (source, destination, title) in [
+            ("[a](u)", "/external", "External"),
+            ("[a](u)\n\n[p]: /local \"Local\"", "/local", "Local"),
+        ] {
+            let before =
+                VisualProjection::from_markdown_with_context(source, None, definitions.clone());
+            let typed = "![img][p] [";
+            let caret = typed.chars().count();
+            let update = before.apply_edit(source, typed, caret..caret).unwrap();
+            let after = VisualProjection::from_markdown_with_context(
+                &update.source,
+                None,
+                definitions.clone(),
+            );
+            assert_eq!(after.text(), "▧ img [", "{:?}", update.source);
+            let images: Vec<_> =
+                crate::markdown::events_with_references(&update.source, &definitions)
+                    .filter_map(|(event, _)| match event {
+                        Event::Start(Tag::Image {
+                            dest_url, title, ..
+                        }) => Some((dest_url.into_string(), title.into_string())),
+                        _ => None,
+                    })
+                    .collect();
+            assert_eq!(images, [(destination.to_owned(), title.to_owned())]);
+            assert_eq!(
+                after.visual_char_range(&update.source, update.selection),
+                7..7
             );
         }
     }

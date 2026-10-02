@@ -94,6 +94,16 @@ SEEDS = {
         "shortcut-reference-label-edit": trace(
             "a [label] z\n\n[label]: https://x.test", [(0, 2, 3, "新")]
         ),
+        "hidden-link-unmatched-bracket": trace("[a](u)", [(2, 0, 1, "[")]),
+        "hidden-link-empty-target-bypass": trace("[a](u)", [(0, 0, 1, "](u)")]),
+        "hidden-link-mixed-math": trace("[a](u)", [(0, 0, 1, "$[$ [")]),
+        "hidden-link-mixed-reference-image": trace(
+            "[a](u)\n\n[p]: pic", [(0, 0, 1, "![img][p] [")]
+        ),
+        "hidden-link-mixed-escape": trace("[a](u)", [(2, 0, 1, r"\[ [")]),
+        "hidden-link-literal-backslash-neighbor": trace(
+            r"[\a](u)", [(0, 1, 2, "]"), (2, 1, 2, "新🙂")]
+        ),
         "long-unicode-offset": trace("a" * 1024 + "中文🙂尾", [(0, 1024, 1027, "新🙂")]),
     },
 }
