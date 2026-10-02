@@ -2014,7 +2014,7 @@ fn encode_link_label_input(
 ) -> (String, Vec<usize>) {
     // Preserve complete new code, math, images and HTML. Entities are literal
     // text in code/math bodies, and reference images need the document context.
-    let literal_ranges: Vec<_> = crate::markdown::events_with_references(text, references)
+    let mut literal_ranges: Vec<_> = crate::markdown::events_with_references(text, references)
         .filter_map(|(event, range)| {
             matches!(
                 event,
@@ -2027,12 +2027,25 @@ fn encode_link_label_input(
             .then_some(range)
         })
         .collect();
+    // Start order lets one cursor cover the union of overlapping ranges, such
+    // as code inside an image label, without rescanning every range per char.
+    literal_ranges.sort_unstable_by_key(|range| range.start);
+    let mut literal_range = 0;
     let mut encoded = String::with_capacity(text.len());
     let mut boundaries = Vec::with_capacity(text.chars().count() + 1);
     let mut input = text.char_indices().peekable();
     while let Some((byte, ch)) = input.next() {
         boundaries.push(encoded.len());
-        if literal_ranges.iter().any(|range| range.contains(&byte)) {
+        while literal_ranges
+            .get(literal_range)
+            .is_some_and(|range| range.end <= byte)
+        {
+            literal_range += 1;
+        }
+        if literal_ranges
+            .get(literal_range)
+            .is_some_and(|range| range.contains(&byte))
+        {
             encoded.push(ch);
             continue;
         }

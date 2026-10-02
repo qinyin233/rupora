@@ -18,6 +18,26 @@ fn main() {
         },
     );
 
+    let linked = VisualProjection::from_markdown("[a](u)");
+    let pasted = "`[` ".repeat(128_000) + "[";
+    let caret = pasted.chars().count();
+    measure(
+        "edit 128k inline code spans in a hidden link label",
+        Duration::from_secs(2),
+        || {
+            let update = linked.apply_edit("[a](u)", &pasted, caret..caret).unwrap();
+            let projection = VisualProjection::from_markdown(&update.source);
+            assert_eq!(projection.text(), "[ ".repeat(128_000) + "[");
+            assert!(
+                projection
+                    .runs_for(projection.text())
+                    .iter()
+                    .all(|run| run.style.link)
+            );
+            std::hint::black_box(update);
+        },
+    );
+
     let source = representative_document(20_000);
     measure("analyze 20k sections", Duration::from_secs(8), || {
         std::hint::black_box(analyze(&source));

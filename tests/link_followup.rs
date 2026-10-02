@@ -274,6 +274,38 @@ fn mixed_markdown_and_literal_brackets_keep_valid_inline_syntax() {
 }
 
 #[test]
+fn mixed_overlapping_inline_ranges_keep_text_styles_and_caret() {
+    for typed in [
+        "![`[` $]$](pic) [",
+        "![**`[中🙂]`**](pic) [",
+        "<span title='[x]'>`[`</span> [",
+        "`[` $]$ <em>[中🙂]</em> [",
+    ] {
+        let source = "[a](u)";
+        let before = VisualProjection::from_markdown(source);
+        let expected = VisualProjection::from_markdown(typed);
+        let caret = typed.chars().count();
+        let update = before.apply_edit(source, typed, caret..caret).unwrap();
+        let after = VisualProjection::from_markdown(&update.source);
+        assert_eq!(after.text(), expected.text(), "{:?}", update.source);
+        let mut expected_styles = styles(&expected);
+        for style in &mut expected_styles {
+            style.link = true;
+        }
+        assert_eq!(styles(&after), expected_styles, "{:?}", update.source);
+        assert_eq!(
+            destinations(&update.source),
+            [("u".to_owned(), String::new())]
+        );
+        let visual_end = after.text().chars().count();
+        assert_eq!(
+            after.visual_char_range(&update.source, update.selection),
+            visual_end..visual_end
+        );
+    }
+}
+
+#[test]
 fn an_empty_link_with_the_same_target_cannot_replace_the_visible_link() {
     let source = "[a](u)";
     let before = VisualProjection::from_markdown(source);
